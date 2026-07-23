@@ -1,0 +1,16 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+# 生成代码不纳入 lint。
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  default: standard # errcheck govet ineffassign staticcheck unused
+  exclusions:
+    generated: lax
+    paths:
+      - gen

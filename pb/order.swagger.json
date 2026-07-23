@@ -1,0 +1,681 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Package order.v1 是订单 + 支付服务的对外契约(v2 实施版)。",
+    "description": "范围:下单 → 支付 → 支付回调 → 全额退款(V1)。支付结果通过事件推送(主)+\n查询(兜底/前端反馈)双路径触达接入方。orderd 不做交付/发权益、不做退款审批——只执行。\n\nV1 仅支持全额退款;部分/多次退款为 roadmap(见 RefundOrderRequest 注释)。",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "OrderService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v1/events": {
+      "get": {
+        "summary": "对账兜底:游标拉取事件,补偿漏投的 webhook。",
+        "operationId": "OrderService_ListOrderEvents",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListOrderEventsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "description": "单调游标:服务端基于 DB 自增序列或 (created_at, id) 编码,不用 UUID event_id 排序。\n空=从头;游标有保留周期,过期需重新全量拉取。",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/orders": {
+      "post": {
+        "summary": "REST 与 gRPC 同源:身份/权限统一走 authorization 头(JWT),REST 不在 path/query 暴露鉴权信息。\n写操作 POST + body:\"*\"(整体映射);只读用 GET(字段落 query/path)。",
+        "operationId": "OrderService_CreateOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CreateOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1CreateOrderRequest"
+            }
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/orders/status": {
+      "get": {
+        "operationId": "OrderService_GetOrderStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetOrderStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "orderToken",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "userId",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "int64"
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/orders/{orderNo}/cancel": {
+      "post": {
+        "operationId": "OrderService_CancelOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CancelOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "orderNo",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/OrderServiceCancelOrderBody"
+            }
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/orders/{orderNo}/prepare-payment": {
+      "post": {
+        "summary": "一单多支付尝试入口:换渠道 / 重新调起支付(§8/§9)。",
+        "operationId": "OrderService_PreparePayment",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1PreparePaymentResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "orderNo",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/OrderServicePreparePaymentBody"
+            }
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/refunds": {
+      "get": {
+        "operationId": "OrderService_GetRefund",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetRefundResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "refundNo",
+            "description": "二选一:refund_no(本服务单号)或 out_refund_no(调用方幂等键)。",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "outRefundNo",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      },
+      "post": {
+        "operationId": "OrderService_RefundOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1RefundOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1RefundOrderRequest"
+            }
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "OrderServiceCancelOrderBody": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "format": "int64",
+          "title": "归属校验"
+        }
+      }
+    },
+    "OrderServicePreparePaymentBody": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "format": "int64",
+          "title": "归属校验"
+        },
+        "payMethod": {
+          "$ref": "#/definitions/v1PayMethod",
+          "title": "目标支付方式;与订单当前活跃尝试不同即触发\"换渠道=开新尝试\"。"
+        },
+        "channelId": {
+          "type": "string",
+          "format": "int64"
+        },
+        "clientIp": {
+          "type": "string"
+        }
+      },
+      "description": "场景:同一 PENDING 订单需要(重新)调起支付——用户换支付方式、旧 prepay 过期、\n或前端重新拉起收银台。orderd 在同一订单行加锁并确认 PENDING(见 §8),再:\n  · 已有活跃尝试且渠道/方式一致 → 复用(返回原 prepay 组装的 app_params),reused=true;\n  · 需换支付方式或无活跃尝试 → 关旧活跃尝试 + 开新 attempt(新 out_trade_no)。\n不新建订单、不改订单幂等键;订单与尝试分表(§9),故不破坏下单幂等。",
+      "title": "=====================================================================\n支付准备 / 换渠道再调起(一单多支付尝试的对外入口)\n====================================================================="
+    },
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v1CancelOrderResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/v1OrderStatus"
+        }
+      }
+    },
+    "v1CloseReason": {
+      "type": "string",
+      "enum": [
+        "CLOSE_REASON_UNSPECIFIED",
+        "CLOSE_REASON_TIMEOUT",
+        "CLOSE_REASON_SUPERSEDED",
+        "CLOSE_REASON_SYSTEM",
+        "CLOSE_REASON_USER_CANCEL"
+      ],
+      "default": "CLOSE_REASON_UNSPECIFIED",
+      "title": "- CLOSE_REASON_TIMEOUT: 支付超时\n - CLOSE_REASON_SUPERSEDED: 被新单取代\n - CLOSE_REASON_SYSTEM: 系统关闭\n - CLOSE_REASON_USER_CANCEL: 用户主动取消(存在已提交网关的支付尝试,经关单确认后 CLOSED)"
+    },
+    "v1CreateOrderRequest": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "format": "int64",
+          "title": "必来自鉴权上下文"
+        },
+        "product": {
+          "$ref": "#/definitions/v1ProductSnapshot"
+        },
+        "amount": {
+          "$ref": "#/definitions/v1Money"
+        },
+        "payMethod": {
+          "$ref": "#/definitions/v1PayMethod"
+        },
+        "channelId": {
+          "type": "string",
+          "format": "int64"
+        },
+        "clientIp": {
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "title": "幂等键。服务端对归一化后的 (user_id, product, amount, pay_method, metadata …) 计算\nrequest_hash 并与本 key 绑定:\n  · 同 key 同 hash → 返回原订单(reused=true);\n  · 同 key 不同 hash → 拒绝,gRPC codes.AlreadyExists(msg: IDEMPOTENCY_CONFLICT);\n  · 唯一约束 UNIQUE(app_id, idempotency_key)。\n留空则退化为\"同 user+product 未支付单复用\"。"
+        },
+        "clientOrderNo": {
+          "type": "string",
+          "title": "接入方业务单号(一等字段),服务端 UNIQUE(app_id, client_order_no);关联业务单据与对账。"
+        }
+      }
+    },
+    "v1CreateOrderResponse": {
+      "type": "object",
+      "properties": {
+        "orderNo": {
+          "type": "string"
+        },
+        "orderToken": {
+          "type": "string",
+          "title": "安全随机,非派生值(不可预测)"
+        },
+        "appParams": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1OrderStatus"
+        },
+        "expireAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reused": {
+          "type": "boolean"
+        }
+      }
+    },
+    "v1Currency": {
+      "type": "string",
+      "enum": [
+        "CURRENCY_UNSPECIFIED",
+        "CURRENCY_CNY"
+      ],
+      "default": "CURRENCY_UNSPECIFIED"
+    },
+    "v1EventRecord": {
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string"
+        },
+        "eventType": {
+          "type": "string"
+        },
+        "orderNo": {
+          "type": "string"
+        },
+        "aggregateVersion": {
+          "type": "string",
+          "format": "int64"
+        },
+        "occurredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "envelope": {
+          "type": "string",
+          "format": "byte",
+          "title": "序列化的 EventEnvelope(见 events.proto)"
+        }
+      }
+    },
+    "v1GetOrderStatusResponse": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/definitions/v1OrderStatus"
+        },
+        "statusText": {
+          "type": "string"
+        },
+        "closeReason": {
+          "$ref": "#/definitions/v1CloseReason"
+        },
+        "amount": {
+          "$ref": "#/definitions/v1Money"
+        },
+        "tradeNo": {
+          "type": "string"
+        },
+        "paidAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "refundedAmount": {
+          "type": "string",
+          "format": "int64"
+        },
+        "aggregateVersion": {
+          "type": "string",
+          "format": "int64",
+          "title": "aggregate_version 与事件对齐:接入方据此判断查询结果与已消费事件的新旧。"
+        },
+        "metadata": {
+          "type": "string",
+          "format": "byte"
+        }
+      }
+    },
+    "v1GetRefundResponse": {
+      "type": "object",
+      "properties": {
+        "refundNo": {
+          "type": "string"
+        },
+        "outRefundNo": {
+          "type": "string"
+        },
+        "orderNo": {
+          "type": "string"
+        },
+        "refundAmount": {
+          "type": "string",
+          "format": "int64"
+        },
+        "status": {
+          "$ref": "#/definitions/v1RefundStatus"
+        },
+        "gatewayRefundId": {
+          "type": "string"
+        },
+        "succeededAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1ListOrderEventsResponse": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1EventRecord"
+          }
+        },
+        "nextCursor": {
+          "type": "string"
+        }
+      }
+    },
+    "v1Money": {
+      "type": "object",
+      "properties": {
+        "original": {
+          "type": "string",
+          "format": "int64",
+          "title": "原价(分)"
+        },
+        "discount": {
+          "type": "string",
+          "format": "int64",
+          "title": "优惠(分)"
+        },
+        "payable": {
+          "type": "string",
+          "format": "int64",
+          "title": "实付(分)"
+        },
+        "currency": {
+          "$ref": "#/definitions/v1Currency"
+        }
+      },
+      "title": "Money 金额明细,服务端强制不变量:original - discount = payable。\n财务快照,独立于业务 metadata。orderd 另按 app 校验币种/金额上下限/业务白名单。"
+    },
+    "v1OrderStatus": {
+      "type": "string",
+      "enum": [
+        "ORDER_STATUS_UNSPECIFIED",
+        "ORDER_STATUS_PENDING",
+        "ORDER_STATUS_PAID",
+        "ORDER_STATUS_CLOSING",
+        "ORDER_STATUS_CLOSED",
+        "ORDER_STATUS_CANCELLED",
+        "ORDER_STATUS_REFUNDING",
+        "ORDER_STATUS_REFUNDED",
+        "ORDER_STATUS_REFUND_EXCEPTION"
+      ],
+      "default": "ORDER_STATUS_UNSPECIFIED",
+      "description": "关单拆成两态:CLOSING = 已向网关发起关单但结果未知(reconcile 查单确认),\nCLOSED = 已确认关闭(附 close_reason)。避免\"网关关单超时即标记关闭\"的误判。\n不再保留语义与 CLOSED 重叠的 EXPIRED——支付超时归入 close_reason=TIMEOUT。\n\n - ORDER_STATUS_PENDING: 待支付\n - ORDER_STATUS_PAID: 已支付\n - ORDER_STATUS_CLOSING: 关单中(网关结果未知)\n - ORDER_STATUS_CLOSED: 已关闭(见 close_reason)\n - ORDER_STATUS_CANCELLED: 用户主动取消\n - ORDER_STATUS_REFUNDING: 退款中\n - ORDER_STATUS_REFUNDED: 已退款(全额,终态)\n - ORDER_STATUS_REFUND_EXCEPTION: 退款异常:网关退款结果与订单状态冲突/金额账号不符,需人工介入(见 §10)。\nproto 90 ↔ DB 80(统一 +10 偏移)。加它是为让 RefundOrder/GetOrderStatus 能返回该态。",
+      "title": "OrderStatus 订单状态(proto 值相对 DB +10 偏移,内部映射)。"
+    },
+    "v1PayMethod": {
+      "type": "string",
+      "enum": [
+        "PAY_METHOD_UNSPECIFIED",
+        "PAY_METHOD_WECHAT",
+        "PAY_METHOD_ALIPAY"
+      ],
+      "default": "PAY_METHOD_UNSPECIFIED"
+    },
+    "v1PreparePaymentResponse": {
+      "type": "object",
+      "properties": {
+        "attemptNo": {
+          "type": "integer",
+          "format": "int32",
+          "title": "本次使用的支付尝试序号"
+        },
+        "appParams": {
+          "type": "string",
+          "title": "前端调起参数(不含任何服务端凭证)"
+        },
+        "status": {
+          "$ref": "#/definitions/v1OrderStatus",
+          "title": "订单当前状态(应为 PENDING)"
+        },
+        "expireAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reused": {
+          "type": "boolean",
+          "title": "true=复用已有活跃尝试"
+        }
+      }
+    },
+    "v1ProductSnapshot": {
+      "type": "object",
+      "properties": {
+        "productId": {
+          "type": "string",
+          "format": "uint64"
+        },
+        "title": {
+          "type": "string"
+        },
+        "businessType": {
+          "type": "string",
+          "title": "业务类型,orderd 按 app 白名单校验(拦截伪造/异常商品)。"
+        },
+        "metadataType": {
+          "type": "string",
+          "title": "metadata 类型标签与 schema 版本;metadata 不透明,禁写密钥与不必要 PII。"
+        },
+        "metadataVersion": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "metadata": {
+          "type": "string",
+          "format": "byte"
+        }
+      }
+    },
+    "v1RefundOrderRequest": {
+      "type": "object",
+      "properties": {
+        "orderNo": {
+          "type": "string"
+        },
+        "refundAmount": {
+          "type": "string",
+          "format": "int64",
+          "title": "V1:refund_amount 必须等于订单实付,否则 gRPC codes.FailedPrecondition。\nroadmap:支持部分/多次退款时放开,并引入\"成功额+处理中额 ≤ 实付\"不变量。"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "outRefundNo": {
+          "type": "string",
+          "title": "幂等键"
+        }
+      }
+    },
+    "v1RefundOrderResponse": {
+      "type": "object",
+      "properties": {
+        "refundNo": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1RefundStatus"
+        }
+      }
+    },
+    "v1RefundStatus": {
+      "type": "string",
+      "enum": [
+        "REFUND_STATUS_UNSPECIFIED",
+        "REFUND_STATUS_CREATED",
+        "REFUND_STATUS_PROCESSING",
+        "REFUND_STATUS_SUCCEEDED",
+        "REFUND_STATUS_FAILED",
+        "REFUND_STATUS_CLOSED",
+        "REFUND_STATUS_ABNORMAL"
+      ],
+      "default": "REFUND_STATUS_UNSPECIFIED",
+      "description": "- REFUND_STATUS_CREATED: 已受理,未提交网关\n - REFUND_STATUS_PROCESSING: 网关处理中\n - REFUND_STATUS_SUCCEEDED: 成功(终态)\n - REFUND_STATUS_FAILED: 失败(终态)\n - REFUND_STATUS_CLOSED: 已撤销/关闭(终态)\n - REFUND_STATUS_ABNORMAL: 异常,需人工介入",
+      "title": "RefundStatus 单笔退款状态机(V1 只会有一笔全额退款,状态机为部分退款预留)。"
+    }
+  }
+}

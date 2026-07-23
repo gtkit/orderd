@@ -1,0 +1,40 @@
+# 本地一键起:MySQL + Redis + orderd。
+# 注意(借鉴 Night-Hawk):容器内互连用服务名 DNS(mysql:3306 / redis:6379),不是 127.0.0.1。
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: orderd
+    ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # 建表:项目无迁移工具,以 docs/sql/schema.sql 为权威草稿,人工评审后执行(生产禁 AutoMigrate)。
+    # 本地可把 docs/sql/schema.sql 挂到 /docker-entrypoint-initdb.d/ 自动导入。
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  orderd:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    # 结构化配置从挂载的 yaml 读取;敏感项仅走 environment(不入 yaml/镜像)。
+    command: ["--config", "/config/env/env.yml"]
+    volumes:
+      - ./env.docker.yml:/config/env/env.yml:ro
+    environment:
+      # 鉴权(dev 值,生产改由密钥系统注入):ORDERD_JWT_KEYS=kid=secret[,kid2=secret2]
+      ORDERD_JWT_KEYS: "dev1=dev-secret-change-me-32bytes-xx"
+      # MySQL 口令(dev root/root);生产走密钥系统。
+      ORDERD_MYSQL_PASSWORD: "root"
+    ports: ["9090:9090", "8080:8080"]

@@ -1,0 +1,14 @@
+version: v2
+modules:
+  - path: .
+deps:
+  # protovalidate:运行时校验(下单请求字段约束),对应 Go 运行时库 buf.build/go/protovalidate。
+  - buf.build/bufbuild/protovalidate
+  # googleapis:google/api/annotations.proto,grpc-gateway 据 google.api.http 生成 REST 反向代理。
+  - buf.build/googleapis/googleapis
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

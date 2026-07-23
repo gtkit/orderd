@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+// Package order.v1 事件契约(v2):订单服务 → 接入方的 webhook 回调载荷(发权益主路径)。
+//
+// 幂等 + 防乱序双机制:
+//   · event_id  —— 防"同一事件重复投递"(接入方 inbox 唯一键去重);
+//   · aggregate_version —— 防"延迟旧事件回退状态"(如退款后迟到的 order.paid 重新发权益)。
+//     接入方按 (order_no, aggregate_version) 单调接受:只处理版本更高的事件。
+package order.v1;
+
+import "google/protobuf/timestamp.proto";
+import "order/v1/order.proto";
+
+option go_package = "github.com/gtkit/orderd/pb/order/v1;orderv1";
+
+// EventEnvelope webhook 事件统一信封。
+// 传输 = 序列化 EventEnvelope(application/x-protobuf);
+// 头带 X-Order-Event-Id(幂等)、X-Order-Timestamp、X-Order-Key-Id、
+// X-Order-Signature = HMAC-SHA256(timestamp + "." + raw_body, secret)。
+message EventEnvelope {
+  string event_id   = 1; // UUID,幂等键
+  string event_type = 2; // order.paid / order.refunded / order.closed
+  google.protobuf.Timestamp occurred_at = 3;
+  string app_id     = 4;
+  string order_no   = 5;
+
+  // 单调递增的聚合版本(每次订单状态跃迁 +1),接入方据此判定新旧、拒绝回退。
+  int64       aggregate_version = 6;
+  OrderStatus previous_status   = 7;
+  OrderStatus current_status    = 8;
+  int32       schema_version    = 9; // payload schema 版本,演进用
+
+  oneof payload {
+    OrderPaidEvent     paid     = 20;
+    OrderRefundedEvent refunded = 21;
+    OrderClosedEvent   closed   = 22;
+  }
+}
+
+// OrderPaidEvent 支付成功。接入方据此发放权益(消费必须幂等,见 inbox 模式)。
+//
+// 安全:order_token 是订单 bearer 凭证,绝不进事件/webhook/outbox/事件历史(评审补充项)。
+// 接入方在 CreateOrder 响应里已持有 order_token,无需事件再带;字段 2 永久保留不复用。
+message OrderPaidEvent {
+  reserved 2;
+  reserved "order_token";
+  string order_no    = 1;
+  int64  user_id     = 3;
+  uint64 product_id  = 4;
+  string product_title = 5;
+  int64  amount      = 6; // 实付(分)
+  string currency    = 7;
+  string trade_no    = 8;
+  int32  pay_method  = 9;
+  string pay_channel = 10;
+  google.protobuf.Timestamp paid_at = 11;
+  string metadata_type    = 20;
+  int32  metadata_version = 21;
+  bytes  metadata         = 22; // 原样回传下单 metadata
+}
+
+// OrderRefundedEvent 退款成功(网关确认)。接入方据此反向核销(消费必须幂等)。
+message OrderRefundedEvent {
+  string order_no      = 1;
+  int64  user_id       = 2;
+  string refund_no     = 3;
+  int64  refund_amount = 4; // 本次退款(分),V1=全额
+  google.protobuf.Timestamp refunded_at = 5;
+  string metadata_type    = 20;
+  int32  metadata_version = 21;
+  bytes  metadata         = 22;
+}
+
+// OrderClosedEvent 订单关闭(未支付)。可选消费。
+message OrderClosedEvent {
+  string order_no = 1;
+  int64  user_id  = 2;
+  CloseReason reason = 3;
+  google.protobuf.Timestamp closed_at = 4;
+}

@@ -1,0 +1,169 @@
+package apptest
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/gtkit/orderd/internal/models"
+	orderapp "github.com/gtkit/orderd/internal/module/order/application"
+	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
+	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
+	"github.com/gtkit/orderd/internal/paygateway"
+	"github.com/gtkit/orderd/internal/store/memstore"
+)
+
+// --- fakes ---
+
+type fakePricing struct{ err error }
+
+func (f fakePricing) Authorize(string, models.Money, string) error { return f.err }
+func (fakePricing) Kind() string                                   { return "trusted-caller" }
+
+type fakeAmounts struct{ b models.AmountBounds }
+
+func (f fakeAmounts) Bounds(string) (models.AmountBounds, bool) { return f.b, true }
+
+type fakeAccounts struct{}
+
+func (fakeAccounts) Resolve(_ context.Context, appID, channel string) (models.AppPayAccount, error) {
+	id := "acc-" + channel
+	return models.AppPayAccount{
+		PayAccountID: id, AppID: appID, Channel: channel,
+		MchID: "mch-" + channel, PayAppID: "app-" + channel, ConfigVersion: 1, Enabled: true,
+	}, nil
+}
+
+func (fakeAccounts) ResolveByID(_ context.Context, payAccountID string) (models.AppPayAccount, error) {
+	return models.AppPayAccount{
+		PayAccountID: payAccountID, MchID: "mch-" + payAccountID, PayAppID: "app-" + payAccountID,
+		ConfigVersion: 1, Enabled: true,
+	}, nil
+}
+
+// refundCall 记录一次退款调用的关键入参(校验结算渠道/账号/原商户单号)。
+type refundCall struct {
+	Channel      string
+	PayAccountID string
+	OutTradeNo   string
+	OutRefundNo  string
+}
+
+// fakeGateway 记录退款调用,可注入错误。
+type fakeGateway struct {
+	mu              sync.Mutex
+	prepareErr      error
+	lastPrepare     paygateway.PrepareInput
+	refunds         []refundCall
+	refundNotAccept bool
+}
+
+func (g *fakeGateway) Prepare(_ context.Context, in paygateway.PrepareInput) (paygateway.PrepareResult, error) {
+	g.mu.Lock()
+	g.lastPrepare = in
+	g.mu.Unlock()
+	if g.prepareErr != nil {
+		return paygateway.PrepareResult{}, g.prepareErr
+	}
+	return paygateway.PrepareResult{PrepayID: "pp-" + in.OutTradeNo, AppParams: "params-" + in.Channel}, nil
+}
+
+func (g *fakeGateway) Query(context.Context, paygateway.QueryInput) (paygateway.QueryResult, error) {
+	return paygateway.QueryResult{State: paygateway.QueryNotPay}, nil
+}
+func (g *fakeGateway) Close(context.Context, paygateway.CloseInput) error { return nil }
+func (g *fakeGateway) Refund(_ context.Context, in paygateway.RefundInput) (paygateway.RefundResult, error) {
+	g.mu.Lock()
+	g.refunds = append(g.refunds, refundCall{Channel: in.Channel, PayAccountID: in.PayAccountID, OutTradeNo: in.OutTradeNo, OutRefundNo: in.OutRefundNo})
+	g.mu.Unlock()
+	if g.refundNotAccept {
+		return paygateway.RefundResult{Accepted: false}, nil
+	}
+	return paygateway.RefundResult{GatewayRefundID: "gwr-" + in.OutRefundNo, Accepted: true}, nil
+}
+
+// RefundQuery 供退款查单 worker(测试默认返回成功)。
+func (g *fakeGateway) RefundQuery(_ context.Context, in paygateway.RefundQueryInput) (paygateway.RefundQueryResult, error) {
+	return paygateway.RefundQueryResult{State: paygateway.RefundQuerySucceeded, GatewayRefundID: "gwr-" + in.OutRefundNo, TransactionID: "rtx-" + in.OutRefundNo, Amount: 90}, nil
+}
+
+type fakeRouter struct{ gw *fakeGateway }
+
+func (r fakeRouter) Resolve(string, string) (paygateway.Gateway, error) { return r.gw, nil }
+
+type recordingAlerter struct {
+	mu    sync.Mutex
+	kinds []string
+}
+
+func (a *recordingAlerter) Anomaly(_ context.Context, kind string, _ map[string]any) {
+	a.mu.Lock()
+	a.kinds = append(a.kinds, kind)
+	a.mu.Unlock()
+}
+
+func (a *recordingAlerter) count(kind string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, k := range a.kinds {
+		if k == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// --- harness ---
+
+type harness struct {
+	mem     *memstore.Mem
+	order   *orderapp.Service
+	payment *paymentapp.Service
+	refund  *refundapp.Service
+	gateway *fakeGateway
+	alerter *recordingAlerter
+}
+
+func newHarness(refundEnabled bool) *harness {
+	mem := memstore.New()
+	gw := &fakeGateway{}
+	router := fakeRouter{gw: gw}
+	alerter := &recordingAlerter{}
+	clock := func() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) }
+
+	var evtN, tokN, ordN, tradeN, refN int64
+	var idMu sync.Mutex
+	next := func(p *int64) int64 { idMu.Lock(); defer idMu.Unlock(); *p++; return *p }
+
+	pay := paymentapp.New(paymentapp.Deps{
+		Store: mem, Router: router, Accounts: fakeAccounts{}, Alerter: alerter, Clock: clock,
+		NewEventID: func() (string, error) { return fmt.Sprintf("evt-%d", next(&evtN)), nil },
+		OutTradeNo: func() string { return fmt.Sprintf("PT%d", next(&tradeN)) },
+	})
+	ord := orderapp.New(orderapp.Deps{
+		Store: mem, Payment: pay, Pricing: fakePricing{},
+		Amounts:  fakeAmounts{models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}}},
+		Accounts: fakeAccounts{}, Clock: clock,
+		NewOrderNo: func() string { return fmt.Sprintf("OD%d", next(&ordN)) },
+		NewToken:   func() (string, error) { return fmt.Sprintf("tok-%d", next(&tokN)), nil },
+		NewEventID: func() (string, error) { return fmt.Sprintf("evt-%d", next(&evtN)), nil },
+	})
+	ref := refundapp.New(refundapp.Deps{
+		Store: mem, Router: router, Accounts: fakeAccounts{}, Alerter: alerter, Clock: clock,
+		NewRefundNo: func() string { return fmt.Sprintf("RF%d", next(&refN)) },
+		NewEventID:  func() (string, error) { return fmt.Sprintf("evt-%d", next(&evtN)), nil },
+		Enabled:     refundEnabled,
+	})
+	return &harness{mem: mem, order: ord, payment: pay, refund: ref, gateway: gw, alerter: alerter}
+}
+
+// baseCreate 返回一份合法下单入参。
+func baseCreate() orderapp.CreateInput {
+	return orderapp.CreateInput{
+		AppID: "app1", UserID: 42, ProductID: 7, ProductTitle: "会员月卡", BusinessType: "vip",
+		Amount:    models.Money{Original: 100, Discount: 10, Payable: 90, Currency: "CNY"},
+		PayMethod: models.PayMethodWechat, ChannelID: 3,
+	}
+}

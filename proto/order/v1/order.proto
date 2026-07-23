@@ -1,0 +1,284 @@
+syntax = "proto3";
+
+// Package order.v1 是订单 + 支付服务的对外契约(v2 实施版)。
+//
+// 范围:下单 → 支付 → 支付回调 → 全额退款(V1)。支付结果通过事件推送(主)+
+// 查询(兜底/前端反馈)双路径触达接入方。orderd 不做交付/发权益、不做退款审批——只执行。
+//
+// V1 仅支持全额退款;部分/多次退款为 roadmap(见 RefundOrderRequest 注释)。
+package order.v1;
+
+import "buf/validate/validate.proto";
+import "google/api/annotations.proto"; // grpc-gateway 据 google.api.http 生成 REST 反向代理
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/gtkit/orderd/pb/order/v1;orderv1";
+
+// =====================================================================
+// 枚举
+// =====================================================================
+
+// OrderStatus 订单状态(proto 值相对 DB +10 偏移,内部映射)。
+//
+// 关单拆成两态:CLOSING = 已向网关发起关单但结果未知(reconcile 查单确认),
+// CLOSED = 已确认关闭(附 close_reason)。避免"网关关单超时即标记关闭"的误判。
+// 不再保留语义与 CLOSED 重叠的 EXPIRED——支付超时归入 close_reason=TIMEOUT。
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING     = 10; // 待支付
+  ORDER_STATUS_PAID        = 20; // 已支付
+  ORDER_STATUS_CLOSING     = 40; // 关单中(网关结果未知)
+  ORDER_STATUS_CLOSED      = 50; // 已关闭(见 close_reason)
+  ORDER_STATUS_CANCELLED   = 60; // 用户主动取消
+  ORDER_STATUS_REFUNDING   = 70; // 退款中
+  ORDER_STATUS_REFUNDED    = 80; // 已退款(全额,终态)
+  // 退款异常:网关退款结果与订单状态冲突/金额账号不符,需人工介入(见 §10)。
+  // proto 90 ↔ DB 80(统一 +10 偏移)。加它是为让 RefundOrder/GetOrderStatus 能返回该态。
+  ORDER_STATUS_REFUND_EXCEPTION = 90;
+}
+
+enum CloseReason {
+  CLOSE_REASON_UNSPECIFIED = 0;
+  CLOSE_REASON_TIMEOUT     = 1; // 支付超时
+  CLOSE_REASON_SUPERSEDED  = 2; // 被新单取代
+  CLOSE_REASON_SYSTEM      = 3; // 系统关闭
+  CLOSE_REASON_USER_CANCEL = 4; // 用户主动取消(存在已提交网关的支付尝试,经关单确认后 CLOSED)
+}
+
+enum PayMethod {
+  PAY_METHOD_UNSPECIFIED = 0;
+  PAY_METHOD_WECHAT      = 1;
+  PAY_METHOD_ALIPAY      = 2;
+}
+
+enum Currency {
+  CURRENCY_UNSPECIFIED = 0;
+  CURRENCY_CNY         = 1;
+}
+
+// RefundStatus 单笔退款状态机(V1 只会有一笔全额退款,状态机为部分退款预留)。
+enum RefundStatus {
+  REFUND_STATUS_UNSPECIFIED = 0;
+  REFUND_STATUS_CREATED     = 1; // 已受理,未提交网关
+  REFUND_STATUS_PROCESSING  = 2; // 网关处理中
+  REFUND_STATUS_SUCCEEDED   = 3; // 成功(终态)
+  REFUND_STATUS_FAILED      = 4; // 失败(终态)
+  REFUND_STATUS_CLOSED      = 5; // 已撤销/关闭(终态)
+  REFUND_STATUS_ABNORMAL    = 6; // 异常,需人工介入
+}
+
+// =====================================================================
+// 金额(权威,orderd 侧强校验,不信任接入方随意传值)
+// =====================================================================
+
+// Money 金额明细,服务端强制不变量:original - discount = payable。
+// 财务快照,独立于业务 metadata。orderd 另按 app 校验币种/金额上下限/业务白名单。
+message Money {
+  int64    original = 1 [(buf.validate.field).int64.gte = 0]; // 原价(分)
+  int64    discount = 2 [(buf.validate.field).int64.gte = 0]; // 优惠(分)
+  int64    payable  = 3 [(buf.validate.field).int64.gt = 0];  // 实付(分)
+  Currency currency = 4 [(buf.validate.field).enum = {defined_only: true, not_in: [0]}];
+}
+
+message ProductSnapshot {
+  uint64 product_id    = 1 [(buf.validate.field).uint64.gt = 0];
+  string title         = 2 [(buf.validate.field).string = {min_len: 1, max_len: 255}];
+  // 业务类型,orderd 按 app 白名单校验(拦截伪造/异常商品)。
+  string business_type = 3 [(buf.validate.field).string = {min_len: 1, max_len: 64}];
+  // metadata 类型标签与 schema 版本;metadata 不透明,禁写密钥与不必要 PII。
+  string metadata_type    = 4 [(buf.validate.field).string.max_len = 64];
+  int32  metadata_version = 5;
+  bytes  metadata         = 6 [(buf.validate.field).bytes.max_len = 4096];
+}
+
+// =====================================================================
+// 下单
+// =====================================================================
+
+message CreateOrderRequest {
+  int64 user_id = 1 [(buf.validate.field).int64.gt = 0]; // 必来自鉴权上下文
+
+  ProductSnapshot product = 2 [(buf.validate.field).required = true];
+  Money           amount  = 3 [(buf.validate.field).required = true];
+
+  PayMethod pay_method = 4 [(buf.validate.field).enum = {defined_only: true, not_in: [0]}];
+  int64  channel_id = 5;
+  string client_ip  = 6 [(buf.validate.field).string.max_len = 45];
+
+  // 幂等键。服务端对归一化后的 (user_id, product, amount, pay_method, metadata …) 计算
+  // request_hash 并与本 key 绑定:
+  //   · 同 key 同 hash → 返回原订单(reused=true);
+  //   · 同 key 不同 hash → 拒绝,gRPC codes.AlreadyExists(msg: IDEMPOTENCY_CONFLICT);
+  //   · 唯一约束 UNIQUE(app_id, idempotency_key)。
+  // 留空则退化为"同 user+product 未支付单复用"。
+  string idempotency_key = 7 [(buf.validate.field).string.max_len = 64];
+
+  // 接入方业务单号(一等字段),服务端 UNIQUE(app_id, client_order_no);关联业务单据与对账。
+  string client_order_no = 8 [(buf.validate.field).string.max_len = 64];
+}
+
+message CreateOrderResponse {
+  string order_no    = 1;
+  string order_token = 2; // 安全随机,非派生值(不可预测)
+  string app_params  = 3;
+  OrderStatus status = 4;
+  google.protobuf.Timestamp expire_at = 5;
+  bool reused = 6;
+}
+
+// =====================================================================
+// 查询(前端反馈 + 对账兜底)
+// =====================================================================
+
+message GetOrderStatusRequest {
+  string order_token = 1 [(buf.validate.field).string.min_len = 1];
+  int64  user_id     = 2 [(buf.validate.field).int64.gt = 0];
+}
+
+message GetOrderStatusResponse {
+  OrderStatus status       = 1;
+  string      status_text  = 2;
+  CloseReason close_reason = 3;
+  Money       amount       = 4;
+  string      trade_no     = 5;
+  google.protobuf.Timestamp paid_at = 6;
+  int64       refunded_amount   = 7;
+  // aggregate_version 与事件对齐:接入方据此判断查询结果与已消费事件的新旧。
+  int64       aggregate_version = 8;
+  bytes       metadata     = 9;
+}
+
+// ListOrderEvents 游标批量拉取事件,供接入方大规模漏事件对账(单笔轮询兜不住)。
+message ListOrderEventsRequest {
+  // 单调游标:服务端基于 DB 自增序列或 (created_at, id) 编码,不用 UUID event_id 排序。
+  // 空=从头;游标有保留周期,过期需重新全量拉取。
+  string cursor = 1;
+  int32  limit  = 2 [(buf.validate.field).int32 = {gte: 1, lte: 1000}];
+}
+message ListOrderEventsResponse {
+  repeated EventRecord events = 1;
+  string next_cursor = 2;
+}
+message EventRecord {
+  string event_id  = 1;
+  string event_type = 2;
+  string order_no  = 3;
+  int64  aggregate_version = 4;
+  google.protobuf.Timestamp occurred_at = 5;
+  bytes  envelope = 6; // 序列化的 EventEnvelope(见 events.proto)
+}
+
+// =====================================================================
+// 取消(用户主动取消待支付订单)
+// =====================================================================
+
+message CancelOrderRequest {
+  string order_no = 1 [(buf.validate.field).string.min_len = 1];
+  int64  user_id  = 2 [(buf.validate.field).int64.gt = 0]; // 归属校验
+}
+message CancelOrderResponse {
+  OrderStatus status = 1;
+}
+
+// =====================================================================
+// 支付准备 / 换渠道再调起(一单多支付尝试的对外入口)
+// =====================================================================
+//
+// 场景:同一 PENDING 订单需要(重新)调起支付——用户换支付方式、旧 prepay 过期、
+// 或前端重新拉起收银台。orderd 在同一订单行加锁并确认 PENDING(见 §8),再:
+//   · 已有活跃尝试且渠道/方式一致 → 复用(返回原 prepay 组装的 app_params),reused=true;
+//   · 需换支付方式或无活跃尝试 → 关旧活跃尝试 + 开新 attempt(新 out_trade_no)。
+// 不新建订单、不改订单幂等键;订单与尝试分表(§9),故不破坏下单幂等。
+message PreparePaymentRequest {
+  string order_no = 1 [(buf.validate.field).string.min_len = 1];
+  int64  user_id  = 2 [(buf.validate.field).int64.gt = 0]; // 归属校验
+  // 目标支付方式;与订单当前活跃尝试不同即触发"换渠道=开新尝试"。
+  PayMethod pay_method = 3 [(buf.validate.field).enum = {defined_only: true, not_in: [0]}];
+  int64  channel_id = 4;
+  string client_ip  = 5 [(buf.validate.field).string.max_len = 45];
+}
+message PreparePaymentResponse {
+  int32       attempt_no = 1; // 本次使用的支付尝试序号
+  string      app_params = 2; // 前端调起参数(不含任何服务端凭证)
+  OrderStatus status     = 3; // 订单当前状态(应为 PENDING)
+  google.protobuf.Timestamp expire_at = 4;
+  bool        reused     = 5; // true=复用已有活跃尝试
+}
+
+// =====================================================================
+// 退款(V1 仅全额;审批在 admin)。
+// ★ V1 不开放:通过授权关闭——不向任何调用方发放 refund:execute 权限;
+//   admin 退款审批改造上线时再发放。message/rpc 已定义,届时零改动启用。
+// =====================================================================
+
+message RefundOrderRequest {
+  string order_no = 1 [(buf.validate.field).string.min_len = 1];
+  // V1:refund_amount 必须等于订单实付,否则 gRPC codes.FailedPrecondition。
+  // roadmap:支持部分/多次退款时放开,并引入"成功额+处理中额 ≤ 实付"不变量。
+  int64  refund_amount = 2 [(buf.validate.field).int64.gt = 0];
+  string reason        = 3 [(buf.validate.field).string.max_len = 512];
+  string out_refund_no = 4 [(buf.validate.field).string = {min_len: 1, max_len: 64}]; // 幂等键
+}
+message RefundOrderResponse {
+  string       refund_no = 1;
+  RefundStatus status    = 2;
+}
+
+message GetRefundRequest {
+  // 二选一:refund_no(本服务单号)或 out_refund_no(调用方幂等键)。
+  string refund_no     = 1;
+  string out_refund_no = 2;
+}
+message GetRefundResponse {
+  string       refund_no     = 1;
+  string       out_refund_no = 2;
+  string       order_no      = 3;
+  int64        refund_amount = 4;
+  RefundStatus status        = 5;
+  string       gateway_refund_id = 6;
+  google.protobuf.Timestamp succeeded_at = 7;
+}
+
+// =====================================================================
+// 服务
+// =====================================================================
+
+service OrderService {
+  // REST 与 gRPC 同源:身份/权限统一走 authorization 头(JWT),REST 不在 path/query 暴露鉴权信息。
+  // 写操作 POST + body:"*"(整体映射);只读用 GET(字段落 query/path)。
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/orders"
+      body: "*"
+    };
+  }
+  rpc GetOrderStatus(GetOrderStatusRequest) returns (GetOrderStatusResponse) {
+    option (google.api.http) = {get: "/v1/orders/status"};
+  }
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/orders/{order_no}/cancel"
+      body: "*"
+    };
+  }
+  // 一单多支付尝试入口:换渠道 / 重新调起支付(§8/§9)。
+  rpc PreparePayment(PreparePaymentRequest) returns (PreparePaymentResponse) {
+    option (google.api.http) = {
+      post: "/v1/orders/{order_no}/prepare-payment"
+      body: "*"
+    };
+  }
+  rpc RefundOrder(RefundOrderRequest) returns (RefundOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/refunds"
+      body: "*"
+    };
+  }
+  rpc GetRefund(GetRefundRequest) returns (GetRefundResponse) {
+    option (google.api.http) = {get: "/v1/refunds"};
+  }
+  // 对账兜底:游标拉取事件,补偿漏投的 webhook。
+  rpc ListOrderEvents(ListOrderEventsRequest) returns (ListOrderEventsResponse) {
+    option (google.api.http) = {get: "/v1/events"};
+  }
+}
