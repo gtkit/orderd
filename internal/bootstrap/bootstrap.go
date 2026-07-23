@@ -13,6 +13,7 @@ import (
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/gtkit/logger"
 	"github.com/gtkit/orderd/internal/appmeta"
+	orderv1gw "github.com/gtkit/orderd/internal/gateway/order/v1"
 	"github.com/gtkit/orderd/internal/pkg/interceptor"
 	"github.com/gtkit/orderd/internal/platform/config"
 	orderruntime "github.com/gtkit/orderd/internal/runtime"
@@ -39,7 +40,7 @@ func newRESTGateway(ctx context.Context, grpcAddr string) (*runtime.ServeMux, er
 		}
 		return runtime.DefaultHeaderMatcher(key)
 	}))
-	if err := orderv1.RegisterOrderServiceHandlerFromEndpoint(ctx, gwMux, dialAddr,
+	if err := orderv1gw.RegisterOrderServiceHandlerFromEndpoint(ctx, gwMux, dialAddr,
 		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}); err != nil {
 		return nil, err
 	}

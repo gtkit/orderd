@@ -16,6 +16,7 @@ import (
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/utilities"
+	extOrderv1 "github.com/gtkit/orderd/pb/order/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
@@ -35,9 +36,9 @@ var (
 	_ = metadata.Join
 )
 
-func request_OrderService_CreateOrder_0(ctx context.Context, marshaler runtime.Marshaler, client OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_OrderService_CreateOrder_0(ctx context.Context, marshaler runtime.Marshaler, client extOrderv1.OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq CreateOrderRequest
+		protoReq extOrderv1.CreateOrderRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
@@ -50,9 +51,9 @@ func request_OrderService_CreateOrder_0(ctx context.Context, marshaler runtime.M
 	return msg, metadata, err
 }
 
-func local_request_OrderService_CreateOrder_0(ctx context.Context, marshaler runtime.Marshaler, server OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_OrderService_CreateOrder_0(ctx context.Context, marshaler runtime.Marshaler, server extOrderv1.OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq CreateOrderRequest
+		protoReq extOrderv1.CreateOrderRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
@@ -64,9 +65,9 @@ func local_request_OrderService_CreateOrder_0(ctx context.Context, marshaler run
 
 var filter_OrderService_GetOrderStatus_0 = &utilities.DoubleArray{Encoding: map[string]int{}, Base: []int(nil), Check: []int(nil)}
 
-func request_OrderService_GetOrderStatus_0(ctx context.Context, marshaler runtime.Marshaler, client OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_OrderService_GetOrderStatus_0(ctx context.Context, marshaler runtime.Marshaler, client extOrderv1.OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq GetOrderStatusRequest
+		protoReq extOrderv1.GetOrderStatusRequest
 		metadata runtime.ServerMetadata
 	)
 	if req.Body != nil {
@@ -82,9 +83,9 @@ func request_OrderService_GetOrderStatus_0(ctx context.Context, marshaler runtim
 	return msg, metadata, err
 }
 
-func local_request_OrderService_GetOrderStatus_0(ctx context.Context, marshaler runtime.Marshaler, server OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_OrderService_GetOrderStatus_0(ctx context.Context, marshaler runtime.Marshaler, server extOrderv1.OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq GetOrderStatusRequest
+		protoReq extOrderv1.GetOrderStatusRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := req.ParseForm(); err != nil {
@@ -97,9 +98,9 @@ func local_request_OrderService_GetOrderStatus_0(ctx context.Context, marshaler 
 	return msg, metadata, err
 }
 
-func request_OrderService_CancelOrder_0(ctx context.Context, marshaler runtime.Marshaler, client OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_OrderService_CancelOrder_0(ctx context.Context, marshaler runtime.Marshaler, client extOrderv1.OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq CancelOrderRequest
+		protoReq extOrderv1.CancelOrderRequest
 		metadata runtime.ServerMetadata
 		err      error
 	)
@@ -121,9 +122,9 @@ func request_OrderService_CancelOrder_0(ctx context.Context, marshaler runtime.M
 	return msg, metadata, err
 }
 
-func local_request_OrderService_CancelOrder_0(ctx context.Context, marshaler runtime.Marshaler, server OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_OrderService_CancelOrder_0(ctx context.Context, marshaler runtime.Marshaler, server extOrderv1.OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq CancelOrderRequest
+		protoReq extOrderv1.CancelOrderRequest
 		metadata runtime.ServerMetadata
 		err      error
 	)
@@ -142,9 +143,9 @@ func local_request_OrderService_CancelOrder_0(ctx context.Context, marshaler run
 	return msg, metadata, err
 }
 
-func request_OrderService_PreparePayment_0(ctx context.Context, marshaler runtime.Marshaler, client OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_OrderService_PreparePayment_0(ctx context.Context, marshaler runtime.Marshaler, client extOrderv1.OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq PreparePaymentRequest
+		protoReq extOrderv1.PreparePaymentRequest
 		metadata runtime.ServerMetadata
 		err      error
 	)
@@ -166,9 +167,9 @@ func request_OrderService_PreparePayment_0(ctx context.Context, marshaler runtim
 	return msg, metadata, err
 }
 
-func local_request_OrderService_PreparePayment_0(ctx context.Context, marshaler runtime.Marshaler, server OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_OrderService_PreparePayment_0(ctx context.Context, marshaler runtime.Marshaler, server extOrderv1.OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq PreparePaymentRequest
+		protoReq extOrderv1.PreparePaymentRequest
 		metadata runtime.ServerMetadata
 		err      error
 	)
@@ -187,9 +188,9 @@ func local_request_OrderService_PreparePayment_0(ctx context.Context, marshaler 
 	return msg, metadata, err
 }
 
-func request_OrderService_RefundOrder_0(ctx context.Context, marshaler runtime.Marshaler, client OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_OrderService_RefundOrder_0(ctx context.Context, marshaler runtime.Marshaler, client extOrderv1.OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq RefundOrderRequest
+		protoReq extOrderv1.RefundOrderRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
@@ -202,9 +203,9 @@ func request_OrderService_RefundOrder_0(ctx context.Context, marshaler runtime.M
 	return msg, metadata, err
 }
 
-func local_request_OrderService_RefundOrder_0(ctx context.Context, marshaler runtime.Marshaler, server OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_OrderService_RefundOrder_0(ctx context.Context, marshaler runtime.Marshaler, server extOrderv1.OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq RefundOrderRequest
+		protoReq extOrderv1.RefundOrderRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := marshaler.NewDecoder(req.Body).Decode(&protoReq); err != nil && !errors.Is(err, io.EOF) {
@@ -216,9 +217,9 @@ func local_request_OrderService_RefundOrder_0(ctx context.Context, marshaler run
 
 var filter_OrderService_GetRefund_0 = &utilities.DoubleArray{Encoding: map[string]int{}, Base: []int(nil), Check: []int(nil)}
 
-func request_OrderService_GetRefund_0(ctx context.Context, marshaler runtime.Marshaler, client OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_OrderService_GetRefund_0(ctx context.Context, marshaler runtime.Marshaler, client extOrderv1.OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq GetRefundRequest
+		protoReq extOrderv1.GetRefundRequest
 		metadata runtime.ServerMetadata
 	)
 	if req.Body != nil {
@@ -234,9 +235,9 @@ func request_OrderService_GetRefund_0(ctx context.Context, marshaler runtime.Mar
 	return msg, metadata, err
 }
 
-func local_request_OrderService_GetRefund_0(ctx context.Context, marshaler runtime.Marshaler, server OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_OrderService_GetRefund_0(ctx context.Context, marshaler runtime.Marshaler, server extOrderv1.OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq GetRefundRequest
+		protoReq extOrderv1.GetRefundRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := req.ParseForm(); err != nil {
@@ -251,9 +252,9 @@ func local_request_OrderService_GetRefund_0(ctx context.Context, marshaler runti
 
 var filter_OrderService_ListOrderEvents_0 = &utilities.DoubleArray{Encoding: map[string]int{}, Base: []int(nil), Check: []int(nil)}
 
-func request_OrderService_ListOrderEvents_0(ctx context.Context, marshaler runtime.Marshaler, client OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func request_OrderService_ListOrderEvents_0(ctx context.Context, marshaler runtime.Marshaler, client extOrderv1.OrderServiceClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq ListOrderEventsRequest
+		protoReq extOrderv1.ListOrderEventsRequest
 		metadata runtime.ServerMetadata
 	)
 	if req.Body != nil {
@@ -269,9 +270,9 @@ func request_OrderService_ListOrderEvents_0(ctx context.Context, marshaler runti
 	return msg, metadata, err
 }
 
-func local_request_OrderService_ListOrderEvents_0(ctx context.Context, marshaler runtime.Marshaler, server OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+func local_request_OrderService_ListOrderEvents_0(ctx context.Context, marshaler runtime.Marshaler, server extOrderv1.OrderServiceServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
-		protoReq ListOrderEventsRequest
+		protoReq extOrderv1.ListOrderEventsRequest
 		metadata runtime.ServerMetadata
 	)
 	if err := req.ParseForm(); err != nil {
@@ -289,7 +290,7 @@ func local_request_OrderService_ListOrderEvents_0(ctx context.Context, marshaler
 // StreamingRPC :currently unsupported pending https://github.com/grpc/grpc-go/issues/906.
 // Note that using this registration option will cause many gRPC library features to stop working. Consider using RegisterOrderServiceHandlerFromEndpoint instead.
 // GRPC interceptors will not work for this type of registration. To use interceptors, you must use the "runtime.WithMiddlewares" option in the "runtime.NewServeMux" call.
-func RegisterOrderServiceHandlerServer(ctx context.Context, mux *runtime.ServeMux, server OrderServiceServer) error {
+func RegisterOrderServiceHandlerServer(ctx context.Context, mux *runtime.ServeMux, server extOrderv1.OrderServiceServer) error {
 	mux.Handle(http.MethodPost, pattern_OrderService_CreateOrder_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -461,15 +462,15 @@ func RegisterOrderServiceHandlerFromEndpoint(ctx context.Context, mux *runtime.S
 // RegisterOrderServiceHandler registers the http handlers for service OrderService to "mux".
 // The handlers forward requests to the grpc endpoint over "conn".
 func RegisterOrderServiceHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
-	return RegisterOrderServiceHandlerClient(ctx, mux, NewOrderServiceClient(conn))
+	return RegisterOrderServiceHandlerClient(ctx, mux, extOrderv1.NewOrderServiceClient(conn))
 }
 
 // RegisterOrderServiceHandlerClient registers the http handlers for service OrderService
-// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "OrderServiceClient".
-// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "OrderServiceClient"
+// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "extOrderv1.OrderServiceClient".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "extOrderv1.OrderServiceClient"
 // doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
-// "OrderServiceClient" to call the correct interceptors. This client ignores the HTTP middlewares.
-func RegisterOrderServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client OrderServiceClient) error {
+// "extOrderv1.OrderServiceClient" to call the correct interceptors. This client ignores the HTTP middlewares.
+func RegisterOrderServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client extOrderv1.OrderServiceClient) error {
 	mux.Handle(http.MethodPost, pattern_OrderService_CreateOrder_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()

@@ -10,13 +10,16 @@ plugins:
   - remote: buf.build/grpc/go
     out: ../pb
     opt: paths=source_relative
-  # REST 反向代理(依据 google.api.http 生成)
+  # REST 反向代理(standalone=true:生成独立包并 import pb 消息,而非同包)。
+  # 落 ../internal/gateway(仅服务端编译),使契约模块 pb 不带 grpc-gateway 依赖。
   - remote: buf.build/grpc-ecosystem/gateway
-    out: ../pb
-    opt: paths=source_relative
-  # OpenAPI v2(交付 PHP 等非 gRPC 接入方),合并为单文件 pb/order.swagger.json
+    out: ../internal/gateway
+    opt:
+      - paths=source_relative
+      - standalone=true
+  # OpenAPI v2(交付 PHP 等非 gRPC 接入方),合并为单文件 docs/openapi/order.swagger.json
   - remote: buf.build/grpc-ecosystem/openapiv2
-    out: ../pb
+    out: ../docs/openapi
     opt:
       - allow_merge=true
       - merge_file_name=order
