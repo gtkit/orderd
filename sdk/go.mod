@@ -3,13 +3,12 @@ module github.com/gtkit/orderd/sdk
 go 1.26
 
 require (
-	github.com/gtkit/orderd/pb v1.0.0
+	github.com/gtkit/orderd/pb v1.1.0
 	google.golang.org/protobuf v1.36.11
 )
 
 require (
 	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260709200747-435963d16310.1 // indirect
-	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
