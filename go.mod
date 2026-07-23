@@ -14,7 +14,6 @@ go 1.26
 //   github.com/gtkit/logger         —— 项目统一日志库(禁 slog)
 
 require (
-	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260709200747-435963d16310.1
 	buf.build/go/protovalidate v1.2.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -22,11 +21,15 @@ require (
 	github.com/gtkit/go-pay v1.6.1
 	github.com/gtkit/logger v1.8.1
 	github.com/gtkit/ormx v1.1.0
-	google.golang.org/genproto/googleapis/api v0.0.0-20260715232425-e75dac1f907d
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/gorm v1.31.2
+)
+
+require (
+	buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go v1.36.11-20260709200747-435963d16310.1 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260720211330-0afa2a65878a // indirect
 )
 
 require (
@@ -41,6 +44,8 @@ require (
 	github.com/google/cel-go v0.29.2 // indirect
 	github.com/gtkit/json/v2 v2.0.7 // indirect
 	github.com/gtkit/logrotate v1.1.2 // indirect
+	github.com/gtkit/orderd/pb v1.0.0
+	github.com/gtkit/orderd/sdk v1.0.0
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
@@ -62,6 +67,10 @@ require (
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260715232425-e75dac1f907d // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260720155508-bb71a54f79dc // indirect
 	gorm.io/driver/mysql v1.6.0 // indirect
 )
+
+replace github.com/gtkit/orderd/pb => ./pb
+
+replace github.com/gtkit/orderd/sdk => ./sdk
