@@ -8,6 +8,7 @@ import (
 	"github.com/gtkit/logger"
 	"github.com/gtkit/orderd/internal/models"
 	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
+	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/store"
 )
 
@@ -17,6 +18,7 @@ type RefundQueryConfig struct {
 	PollInterval time.Duration
 	BatchSize    int
 	LeaseTTL     time.Duration
+	MaxQueries   int32 // 退款仍处理中且查询次数达此值时告警一次(滞留可见,状态不变)
 	BaseBackoff  time.Duration
 	MaxBackoff   time.Duration
 }
@@ -34,6 +36,9 @@ func (c *RefundQueryConfig) withDefaults() {
 	if c.LeaseTTL == 0 {
 		c.LeaseTTL = 30 * time.Second
 	}
+	if c.MaxQueries == 0 {
+		c.MaxQueries = 6
+	}
 	if c.BaseBackoff == 0 {
 		c.BaseBackoff = 15 * time.Second
 	}
@@ -44,19 +49,20 @@ func (c *RefundQueryConfig) withDefaults() {
 
 // RefundQueryWorker 认领处理中的退款,向网关查单收敛为成功/失败(DESIGN §10)。
 type RefundQueryWorker struct {
-	store  store.Store
-	refund *refundapp.Service
-	cfg    RefundQueryConfig
-	clock  func() time.Time
+	store   store.Store
+	refund  *refundapp.Service
+	alerter alert.Alerter
+	cfg     RefundQueryConfig
+	clock   func() time.Time
 }
 
 // NewRefundQueryWorker 构造退款查单 worker。
-func NewRefundQueryWorker(st store.Store, ref *refundapp.Service, cfg RefundQueryConfig, clock func() time.Time) *RefundQueryWorker {
+func NewRefundQueryWorker(st store.Store, ref *refundapp.Service, alerter alert.Alerter, cfg RefundQueryConfig, clock func() time.Time) *RefundQueryWorker {
 	cfg.withDefaults()
 	if clock == nil {
 		clock = time.Now
 	}
-	return &RefundQueryWorker{store: st, refund: ref, cfg: cfg, clock: clock}
+	return &RefundQueryWorker{store: st, refund: ref, alerter: alerter, cfg: cfg, clock: clock}
 }
 
 // RunOnce 认领一批 PROCESSING 退款并查单;仍处理中的按退避重排。
@@ -81,7 +87,15 @@ func (w *RefundQueryWorker) RunOnce(ctx context.Context) (int, error) {
 }
 
 // rescheduleIfProcessing 若退款仍 PROCESSING,设下次查单时间 + query_count++ + 清租约。
+//
+// 查询次数恰好跨过 MaxQueries 时告警一次(边沿触发,不会每轮刷);告警在事务外发出,
+// 不把外部 IO 放进持锁期间。达阈值只告警不落终态:钱可能实际已退,本地判失败会造成账实不符,
+// 滞留由退款通知或人工介入收敛。
 func (w *RefundQueryWorker) rescheduleIfProcessing(ctx context.Context, refundNo string, prevCount int32) {
+	var (
+		stalled bool
+		orderNo string
+	)
 	err := w.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
 		if err != nil {
@@ -94,9 +108,16 @@ func (w *RefundQueryWorker) rescheduleIfProcessing(ctx context.Context, refundNo
 		rf.NextQueryAt = sql.NullTime{Time: w.clock().Add(jitterBackoff(w.cfg.BaseBackoff, w.cfg.MaxBackoff, rf.QueryCount)), Valid: true}
 		rf.LockedBy = ""
 		rf.LockedUntil = sql.NullTime{}
+		stalled, orderNo = rf.QueryCount == w.cfg.MaxQueries, rf.OrderNo
 		return r.Refunds().Update(ctx, rf)
 	})
 	if err != nil {
 		logger.Warnw("退款查单重排失败", "refund_no", refundNo, "err", err)
+		return
+	}
+	if stalled {
+		w.alerter.Anomaly(ctx, "refund_query_stalled", map[string]any{
+			"refund_no": refundNo, "order_no": orderNo, "query_count": prevCount + 1,
+		})
 	}
 }

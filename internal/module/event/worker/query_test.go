@@ -2,12 +2,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/gtkit/orderd/internal/models"
 	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
 	"github.com/gtkit/orderd/internal/paygateway"
+	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/store"
 	"github.com/gtkit/orderd/internal/store/memstore"
 )
@@ -17,6 +19,7 @@ import (
 type qGateway struct {
 	res      paygateway.QueryResult
 	resErr   error
+	closeErr error
 	refundQR paygateway.RefundQueryResult
 }
 
@@ -27,7 +30,7 @@ func (g qGateway) Prepare(context.Context, paygateway.PrepareInput) (paygateway.
 func (g qGateway) Query(context.Context, paygateway.QueryInput) (paygateway.QueryResult, error) {
 	return g.res, g.resErr
 }
-func (g qGateway) Close(context.Context, paygateway.CloseInput) error { return nil }
+func (g qGateway) Close(context.Context, paygateway.CloseInput) error { return g.closeErr }
 func (g qGateway) Refund(context.Context, paygateway.RefundInput) (paygateway.RefundResult, error) {
 	return paygateway.RefundResult{}, nil
 }
@@ -57,14 +60,19 @@ func (nopAlerter) Anomaly(context.Context, string, map[string]any) {}
 func qClock() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) }
 
 func buildQueryWorker(mem *memstore.Mem, qr paygateway.QueryResult, maxQueries int32) *QueryWorker {
-	router := qRouter{gw: qGateway{res: qr}}
+	return buildQueryWorkerWith(mem, qGateway{res: qr}, maxQueries, nopAlerter{})
+}
+
+// buildQueryWorkerWith 用指定网关与告警端口构造查单 worker(关单失败 / 滞留告警用例)。
+func buildQueryWorkerWith(mem *memstore.Mem, gw paygateway.Gateway, maxQueries int32, alerter alert.Alerter) *QueryWorker {
+	router := qRouter{gw: gw}
 	var n int64
 	pay := paymentapp.New(paymentapp.Deps{
 		Store: mem, Router: router, Accounts: qAccounts{}, Alerter: nopAlerter{}, Clock: qClock,
 		NewEventID: func() (string, error) { n++; return "evt-q-" + itoaW(n), nil },
 		OutTradeNo: func() string { n++; return "PT-q-" + itoaW(n) },
 	})
-	return NewQueryWorker(mem, router, pay, QueryConfig{WorkerID: "q1", MaxQueries: maxQueries}, qClock)
+	return NewQueryWorker(mem, router, pay, alerter, QueryConfig{WorkerID: "q1", MaxQueries: maxQueries}, qClock)
 }
 
 // seed 播种一个订单 + 一个尝试。
@@ -178,6 +186,69 @@ func TestQueryUnknownNotPay(t *testing.T) {
 	}
 	if orderStatus(t, mem, "OD-np") != models.OrderPending {
 		t.Fatal("订单应仍 PENDING")
+	}
+}
+
+func TestQueryClosingNotPayKeepsObserving(t *testing.T) {
+	tests := []struct {
+		name     string
+		closeErr error
+	}{
+		{"关单成功", nil},
+		{"关单失败", errors.New("网关关单失败")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := memstore.New()
+			seed(t, mem, "OD-cn", models.OrderClosing, models.CloseUserCancel, models.AttemptClosing, 0)
+			qw := buildQueryWorkerWith(mem,
+				qGateway{res: paygateway.QueryResult{State: paygateway.QueryNotPay}, closeErr: tc.closeErr},
+				6, nopAlerter{})
+			if _, err := qw.RunOnce(bg); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if attemptStatus(t, mem, "OD-cn") != models.AttemptClosing {
+				t.Fatal("CLOSING 查单=有单未付,关单结果不改变尝试状态")
+			}
+			if orderStatus(t, mem, "OD-cn") != models.OrderClosing {
+				t.Fatal("订单应仍 CLOSING")
+			}
+			a := mem.Attempts("OD-cn")[0]
+			if a.QueryCount != 1 || !a.NextQueryAt.Valid || !a.NextQueryAt.Time.After(qClock()) {
+				t.Fatalf("应 query_count++ 并设未来 next_query_at: %+v", a)
+			}
+		})
+	}
+}
+
+func TestQueryClosingStallAlertEdgeTriggered(t *testing.T) {
+	tests := []struct {
+		name       string
+		queryCount int32 // 播种时已查次数;本轮重排后为 queryCount+1
+		wantAlert  bool
+	}{
+		{"未达阈值不告警", 4, false},
+		{"跨过阈值告警一次", 5, true},
+		{"已超过阈值不再告警", 6, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := memstore.New()
+			seed(t, mem, "OD-st", models.OrderClosing, models.CloseUserCancel, models.AttemptClosing, tc.queryCount)
+			rec := &recAlerter{}
+			qw := buildQueryWorkerWith(mem,
+				qGateway{res: paygateway.QueryResult{State: paygateway.QueryNotPay}, closeErr: errors.New("关不掉")},
+				6, rec)
+			if _, err := qw.RunOnce(bg); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if got := rec.has("attempt_close_stalled"); got != tc.wantAlert {
+				t.Fatalf("attempt_close_stalled 告警期望 %v,实际 %v", tc.wantAlert, got)
+			}
+			if attemptStatus(t, mem, "OD-st") != models.AttemptClosing {
+				t.Fatal("达阈值只告警,尝试状态不变")
+			}
+		})
 	}
 }
 

@@ -135,12 +135,12 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 	secrets := secret.NewStatic(cfg.WebhookSecrets)
 	delivery := worker.NewDelivery(st, endpoints, secrets, sender, alerter,
 		worker.Config{WorkerID: cfg.WorkerID}, clock)
-	query := worker.NewQueryWorker(st, router, pay, worker.QueryConfig{WorkerID: cfg.WorkerID}, clock)
+	query := worker.NewQueryWorker(st, router, pay, alerter, worker.QueryConfig{WorkerID: cfg.WorkerID}, clock)
 	timeout := worker.NewTimeoutWorker(st, ord, pay, worker.TimeoutConfig{WorkerID: cfg.WorkerID}, clock)
 
 	set := worker.Set{Delivery: delivery, Query: query, Timeout: timeout}
 	if cfg.RefundEnabled { // 退款关闭时无 PROCESSING 退款,查单 worker 无需运行
-		set.RefundQuery = worker.NewRefundQueryWorker(st, ref, worker.RefundQueryConfig{WorkerID: cfg.WorkerID}, clock)
+		set.RefundQuery = worker.NewRefundQueryWorker(st, ref, alerter, worker.RefundQueryConfig{WorkerID: cfg.WorkerID}, clock)
 	}
 	// 对账 worker:需真实渠道账单源;V1 默认关闭(ReconcileEnabled=false → 不启动)。
 	if cfg.ReconcileEnabled {

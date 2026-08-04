@@ -44,7 +44,7 @@ require (
 	github.com/google/cel-go v0.29.2 // indirect
 	github.com/gtkit/json/v2 v2.0.7 // indirect
 	github.com/gtkit/logrotate v1.1.2 // indirect
-	github.com/gtkit/orderd/pb v1.0.0
+	github.com/gtkit/orderd/pb v1.1.0
 	github.com/gtkit/orderd/sdk v1.0.0
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect

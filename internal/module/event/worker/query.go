@@ -10,16 +10,20 @@ import (
 	"github.com/gtkit/orderd/internal/models"
 	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
 	"github.com/gtkit/orderd/internal/paygateway"
+	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/store"
 )
 
 // QueryConfig 查单 worker 调优参数。
 type QueryConfig struct {
-	WorkerID       string
-	PollInterval   time.Duration
-	BatchSize      int
-	LeaseTTL       time.Duration
-	MaxQueries     int32 // UNKNOWN 连续"不存在"达此次数后才关闭尝试(§9:不能查不到就换号)
+	WorkerID     string
+	PollInterval time.Duration
+	BatchSize    int
+	LeaseTTL     time.Duration
+	// MaxQueries 查询次数阈值,两处用途:
+	//   1. UNKNOWN 连续"不存在"达此次数后才关闭尝试(§9:不能查不到就换号);
+	//   2. CLOSING 仍报"有单未支付"达此次数时告警一次(滞留可见,状态不变)。
+	MaxQueries     int32
 	BaseBackoff    time.Duration
 	MaxBackoff     time.Duration
 	GatewayTimeout time.Duration // 单次网关调用强制超时(评审 P1)
@@ -57,17 +61,18 @@ type QueryWorker struct {
 	store   store.Store
 	router  paygateway.Router
 	payment *paymentapp.Service
+	alerter alert.Alerter
 	cfg     QueryConfig
 	clock   func() time.Time
 }
 
 // NewQueryWorker 构造查单 worker。
-func NewQueryWorker(st store.Store, router paygateway.Router, pay *paymentapp.Service, cfg QueryConfig, clock func() time.Time) *QueryWorker {
+func NewQueryWorker(st store.Store, router paygateway.Router, pay *paymentapp.Service, alerter alert.Alerter, cfg QueryConfig, clock func() time.Time) *QueryWorker {
 	cfg.withDefaults()
 	if clock == nil {
 		clock = time.Now
 	}
-	return &QueryWorker{store: st, router: router, payment: pay, cfg: cfg, clock: clock}
+	return &QueryWorker{store: st, router: router, payment: pay, alerter: alerter, cfg: cfg, clock: clock}
 }
 
 // RunOnce 认领一批到期尝试并逐个查单收敛;返回处理条数。
@@ -112,7 +117,10 @@ func (q *QueryWorker) handle(ctx context.Context, a *models.PaymentAttempt) {
 		if a.Status == models.AttemptUnknown {
 			_ = q.payment.ApplyQueryNotPaid(ctx, a.OutTradeNo) // →READY,交回调驱动
 		} else { // CLOSING:网关仍有开放单 → 关单后继续观察
-			_ = gw.Close(gctx, paygateway.CloseInput{Channel: a.Channel, PayAccountID: a.PayAccountID, OutTradeNo: a.OutTradeNo})
+			if cerr := gw.Close(gctx, paygateway.CloseInput{Channel: a.Channel, PayAccountID: a.PayAccountID, OutTradeNo: a.OutTradeNo}); cerr != nil {
+				logger.Warnw("关单失败", "channel", a.Channel, "out_trade_no", a.OutTradeNo, "err", cerr)
+			}
+			q.alertIfCloseStalled(ctx, a)
 			q.reschedule(ctx, a)
 		}
 	case paygateway.QueryClosed:
@@ -127,6 +135,20 @@ func (q *QueryWorker) handle(ctx context.Context, a *models.PaymentAttempt) {
 	default: // QueryError
 		q.reschedule(ctx, a)
 	}
+}
+
+// alertIfCloseStalled 在本轮重排使查询次数恰好跨过 MaxQueries 时告警一次(边沿触发:
+// reschedule 会 query_count++,故该等式在单个尝试生命周期内只成立一次,不会每轮刷)。
+//
+// 达阈值只告警,不落终态:关单未生效不代表用户不会在渠道侧付款,强行 CLOSED 会把"结果未知"
+// 变成错误的确定——资金随后入账时只能落异常流水并人工退款。滞留由渠道单自然过期或人工介入收敛。
+func (q *QueryWorker) alertIfCloseStalled(ctx context.Context, a *models.PaymentAttempt) {
+	if a.QueryCount+1 != q.cfg.MaxQueries {
+		return
+	}
+	q.alerter.Anomaly(ctx, "attempt_close_stalled", map[string]any{
+		"channel": a.Channel, "out_trade_no": a.OutTradeNo, "query_count": a.QueryCount + 1,
+	})
 }
 
 // reschedule 保持当前查单状态,设下次查单时间(退避)+ query_count++ + 清租约。
