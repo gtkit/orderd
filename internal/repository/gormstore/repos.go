@@ -104,9 +104,9 @@ func (r attemptRepo) GetActiveByOrder(ctx context.Context, orderNo string, fu bo
 	return &a, nil
 }
 
-func (r attemptRepo) GetByOutTradeNo(ctx context.Context, outTradeNo string) (*models.PaymentAttempt, error) {
+func (r attemptRepo) GetByOutTradeNo(ctx context.Context, outTradeNo string, fu bool) (*models.PaymentAttempt, error) {
 	var a models.PaymentAttempt
-	err := dbOf(ctx, r.base).Where("out_trade_no = ?", outTradeNo).Take(&a).Error
+	err := forUpdate(dbOf(ctx, r.base), fu).Where("out_trade_no = ?", outTradeNo).Take(&a).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -255,6 +255,17 @@ func (r refundRepo) ClaimQueryDue(ctx context.Context, workerID string, now, lea
 	for _, rf := range out {
 		rf.LockedBy = workerID
 		rf.LockedUntil = nullTime(leaseUntil)
+	}
+	return out, nil
+}
+
+func (r refundRepo) ListStuckCreated(ctx context.Context, before time.Time, limit int) ([]*models.Refund, error) {
+	var out []*models.Refund
+	// status=0(CREATED)且创建早于 before(走 idx_status)。
+	err := dbOf(ctx, r.base).
+		Where("status = ? AND created_at < ?", models.RefundCreated, before).Limit(limit).Find(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("gormstore: list stuck created refunds: %w", err)
 	}
 	return out, nil
 }

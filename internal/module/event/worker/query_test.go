@@ -97,6 +97,68 @@ func seed(t *testing.T, mem *memstore.Mem, orderNo string, os models.OrderStatus
 	}
 }
 
+// TestRescheduleDoesNotOverwriteConcurrentState 反证 queryworker-state-safety:
+// worker 认领快照后,尝试被应用路径推进(取消→CLOSING、回调→PAID),重排绝不回写陈旧状态
+// (旧实现整行回写含 Status,本测试失败);状态未变时正常重排。
+func TestRescheduleDoesNotOverwriteConcurrentState(t *testing.T) {
+	tests := []struct {
+		name        string
+		concurrent  models.AttemptStatus // 认领快照(UNKNOWN)之后库内被推进到的状态
+		wantStatus  models.AttemptStatus
+		wantCount   int32 // 收敛集合外放弃重排(count 不变);集合内正常推进调度字段
+		wantNextSet bool
+	}{
+		// CLOSING 仍在收敛集合内:状态保持 CLOSING(不打回 UNKNOWN),调度字段照常推进。
+		{"被取消推进为CLOSING不回写", models.AttemptClosing, models.AttemptClosing, 1, true},
+		// PAID 在集合外:放弃重排,任何字段都不动。
+		{"被回调推进为PAID不回写", models.AttemptPaid, models.AttemptPaid, 0, false},
+		{"状态未变正常重排", models.AttemptUnknown, models.AttemptUnknown, 1, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := memstore.New()
+			seed(t, mem, "OD-rs", models.OrderPending, models.CloseNone, models.AttemptUnknown, 0)
+			qw := buildQueryWorker(mem, paygateway.QueryResult{State: paygateway.QueryError}, 6)
+
+			// 认领快照(UNKNOWN,query_count=0)。
+			stale, err := mem.Reader().Attempts().GetByOutTradeNo(context.Background(), "PT-OD-rs", false)
+			if err != nil || stale == nil {
+				t.Fatalf("取快照失败: %v", err)
+			}
+			// 模拟网关调用期间应用路径推进状态。
+			if tc.concurrent != models.AttemptUnknown {
+				err := mem.WithinTx(context.Background(), func(ctx context.Context, r store.Repos) error {
+					cur, e := r.Attempts().GetByOutTradeNo(ctx, "PT-OD-rs", true)
+					if e != nil {
+						return e
+					}
+					cur.Status = tc.concurrent
+					return r.Attempts().Update(ctx, cur)
+				})
+				if err != nil {
+					t.Fatalf("推进状态失败: %v", err)
+				}
+			}
+
+			qw.reschedule(context.Background(), stale)
+
+			got, err := mem.Reader().Attempts().GetByOutTradeNo(context.Background(), "PT-OD-rs", false)
+			if err != nil || got == nil {
+				t.Fatalf("读尝试失败: %v", err)
+			}
+			if got.Status != tc.wantStatus {
+				t.Fatalf("状态期望 %v,实际 %v(陈旧回写)", tc.wantStatus, got.Status)
+			}
+			if got.QueryCount != tc.wantCount {
+				t.Fatalf("query_count 期望 %d,实际 %d", tc.wantCount, got.QueryCount)
+			}
+			if got.NextQueryAt.Valid != tc.wantNextSet {
+				t.Fatalf("next_query_at 设置期望 %v,实际 %v", tc.wantNextSet, got.NextQueryAt.Valid)
+			}
+		})
+	}
+}
+
 func orderStatus(t *testing.T, mem *memstore.Mem, orderNo string) models.OrderStatus {
 	t.Helper()
 	o, err := mem.Reader().Orders().GetByOrderNo(context.Background(), "app1", orderNo, false)

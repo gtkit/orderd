@@ -97,6 +97,32 @@ func TestOrderTransitions(t *testing.T) {
 	}
 }
 
+// TestCanSettlePayment 结算准入白名单全状态枚举:仅 PENDING/CLOSING/CLOSED 可结算;
+// 特别地 REFUNDING 虽有 CanOrderTransit(REFUNDING,PAID)=true(退款回退专用边),但不可结算。
+func TestCanSettlePayment(t *testing.T) {
+	cases := []struct {
+		s    OrderStatus
+		want bool
+	}{
+		{OrderPending, true},
+		{OrderClosing, true},
+		{OrderClosed, true}, // 异常恢复:查单证明真实付款
+		{OrderPaid, false},
+		{OrderCancelled, false},
+		{OrderRefunding, false}, // 退款回退边不可被支付确认借道
+		{OrderRefunded, false},
+		{OrderRefundException, false},
+	}
+	for _, c := range cases {
+		if got := CanSettlePayment(c.s); got != c.want {
+			t.Fatalf("CanSettlePayment(%d)=%v,want %v", c.s, got, c.want)
+		}
+	}
+	if !CanOrderTransit(OrderRefunding, OrderPaid) {
+		t.Fatal("REFUNDING→PAID 状态机边(退款失败回退)必须保留")
+	}
+}
+
 func TestAttemptAndRefundTransitions(t *testing.T) {
 	if !CanAttemptTransit(AttemptClosed, AttemptPaid) {
 		t.Fatal("CLOSED→PAID(异常恢复)应允许")

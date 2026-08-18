@@ -185,7 +185,7 @@ func (s *Service) PreparePayment(ctx context.Context, in PrepareInput) (PrepareO
 			// 期间被取消/关单:不再置就绪,尝试留待 reconcile(评审 #8 取消 vs 建尝试竞态)。
 			return models.ErrOrderNotPending
 		}
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
 		if err != nil {
 			return err
 		}
@@ -209,7 +209,7 @@ func (s *Service) markAttemptUnknown(outTradeNo string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
 		if err != nil || a == nil {
 			return err
 		}
@@ -258,7 +258,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 	var alertOrderNo string
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		// 权威身份由 out_trade_no 唯一派生(评审 P0):不信任回调传入的 order_no/app_id。
-		attempt, err := r.Attempts().GetByOutTradeNo(ctx, in.OutTradeNo)
+		attempt, err := r.Attempts().GetByOutTradeNo(ctx, in.OutTradeNo, false)
 		if err != nil {
 			return err
 		}
@@ -290,14 +290,25 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 				res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: "duplicate_txn_mismatch"}
 				return nil
 			}
+			// 该交易已结算过本订单:若尝试仍占活跃槽(状态被并发回写打回/前次事务半途),
+			// 补推进到 PAID 释放槽位;不推进则查单 worker 每轮"查到已付→duplicate→重排"永不收敛。
+			// 置 PAID 只释放 active_order 槽位、不申请,不会触发唯一守卫冲突。
+			if attempt.Status.Active() {
+				attempt.Status = models.AttemptPaid
+				if err := r.Attempts().Update(ctx, attempt); err != nil {
+					return err
+				}
+			}
 			res = ConfirmResult{Outcome: "duplicate"}
 			return nil
 		}
 
 		mismatch := in.Amount != o.PayAmount || (in.Currency != "" && in.Currency != o.Currency)
 
-		// 2) 订单已不可再跃迁到 PAID:第二笔真实付款 → 落 anomaly 流水,不改订单(评审 #4)。
-		if !models.CanOrderTransit(o.Status, models.OrderPaid) {
+		// 2) 订单状态不在结算白名单(含 PAID/退款域/已取消):第二笔真实付款 → 落 anomaly 流水,
+		// 不改订单(评审 #4)。准入用 CanSettlePayment 而非状态机全表:REFUNDING→PAID 是
+		// 退款失败回退专用边,支付确认借道会把退款中订单错误拉回 PAID(覆盖快照+二次发事件)。
+		if !models.CanSettlePayment(o.Status) {
 			if err := s.insertTxn(ctx, r, o, in, attempt, true); err != nil {
 				return err
 			}
@@ -402,7 +413,7 @@ func (s *Service) ConfirmPayFromQuery(ctx context.Context, a *models.PaymentAtte
 // RecoverStuckRequesting 卡死在 REQUESTING 的尝试 → UNKNOWN(交查单 worker 收敛,超时 watchdog 调用)。
 func (s *Service) RecoverStuckRequesting(ctx context.Context, outTradeNo string) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
 		if err != nil || a == nil {
 			return err
 		}
@@ -417,7 +428,7 @@ func (s *Service) RecoverStuckRequesting(ctx context.Context, outTradeNo string)
 // ApplyQueryNotPaid 查单=有单未支付 → UNKNOWN 尝试恢复为 READY(可继续等待回调)。
 func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
 		if err != nil || a == nil {
 			return err
 		}
@@ -433,7 +444,7 @@ func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string) erro
 // 若订单处于 CLOSING 且已无活跃尝试,则订单转 CLOSED 并发 order.closed 事件(完成取消/关单闭环)。
 func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo string) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
 		if err != nil || a == nil {
 			return err
 		}

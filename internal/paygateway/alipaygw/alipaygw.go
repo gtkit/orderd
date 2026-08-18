@@ -136,6 +136,11 @@ func (g *Gateway) Refund(ctx context.Context, in paygateway.RefundInput) (paygat
 func (g *Gateway) RefundQuery(ctx context.Context, in paygateway.RefundQueryInput) (paygateway.RefundQueryResult, error) {
 	rsp, err := g.provider.QueryRefund(ctx, &paymgr.QueryRefundRequest{OutTradeNo: in.OutTradeNo, OutRefundNo: in.OutRefundNo})
 	if err != nil {
+		// paymgr 未单列"退款单不存在";尽力从错误串识别(支付宝 ACQ.TRADE_NOT_EXIST)。
+		// 识别不了的错误一律 RefundQueryError(继续重试),绝不猜测性落终态。
+		if strings.Contains(strings.ToUpper(err.Error()), "NOT_EXIST") {
+			return paygateway.RefundQueryResult{State: paygateway.RefundQueryNotExist}, nil
+		}
 		return paygateway.RefundQueryResult{State: paygateway.RefundQueryError}, err
 	}
 	switch rsp.RefundStatus {

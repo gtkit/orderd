@@ -136,7 +136,7 @@ func (r attemptRepo) GetActiveByOrder(_ context.Context, orderNo string, _ bool)
 	return nil, nil
 }
 
-func (r attemptRepo) GetByOutTradeNo(_ context.Context, outTradeNo string) (*models.PaymentAttempt, error) {
+func (r attemptRepo) GetByOutTradeNo(_ context.Context, outTradeNo string, _ bool) (*models.PaymentAttempt, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.attempts {
@@ -265,6 +265,9 @@ func (r refundRepo) Insert(_ context.Context, rf *models.Refund) error {
 	}
 	d.seq++
 	rf.ID = d.seq
+	if rf.CreatedAt.IsZero() {
+		rf.CreatedAt = time.Now() // 对齐 DDL DEFAULT CURRENT_TIMESTAMP(ListStuckCreated 依赖)
+	}
 	d.refunds[rf.ID] = *rf
 	return nil
 }
@@ -322,6 +325,23 @@ func (r refundRepo) ClaimQueryDue(_ context.Context, workerID string, now, lease
 		e.LockedBy = workerID
 		e.LockedUntil = sql.NullTime{Time: leaseUntil, Valid: true}
 		r.m.d.refunds[id] = e
+		cp := e
+		out = append(out, &cp)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (r refundRepo) ListStuckCreated(_ context.Context, before time.Time, limit int) ([]*models.Refund, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	var out []*models.Refund
+	for _, e := range r.m.d.refunds {
+		if e.Status != models.RefundCreated || !e.CreatedAt.Before(before) {
+			continue
+		}
 		cp := e
 		out = append(out, &cp)
 		if len(out) >= limit {

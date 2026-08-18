@@ -132,13 +132,22 @@ func (s *Service) CreateOrder(ctx context.Context, in CreateInput) (CreateOutcom
 	})
 	if insertErr != nil {
 		// 并发同幂等键:一方胜出,另一方命中唯一键 → 重新按幂等语义收敛(复用或冲突)。
-		if errors.Is(insertErr, store.ErrDuplicate) && idemKey.Valid {
-			existing, ferr := s.d.Store.Reader().Orders().FindByIdempotencyKey(ctx, in.AppID, idemKey.String)
-			if ferr != nil {
-				return CreateOutcome{}, ferr
+		if errors.Is(insertErr, store.ErrDuplicate) {
+			if idemKey.Valid {
+				existing, ferr := s.d.Store.Reader().Orders().FindByIdempotencyKey(ctx, in.AppID, idemKey.String)
+				if ferr != nil {
+					return CreateOutcome{}, ferr
+				}
+				if existing != nil {
+					return s.reuse(ctx, existing, hash, in)
+				}
 			}
-			if existing != nil {
-				return s.reuse(ctx, existing, hash, in)
+			// 幂等键路径无法复用:client_order_no 归一化非空(空串/空白落库为 NULL,不参与唯一键)
+			// 时冲突来自 uk_app_client_order(业务单号被其它订单占用),返回可判定错误,
+			// 调用方据此查旧单或换单号;否则只可能是 order_no/order_token 罕见碰撞,
+			// 按未分类错误返回(重试即换号)。
+			if o.ClientOrderNo.Valid {
+				return CreateOutcome{}, fmt.Errorf("%w: client_order_no=%q", models.ErrClientOrderNoConflict, o.ClientOrderNo.String)
 			}
 		}
 		return CreateOutcome{}, insertErr
@@ -214,7 +223,8 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 			return err
 		}
 		prev := o.Status
-		if !submitted {
+		switch {
+		case !submitted:
 			// 从未提交网关:安全进入 CANCELLED;顺手关闭未提交的活跃尝试(CREATED)。
 			if active != nil {
 				active.Status = models.AttemptClosed
@@ -237,13 +247,14 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 			if err := eventapp.WriteEvent(ctx, r, o.AppID, o.OrderNo, env); err != nil {
 				return err
 			}
-		} else {
-			// 存在已提交网关的尝试:转 CLOSING(user_cancel),由 reconcile 关单确认后才 CLOSED。
-			if active != nil && active.Status.Active() {
-				active.Status = models.AttemptClosing
-				if err := r.Attempts().Update(ctx, active); err != nil {
-					return err
-				}
+			if err := eventapp.WriteLog(ctx, r, o, prev, "user", "用户取消"); err != nil {
+				return err
+			}
+		case active != nil && active.Status.Active():
+			// 存在活跃的已提交尝试:转 CLOSING(user_cancel),由查单 worker 网关确认后才 CLOSED。
+			active.Status = models.AttemptClosing
+			if err := r.Attempts().Update(ctx, active); err != nil {
+				return err
 			}
 			o.Status = models.OrderClosing
 			o.CloseReason = models.CloseUserCancel
@@ -251,10 +262,41 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 			if err := r.Orders().Update(ctx, o); err != nil {
 				return err
 			}
-			// CLOSING 未确认关闭,暂不发 order.closed(待 reconcile CLOSING→CLOSED 时发)。
-		}
-		if err := eventapp.WriteLog(ctx, r, o, prev, "user", "用户取消"); err != nil {
-			return err
+			// CLOSING 未确认关闭,暂不发 order.closed(待查单 worker CLOSING→CLOSED 时发)。
+			if err := eventapp.WriteLog(ctx, r, o, prev, "user", "用户取消"); err != nil {
+				return err
+			}
+		default:
+			// 曾提交但已无活跃尝试:全部已提交尝试均被网关确认终态(CLOSED/FAILED),无需再求证。
+			// 同事务 CLOSING→CLOSED 落定 + closed 事件——否则查单 worker 只认领活跃尝试,
+			// 没有任何 worker 会再碰这笔订单,将永久滞留 CLOSING。选 CLOSED 不选 CANCELLED:
+			// 保留 CLOSED→PAID 异常恢复边,应对渠道侧延迟入账;CANCELLED 保持"从未提交"强语义。
+			o.Status = models.OrderClosing
+			o.CloseReason = models.CloseUserCancel
+			o.AggregateVersion++
+			if err := r.Orders().Update(ctx, o); err != nil {
+				return err
+			}
+			if err := eventapp.WriteLog(ctx, r, o, prev, "user", "用户取消"); err != nil {
+				return err
+			}
+			prev2 := o.Status
+			o.Status = models.OrderClosed
+			o.AggregateVersion++
+			if err := r.Orders().Update(ctx, o); err != nil {
+				return err
+			}
+			if err := eventapp.WriteLog(ctx, r, o, prev2, "system", "关单确认(无活跃尝试)"); err != nil {
+				return err
+			}
+			eid, err := s.d.NewEventID()
+			if err != nil {
+				return err
+			}
+			env := models.BuildClosedEnvelope(o, prev2, eid, s.d.Clock())
+			if err := eventapp.WriteEvent(ctx, r, o.AppID, o.OrderNo, env); err != nil {
+				return err
+			}
 		}
 		result = o.Status
 		return nil
@@ -263,7 +305,8 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 }
 
 // CloseIfExpired 超时关单(超时 watchdog 调用,DESIGN §15):过期 PENDING → CLOSING(TIMEOUT);
-// 从未提交网关则同事务 CLOSING→CLOSED + order.closed;有提交历史留 CLOSING,由查单 worker 确认。
+// 从未提交网关、或曾提交但已无活跃尝试(全部尝试已被网关确认终态)→ 同事务 CLOSING→CLOSED
+// + order.closed;仍有活跃已提交尝试才留 CLOSING,由查单 worker 确认。
 // 行锁 + 状态复核保证多副本幂等。
 func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (models.OrderStatus, error) {
 	var result models.OrderStatus
@@ -300,8 +343,10 @@ func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (mo
 		if err := eventapp.WriteLog(ctx, r, o, prev, "system", "支付超时"); err != nil {
 			return err
 		}
-		if !submitted {
-			// 无网关交互 → 立即确认关闭:活跃尝试(CREATED)→CLOSED,订单 CLOSING→CLOSED + closed 事件。
+		if !submitted || active == nil {
+			// 立即确认关闭:从未提交网关(无网关交互),或曾提交但已无活跃尝试(全部尝试
+			// 均被网关确认终态,无需再求证——不落定则无 worker 认领,订单永久滞留 CLOSING)。
+			// 活跃尝试(CREATED)→CLOSED,订单 CLOSING→CLOSED + closed 事件。
 			if active != nil {
 				active.Status = models.AttemptClosed
 				if err := r.Attempts().Update(ctx, active); err != nil {

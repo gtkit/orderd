@@ -24,6 +24,20 @@ var orderTransitions = map[OrderStatus]map[OrderStatus]bool{
 // CanOrderTransit 报告订单能否从 from 跃迁到 to。
 func CanOrderTransit(from, to OrderStatus) bool { return orderTransitions[from][to] }
 
+// CanSettlePayment 报告订单当前状态能否接受一笔支付成功结算(胜出:跃迁 PAID + 写快照 + 发事件)。
+// 注意它不是 CanOrderTransit(s, OrderPaid):REFUNDING→PAID 是【退款失败回退】专用边,
+// 支付确认路径绝不允许借道——退款中/已退款订单收到的新真实交易只能落 anomaly 流水
+// (second_real_payment),否则会把订单从退款域拉回 PAID、覆盖 settled_* 快照并二次发 order.paid。
+// 白名单:PENDING/CLOSING 正常结算;CLOSED→PAID 为异常恢复(网关查单证明真实付款)。
+func CanSettlePayment(s OrderStatus) bool {
+	switch s {
+	case OrderPending, OrderClosing, OrderClosed:
+		return true
+	default:
+		return false
+	}
+}
+
 // ---------------------------------------------------------------------
 // 支付尝试状态机(DESIGN §9)
 // ---------------------------------------------------------------------

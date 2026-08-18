@@ -17,6 +17,8 @@ func toStatus(err error) error {
 	switch {
 	case errors.Is(err, models.ErrIdempotencyConflict):
 		return status.Error(codes.AlreadyExists, "IDEMPOTENCY_CONFLICT")
+	case errors.Is(err, models.ErrClientOrderNoConflict):
+		return status.Error(codes.AlreadyExists, "CLIENT_ORDER_NO_CONFLICT")
 	case errors.Is(err, models.ErrOrderNotFound), errors.Is(err, models.ErrRefundNotFound):
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, models.ErrOrderNotOwned):

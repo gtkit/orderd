@@ -57,6 +57,10 @@ type fakeGateway struct {
 	lastPrepare     paygateway.PrepareInput
 	refunds         []refundCall
 	refundNotAccept bool
+	refundErr       error // Refund 返回该错误(模拟超时/网络错误,结果未知)
+	// refundQuerySet=true 时 RefundQuery 返回 refundQuery(测试自定义退款查单结果)。
+	refundQuery    paygateway.RefundQueryResult
+	refundQuerySet bool
 }
 
 func (g *fakeGateway) Prepare(_ context.Context, in paygateway.PrepareInput) (paygateway.PrepareResult, error) {
@@ -77,14 +81,22 @@ func (g *fakeGateway) Refund(_ context.Context, in paygateway.RefundInput) (payg
 	g.mu.Lock()
 	g.refunds = append(g.refunds, refundCall{Channel: in.Channel, PayAccountID: in.PayAccountID, OutTradeNo: in.OutTradeNo, OutRefundNo: in.OutRefundNo})
 	g.mu.Unlock()
+	if g.refundErr != nil {
+		return paygateway.RefundResult{}, g.refundErr
+	}
 	if g.refundNotAccept {
 		return paygateway.RefundResult{Accepted: false}, nil
 	}
 	return paygateway.RefundResult{GatewayRefundID: "gwr-" + in.OutRefundNo, Accepted: true}, nil
 }
 
-// RefundQuery 供退款查单 worker(测试默认返回成功)。
+// RefundQuery 供退款查单 worker(测试默认返回成功,可用 refundQuerySet 覆盖)。
 func (g *fakeGateway) RefundQuery(_ context.Context, in paygateway.RefundQueryInput) (paygateway.RefundQueryResult, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refundQuerySet {
+		return g.refundQuery, nil
+	}
 	return paygateway.RefundQueryResult{State: paygateway.RefundQuerySucceeded, GatewayRefundID: "gwr-" + in.OutRefundNo, TransactionID: "rtx-" + in.OutRefundNo, Amount: 90}, nil
 }
 

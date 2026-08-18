@@ -2,6 +2,7 @@ package wechatgw
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,12 +15,13 @@ import (
 // 额外实现 ACKNotify 以满足本包 provider 接口。
 type fakeProvider struct {
 	paymgr.UnimplementedProvider
-	unified *paymgr.UnifiedOrderResponse
-	query   *paymgr.QueryOrderResponse
-	refund  *paymgr.RefundResponse
-	rquery  *paymgr.QueryRefundResponse
-	notify  *paymgr.NotifyResult
-	acked   bool
+	unified   *paymgr.UnifiedOrderResponse
+	query     *paymgr.QueryOrderResponse
+	refund    *paymgr.RefundResponse
+	rquery    *paymgr.QueryRefundResponse
+	rqueryErr error
+	notify    *paymgr.NotifyResult
+	acked     bool
 }
 
 func (f *fakeProvider) Channel() paymgr.Channel { return paymgr.ChannelWechat }
@@ -36,6 +38,9 @@ func (f *fakeProvider) Refund(context.Context, *paymgr.RefundRequest) (*paymgr.R
 }
 
 func (f *fakeProvider) QueryRefund(context.Context, *paymgr.QueryRefundRequest) (*paymgr.QueryRefundResponse, error) {
+	if f.rqueryErr != nil {
+		return nil, f.rqueryErr
+	}
 	return f.rquery, nil
 }
 
@@ -104,6 +109,21 @@ func TestRefundAndQueryMapping(t *testing.T) {
 	q3, _ := gw3.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
 	if q3.State != paygateway.RefundQueryProcessing {
 		t.Fatalf("处理中应映射 Processing: %+v", q3)
+	}
+}
+
+func TestRefundQueryErrorMapping(t *testing.T) {
+	// "退款单不存在"类错误(微信 v3 RESOURCE_NOT_EXISTS)→ NotExist(无错误,供阈值终态判定)。
+	gw := gwWith(&fakeProvider{rqueryErr: errors.New("wechat: RESOURCE_NOT_EXISTS 退款单不存在")})
+	q, err := gw.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
+	if err != nil || q.State != paygateway.RefundQueryNotExist {
+		t.Fatalf("NOT_EXIST 错误应映射 NotExist 且无错误: %+v err=%v", q, err)
+	}
+	// 无法归类的错误 → Error(继续重试),绝不猜测性落终态。
+	gw2 := gwWith(&fakeProvider{rqueryErr: errors.New("wechat: SYSTEM_ERROR")})
+	q2, err2 := gw2.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
+	if err2 == nil || q2.State != paygateway.RefundQueryError {
+		t.Fatalf("未知错误应映射 Error 并带错误: %+v err=%v", q2, err2)
 	}
 }
 

@@ -151,15 +151,26 @@ func (q *QueryWorker) alertIfCloseStalled(ctx context.Context, a *models.Payment
 	})
 }
 
-// reschedule 保持当前查单状态,设下次查单时间(退避)+ query_count++ + 清租约。
-// 仅用于状态未被应用层改变的分支(a.Status 仍为 UNKNOWN/CLOSING),避免回写覆盖。
+// reschedule 设下次查单时间(退避)+ query_count++ + 清租约。
+// 事务内按行锁重读并复核状态:仅当尝试仍为 UNKNOWN/CLOSING 才重排;已被应用路径推进
+// (取消→CLOSING→…、回调→PAID)时直接放弃,绝不回写认领时的陈旧状态——认领快照到重排之间
+// 隔着最长 GatewayTimeout 的网关调用,租约只互斥其他 worker,不互斥应用路径写。
 func (q *QueryWorker) reschedule(ctx context.Context, a *models.PaymentAttempt) {
-	a.QueryCount++
-	a.NextQueryAt = sql.NullTime{Time: q.clock().Add(jitterBackoff(q.cfg.BaseBackoff, q.cfg.MaxBackoff, a.QueryCount)), Valid: true}
-	a.LockedBy = ""
-	a.LockedUntil = sql.NullTime{}
 	if err := q.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		return r.Attempts().Update(ctx, a)
+		cur, err := r.Attempts().GetByOutTradeNo(ctx, a.OutTradeNo, true) // 行锁:读-复核-写原子
+		if err != nil || cur == nil {
+			return err
+		}
+		if cur.Status != models.AttemptUnknown && cur.Status != models.AttemptClosing {
+			return nil // 已被推进到收敛集合之外(PAID/CLOSED),放弃重排
+		}
+		// 仍在收敛集合(UNKNOWN,或期间被取消/关单路径推进为 CLOSING):状态取重读值不回写,
+		// 调度字段为 worker 独占,基于重读计数推进。
+		cur.QueryCount++
+		cur.NextQueryAt = sql.NullTime{Time: q.clock().Add(jitterBackoff(q.cfg.BaseBackoff, q.cfg.MaxBackoff, cur.QueryCount)), Valid: true}
+		cur.LockedBy = ""
+		cur.LockedUntil = sql.NullTime{}
+		return r.Attempts().Update(ctx, cur)
 	}); err != nil {
 		logger.Warnw("查单重排失败", "out_trade_no", a.OutTradeNo, "err", err)
 	}

@@ -89,7 +89,9 @@ type AttemptRepo interface {
 	// GetActiveByOrder 返回当前活跃尝试;无则 (nil, nil)。
 	GetActiveByOrder(ctx context.Context, orderNo string, forUpdate bool) (*models.PaymentAttempt, error)
 	// GetByOutTradeNo 按商户订单号定位尝试(支付回调用);无则 (nil, nil)。
-	GetByOutTradeNo(ctx context.Context, outTradeNo string) (*models.PaymentAttempt, error)
+	// forUpdate=true 行锁(仅事务内有意义):供"读-复核-写尝试单行"的路径(如查单 worker 重排)
+	// 原子化;其后还要取订单锁的路径必须传 false,避免与「订单→尝试」取锁顺序成环。
+	GetByOutTradeNo(ctx context.Context, outTradeNo string, forUpdate bool) (*models.PaymentAttempt, error)
 	ListByOrder(ctx context.Context, orderNo string) ([]*models.PaymentAttempt, error)
 	CountByOrder(ctx context.Context, orderNo string) (int, error)
 	// ExistsSubmitted 是否存在曾提交网关(status>=REQUESTING)的尝试(区分 CANCELLED vs CLOSED,评审 #5)。
@@ -112,6 +114,9 @@ type RefundRepo interface {
 	FindByOutRefundNo(ctx context.Context, appID, outRefundNo string) (*models.Refund, error)
 	// ClaimQueryDue 认领待查单退款(status=PROCESSING 且 next_query_at 到期/空、租约空闲),打租约后返回。
 	ClaimQueryDue(ctx context.Context, workerID string, now, leaseUntil time.Time, limit int) ([]*models.Refund, error)
+	// ListStuckCreated 列出停留在 CREATED 且 created_at 早于 before 的退款
+	// (建单事务已提交但网关调用结果丢失的滞留,供退款查单 worker 恢复为 PROCESSING)。
+	ListStuckCreated(ctx context.Context, before time.Time, limit int) ([]*models.Refund, error)
 	Update(ctx context.Context, r *models.Refund) error
 }
 

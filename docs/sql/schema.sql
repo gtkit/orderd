@@ -346,7 +346,7 @@ CREATE TABLE payment_transactions (
     currency           VARCHAR(8)   CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'CNY' COMMENT '币种',
     anomaly            TINYINT      NOT NULL DEFAULT 0 COMMENT '0正常 1资金异常(第二笔真实付款/金额账号不符,待人工)',
     paid_at            DATETIME(3)  NULL COMMENT '发生时间',
-    notify_digest      VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '回调内容摘要(审计防篡改)',
+    notify_digest      VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '通知来源标记(alipay-notify/wechat-notify/query)',
     created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入账时间',
     PRIMARY KEY (id),
     -- 不同渠道 transaction_id 命名空间不同,唯一键含 channel + 账号;

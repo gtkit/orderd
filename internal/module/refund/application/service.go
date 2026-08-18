@@ -30,6 +30,10 @@ type Deps struct {
 	NewEventID     func() (string, error)
 	Enabled        bool          // refund.enabled 配置开关(V1=false)
 	GatewayTimeout time.Duration // 单次网关调用强制超时(评审 P1)
+	// NotExistMaxQueries:退款查单连续"网关无此退款单"达此次数 → 判定退款请求从未落地,
+	// FAILED + 订单回退(防渠道写入延迟误判,故不首查即判)。0 取默认 6。
+	// 与查单 worker 的 MaxQueries(滞留告警阈值,只告警不落终态)语义不同,不复用。
+	NotExistMaxQueries int32
 }
 
 // Service 退款应用服务。
@@ -42,6 +46,9 @@ func New(d Deps) *Service {
 	}
 	if d.GatewayTimeout == 0 {
 		d.GatewayTimeout = 10 * time.Second
+	}
+	if d.NotExistMaxQueries == 0 {
+		d.NotExistMaxQueries = 6
 	}
 	return &Service{d: d}
 }
@@ -141,6 +148,7 @@ func (s *Service) RefundOrder(ctx context.Context, in RefundInput) (RefundOutcom
 	defer cancel()
 	gw, gerr := s.d.Router.Resolve(settledChannel, payAcct)
 	if gerr != nil {
+		// 本地路由失败:请求从未发出,确定失败,回退订单。
 		s.failRefund(in.AppID, in.OrderNo, refundNo, gerr.Error())
 		return RefundOutcome{}, gerr
 	}
@@ -148,33 +156,45 @@ func (s *Service) RefundOrder(ctx context.Context, in RefundInput) (RefundOutcom
 		Channel: settledChannel, PayAccountID: payAcct, OutTradeNo: settledOutTradeNo, OutRefundNo: in.OutRefundNo,
 		RefundAmount: in.RefundAmount, TotalAmount: totalAmount, Currency: "CNY",
 	})
-	if gerr != nil || !rr.Accepted {
+	if gerr != nil {
+		// 结果未知(超时/网络/未知错误):渠道可能已受理,绝不判失败——错判会造成
+		// "钱已退、本地 FAILED、订单回 PAID、refunded 事件不发"的账实与权益双错。
+		// 置 PROCESSING 交退款查单 worker 收敛;从未落地的请求由 NotExist 阈值判失败回退(见 QueryRefund)。
+		s.markRefundProcessing(in.OrderNo, refundNo, "")
+		return RefundOutcome{RefundNo: refundNo, Status: models.RefundProcessing}, nil
+	}
+	if !rr.Accepted {
+		// 网关同步应答明确未受理:确定失败,回退订单。
 		s.failRefund(in.AppID, in.OrderNo, refundNo, "网关未受理退款")
-		if gerr != nil {
-			return RefundOutcome{}, gerr
-		}
 		return RefundOutcome{RefundNo: refundNo, Status: models.RefundFailed}, nil
 	}
+	// 受理成功 → PROCESSING + 设查单时间。
+	s.markRefundProcessing(in.OrderNo, refundNo, rr.GatewayRefundID)
+	return RefundOutcome{RefundNo: refundNo, Status: models.RefundProcessing}, nil
+}
 
-	// 受理成功 → PROCESSING + 设查单时间(不吞错误;失败告警,交退款查单 worker 收敛)。
-	uctx, ucancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer ucancel()
-	uerr := s.d.Store.WithinTx(uctx, func(ctx context.Context, r store.Repos) error {
+// markRefundProcessing 把退款推进到 PROCESSING 并设查单时间(网关已受理带渠道退款单号;
+// 结果未知传空串)。用解耦 ctx,不吞错误;更新失败告警,退款留在 CREATED,
+// 由退款查单 worker 的 CREATED 滞留恢复扫描兜底进入查单收敛。
+func (s *Service) markRefundProcessing(orderNo, refundNo, gatewayRefundID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
 		if err != nil {
 			return err
 		}
 		rf.Status = models.RefundProcessing
-		rf.GatewayRefundID = rr.GatewayRefundID
+		if gatewayRefundID != "" {
+			rf.GatewayRefundID = gatewayRefundID
+		}
 		rf.NextQueryAt = sqlutil.Time(s.d.Clock().Add(10 * time.Second))
 		return r.Refunds().Update(ctx, rf)
 	})
-	if uerr != nil {
-		// 网关已受理但本地未标 PROCESSING:告警,交退款查单 worker 兜底(仍会按 refundNo 查单)。
+	if err != nil {
 		s.d.Alerter.Anomaly(context.Background(), "refund_processing_update_failed",
-			map[string]any{"refund_no": refundNo, "order_no": in.OrderNo, "err": uerr.Error()})
+			map[string]any{"refund_no": refundNo, "order_no": orderNo, "err": err.Error()})
 	}
-	return RefundOutcome{RefundNo: refundNo, Status: models.RefundProcessing}, nil
 }
 
 // failRefund 网关退款失败:退款 → FAILED,订单 REFUNDING→PAID 回退(DESIGN §10)。用解耦 ctx,不吞错误。
@@ -215,7 +235,7 @@ func (s *Service) failRefund(appID, orderNo, refundNo, reason string) {
 // ConfirmRefundSuccess 退款成功单事务(与支付成功同等级,评审 #7):
 // 网关确认退款成功 → 退款 SUCCEEDED + 订单 REFUNDING→REFUNDED + 累计已退 + 不可变退款流水
 // (流水回指 refund_no)+ order.refunded 事件。
-func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gatewayRefundID, transactionID string, amount int64, at time.Time) error {
+func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gatewayRefundID string, amount int64, at time.Time) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
 		if err != nil {
@@ -236,10 +256,13 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gat
 			return err
 		}
 		// 退款成功不可变流水(kind=2,回指 refund_no;渠道用结算渠道)。
+		// transaction_id 用【渠道退款单号】(空则回退 out_refund_no):它才是退款这条资金腿的
+		// 第三方唯一标识;原支付交易号已被 kind=1 流水占用 uk_txn,复用它会让本条流水
+		// 永远因唯一键冲突被丢弃。换源后 ErrDuplicate 只在同一退款重复确认时命中,才是真幂等。
 		if err := r.Transactions().Insert(ctx, &models.PaymentTransaction{
 			AppID: appID, OrderNo: rf.OrderNo, RefundNo: refundNo, PayAccountID: rf.PayAccountID,
 			Channel: sqlutil.OrDefault(o.SettledChannel, o.PayChannel), Kind: models.TxnRefund, OutTradeNo: rf.OutRefundNo,
-			TransactionID: transactionID, Amount: amount, Currency: o.Currency, PaidAt: sqlutil.Time(at),
+			TransactionID: sqlutil.OrDefault(gatewayRefundID, rf.OutRefundNo), Amount: amount, Currency: o.Currency, PaidAt: sqlutil.Time(at),
 		}); err != nil && !errors.Is(err, store.ErrDuplicate) {
 			return err
 		}
@@ -321,9 +344,16 @@ func (s *Service) QueryRefund(ctx context.Context, rf *models.Refund) error {
 		if amt == 0 {
 			amt = rf.RefundAmount
 		}
-		return s.ConfirmRefundSuccess(ctx, rf.AppID, rf.RefundNo, qr.GatewayRefundID, qr.TransactionID, amt, at(qr, s.d.Clock()))
+		return s.ConfirmRefundSuccess(ctx, rf.AppID, rf.RefundNo, qr.GatewayRefundID, amt, at(qr, s.d.Clock()))
 	case paygateway.RefundQueryFailed:
 		s.failRefund(rf.AppID, rf.OrderNo, rf.RefundNo, "网关退款失败")
+		return nil
+	case paygateway.RefundQueryNotExist:
+		// 渠道明确报无此退款单:多次核实(防写入延迟)后判定请求从未落地 → 失败回退。
+		// 与"仍处理中"不同,NotExist 是确定性的否定信号,与支付侧 UNKNOWN 连续查证不存在同模式。
+		if rf.QueryCount+1 >= s.d.NotExistMaxQueries {
+			s.failRefund(rf.AppID, rf.OrderNo, rf.RefundNo, "网关无此退款单(多次查证)")
+		}
 		return nil
 	default: // Processing / Error → 保持,交下次查单
 		return nil

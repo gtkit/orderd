@@ -145,6 +145,11 @@ func (g *Gateway) Refund(ctx context.Context, in paygateway.RefundInput) (paygat
 func (g *Gateway) RefundQuery(ctx context.Context, in paygateway.RefundQueryInput) (paygateway.RefundQueryResult, error) {
 	rsp, err := g.provider.QueryRefund(ctx, &paymgr.QueryRefundRequest{OutTradeNo: in.OutTradeNo, OutRefundNo: in.OutRefundNo})
 	if err != nil {
+		// 尽力从错误串识别"退款单不存在"(微信 v3 RESOURCE_NOT_EXISTS 含 NOT_EXIST;
+		// 具体形态待沙箱联调核对后收紧)。识别不了的错误一律 RefundQueryError(继续重试),绝不猜测性落终态。
+		if strings.Contains(strings.ToUpper(err.Error()), "NOT_EXIST") {
+			return paygateway.RefundQueryResult{State: paygateway.RefundQueryNotExist}, nil
+		}
 		return paygateway.RefundQueryResult{State: paygateway.RefundQueryError}, err
 	}
 	switch rsp.RefundStatus {

@@ -92,6 +92,7 @@ const (
 	RefundQuerySucceeded                          // 退款成功
 	RefundQueryFailed                             // 退款失败(终态)
 	RefundQueryProcessing                         // 处理中
+	RefundQueryNotExist                           // 网关无此退款单(多次核实后判定"退款请求从未落地")
 )
 
 // RefundQueryResult 退款查单结果。

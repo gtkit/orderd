@@ -2,6 +2,7 @@ package alipaygw
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/gtkit/go-pay/paymgr"
@@ -11,10 +12,11 @@ import (
 // fakeProvider 嵌入 UnimplementedProvider,只覆写被测方法(验状态映射,不触网关)。
 type fakeProvider struct {
 	paymgr.UnimplementedProvider
-	unified *paymgr.UnifiedOrderResponse
-	query   *paymgr.QueryOrderResponse
-	refund  *paymgr.RefundResponse
-	rquery  *paymgr.QueryRefundResponse
+	unified   *paymgr.UnifiedOrderResponse
+	query     *paymgr.QueryOrderResponse
+	refund    *paymgr.RefundResponse
+	rquery    *paymgr.QueryRefundResponse
+	rqueryErr error
 }
 
 func (f *fakeProvider) Channel() paymgr.Channel { return paymgr.ChannelAlipay }
@@ -31,6 +33,9 @@ func (f *fakeProvider) Refund(context.Context, *paymgr.RefundRequest) (*paymgr.R
 }
 
 func (f *fakeProvider) QueryRefund(context.Context, *paymgr.QueryRefundRequest) (*paymgr.QueryRefundResponse, error) {
+	if f.rqueryErr != nil {
+		return nil, f.rqueryErr
+	}
 	return f.rquery, nil
 }
 
@@ -91,5 +96,20 @@ func TestRefundAndQueryMapping(t *testing.T) {
 	q3, _ := gw3.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
 	if q3.State != paygateway.RefundQueryProcessing {
 		t.Fatalf("处理中应映射 Processing: %+v", q3)
+	}
+}
+
+func TestRefundQueryErrorMapping(t *testing.T) {
+	// "退款单不存在"类错误 → NotExist(无错误,供阈值终态判定)。
+	gw := gwWith(&fakeProvider{rqueryErr: errors.New("alipay: ACQ.TRADE_NOT_EXIST 交易不存在")})
+	q, err := gw.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
+	if err != nil || q.State != paygateway.RefundQueryNotExist {
+		t.Fatalf("NOT_EXIST 错误应映射 NotExist 且无错误: %+v err=%v", q, err)
+	}
+	// 无法归类的错误 → Error(继续重试),绝不猜测性落终态。
+	gw2 := gwWith(&fakeProvider{rqueryErr: errors.New("alipay: SYSTEM_ERROR")})
+	q2, err2 := gw2.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
+	if err2 == nil || q2.State != paygateway.RefundQueryError {
+		t.Fatalf("未知错误应映射 Error 并带错误: %+v err=%v", q2, err2)
 	}
 }

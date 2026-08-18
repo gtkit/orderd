@@ -10,6 +10,9 @@ var (
 	ErrAmountPolicy = errors.New("金额策略校验失败")
 	// ErrIdempotencyConflict 同一幂等键绑定了不同的归一化请求(同 key 异 hash)。
 	ErrIdempotencyConflict = errors.New("幂等键冲突")
+	// ErrClientOrderNoConflict 同 app 下 client_order_no 已被其它订单占用(与幂等键冲突语义不同:
+	// 前者应查旧单/换业务单号,后者是同键改参)。
+	ErrClientOrderNoConflict = errors.New("业务单号已存在")
 	// ErrIllegalTransition 非法状态跃迁。
 	ErrIllegalTransition = errors.New("非法状态跃迁")
 	// ErrOrderNotFound 订单不存在。
