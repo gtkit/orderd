@@ -49,7 +49,7 @@ func TestRefundQueryWorkerSucceeds(t *testing.T) {
 		t.Fatalf("RunOnce: got=%d err=%v", got, err)
 	}
 
-	rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-r")
+	rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-r", false)
 	if rf.Status != models.RefundSucceeded {
 		t.Fatalf("退款应 SUCCEEDED,实际: %v", rf.Status)
 	}
@@ -140,7 +140,7 @@ func TestRefundQueryWorkerRecoversStuckCreated(t *testing.T) {
 		if got, err := rw.RunOnce(bg); err != nil || got != 1 {
 			t.Fatalf("恢复后应在同轮被认领: got=%d err=%v", got, err)
 		}
-		rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-c1")
+		rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-c1", false)
 		if rf.Status != models.RefundSucceeded {
 			t.Fatalf("滞留 CREATED 应恢复并收敛到 SUCCEEDED,实际: %v", rf.Status)
 		}
@@ -156,7 +156,7 @@ func TestRefundQueryWorkerRecoversStuckCreated(t *testing.T) {
 		if got, err := rw.RunOnce(bg); err != nil || got != 0 {
 			t.Fatalf("阈值内不应恢复/认领: got=%d err=%v", got, err)
 		}
-		rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-c2")
+		rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-c2", false)
 		if rf.Status != models.RefundCreated {
 			t.Fatalf("阈值内 CREATED 应保持不动,实际: %v", rf.Status)
 		}
@@ -174,7 +174,7 @@ func TestRefundQueryWorkerRecoversStuckCreated(t *testing.T) {
 		if got, err := rw.RunOnce(bg); err != nil || got != 0 {
 			t.Fatalf("已收敛后再跑一轮应无认领: got=%d err=%v", got, err)
 		}
-		rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-c3")
+		rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-c3", false)
 		if rf.Status != models.RefundSucceeded {
 			t.Fatalf("状态应保持 SUCCEEDED,实际: %v", rf.Status)
 		}
@@ -210,7 +210,7 @@ func TestRefundQueryStallAlertEdgeTriggered(t *testing.T) {
 			if got := rec.has("refund_query_stalled"); got != tc.wantAlert {
 				t.Fatalf("refund_query_stalled 告警期望 %v,实际 %v", tc.wantAlert, got)
 			}
-			rf, err := mem.Reader().Refunds().GetByRefundNo(bg, "RF-rs")
+			rf, err := mem.Reader().Refunds().GetByRefundNo(bg, "RF-rs", false)
 			if err != nil {
 				t.Fatalf("读退款失败: %v", err)
 			}
@@ -232,7 +232,7 @@ func TestRefundQueryWorkerAmountMismatchConverges(t *testing.T) {
 	if got, err := rw.RunOnce(bg); err != nil || got != 1 {
 		t.Fatalf("RunOnce: got=%d err=%v", got, err)
 	}
-	rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-mm")
+	rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-mm", false)
 	if rf.Status != models.RefundAbnormal {
 		t.Fatalf("金额不符应收敛 ABNORMAL,实际: %v", rf.Status)
 	}

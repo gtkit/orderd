@@ -243,9 +243,9 @@ func (r refundRepo) GetActiveByOrder(ctx context.Context, orderNo string, fu boo
 	return &rf, nil
 }
 
-func (r refundRepo) GetByRefundNo(ctx context.Context, refundNo string) (*models.Refund, error) {
+func (r refundRepo) GetByRefundNo(ctx context.Context, refundNo string, fu bool) (*models.Refund, error) {
 	var rf models.Refund
-	err := dbOf(ctx, r.base).Where("refund_no = ?", refundNo).Take(&rf).Error
+	err := forUpdate(dbOf(ctx, r.base), fu).Where("refund_no = ?", refundNo).Take(&rf).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, store.ErrNotFound
 	}

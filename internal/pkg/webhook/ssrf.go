@@ -46,17 +46,37 @@ func (g *SSRFGuard) inAllowCIDR(ip net.IP) bool {
 	return false
 }
 
+// cgnatCIDR 是 RFC6598 共享地址段(100.64.0.0/10):Go 的 IsPrivate() 不覆盖它,
+// 但云厂商常把内部 LB/k8s service 网段放这里,需视同私网(仅白名单放行)。
+var cgnatCIDR = func() *net.IPNet { _, n, _ := net.ParseCIDR("100.64.0.0/10"); return n }()
+
+// metadataIPs 是恒拒的云实例元数据地址(可取临时凭证):169.254.169.254(多数云,亦属链路本地)、
+// 100.100.100.200(阿里云,非链路本地非私网,IsPrivate 漏判)、fd00:ec2::254(AWS IPv6)。
+// 恒拒:即便落在白名单段内也不放行。
+var metadataIPs = []net.IP{
+	net.ParseIP("169.254.169.254"),
+	net.ParseIP("100.100.100.200"),
+	net.ParseIP("fd00:ec2::254"),
+}
+
 // ipAllowed 判定单个 IP 是否放行(不含 host 白名单豁免)。
 func (g *SSRFGuard) ipAllowed(ip net.IP) bool {
-	// 链路本地(含云元数据 169.254.169.254)始终拒。
+	// 云元数据地址恒拒(优先于任何白名单)。
+	for _, m := range metadataIPs {
+		if m != nil && ip.Equal(m) {
+			return false
+		}
+	}
+	// 链路本地(含元数据 169.254.169.254)始终拒。
 	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return false
 	}
 	if ip.IsUnspecified() || ip.IsMulticast() {
 		return false
 	}
-	if ip.IsLoopback() || ip.IsPrivate() {
-		return g.inAllowCIDR(ip) // 私网仅白名单段放行
+	// 环回/RFC1918 私网 + RFC6598 CGNAT:仅白名单段放行。
+	if ip.IsLoopback() || ip.IsPrivate() || cgnatCIDR.Contains(ip) {
+		return g.inAllowCIDR(ip)
 	}
 	return true // 公网单播放行
 }

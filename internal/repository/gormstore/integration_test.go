@@ -17,6 +17,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/gtkit/orderd/internal/models"
 	orderapp "github.com/gtkit/orderd/internal/module/order/application"
 	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
+	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
 	"github.com/gtkit/orderd/internal/paygateway"
 	"github.com/gtkit/orderd/internal/platform/metrics"
 	"github.com/gtkit/orderd/internal/platform/policy"
@@ -510,5 +512,206 @@ func TestIntegrationAmountPolicy(t *testing.T) {
 	}
 	if _, ok, err := r.Bounds(bg, "app-none"); err != nil || ok {
 		t.Fatalf("未配置应 miss: ok=%v err=%v", ok, err)
+	}
+}
+
+// recAlerter 记录告警 kind(真库并发反证用)。
+type recAlerter struct {
+	mu    sync.Mutex
+	kinds []string
+}
+
+func (a *recAlerter) Anomaly(_ context.Context, kind string, _ map[string]any) {
+	a.mu.Lock()
+	a.kinds = append(a.kinds, kind)
+	a.mu.Unlock()
+}
+func (a *recAlerter) has(kind string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, k := range a.kinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// TestIntegrationApplyQueryNotPaidRace 反证 P1-A:ApplyQueryNotPaid 行锁化后,
+// 并发取消把尝试置 CLOSING 时,查单不会把它盲写覆盖成 READY(修复前:订单 CLOSING+尝试 READY 永久滞留)。
+// 用"另一事务持尝试行锁 + 延迟提交"强制确定性交错。
+func TestIntegrationApplyQueryNotPaidRace(t *testing.T) {
+	st := openTestStore(t)
+	defer func() { _ = st.Close() }()
+	var n int64
+	pay := paymentapp.New(paymentapp.Deps{
+		Store: st, Router: itRouter{}, Accounts: gormstore.NewAccountResolver(st.DB()), Alerter: alert.Nop{}, Clock: time.Now,
+		NewEventID: func() (string, error) { n++; return "evt-r-" + strconv.FormatInt(n, 10), nil },
+		OutTradeNo: func() string { n++; return "PT-r-" + strconv.FormatInt(n, 10) },
+	})
+	// 播种:订单 PENDING + 尝试 UNKNOWN。
+	if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		if e := r.Orders().Insert(ctx, &models.Order{
+			AppID: "app1", OrderNo: "OD-race", OrderToken: "tok-race", UserID: 42, Status: models.OrderPending,
+			ProductID: 1, ProductTitle: "x", Currency: "CNY", OriginalPrice: 90, PayAmount: 90,
+			PayMethod: models.PayMethodWechat, PayChannel: "wechat", PayAccountID: "acc-wechat",
+			ExpireAt: time.Now().Add(time.Hour),
+		}); e != nil {
+			return e
+		}
+		return r.Attempts().Insert(ctx, &models.PaymentAttempt{
+			AppID: "app1", OrderNo: "OD-race", AttemptNo: 1, Channel: "wechat", PayAccountID: "acc-wechat",
+			OutTradeNo: "PT-race", Status: models.AttemptUnknown, ExpireAt: time.Now().Add(time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("播种: %v", err)
+	}
+
+	locked := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+			a, e := r.Attempts().GetByOutTradeNo(ctx, "PT-race", true) // 持尝试行锁
+			if e != nil {
+				return e
+			}
+			a.Status = models.AttemptClosing
+			if e := r.Attempts().Update(ctx, a); e != nil {
+				return e
+			}
+			close(locked)
+			time.Sleep(400 * time.Millisecond) // 持锁,让 ApplyQueryNotPaid 阻塞
+			return nil                         // 提交:尝试=CLOSING
+		})
+	}()
+	<-locked
+	// ApplyQueryNotPaid:行锁化后阻塞在尝试行锁上,B 提交后重读 CLOSING → 不写 READY。
+	if err := pay.ApplyQueryNotPaid(bg, "PT-race"); err != nil {
+		t.Fatalf("ApplyQueryNotPaid: %v", err)
+	}
+	<-done
+	a, err := st.Reader().Attempts().GetByOutTradeNo(bg, "PT-race", false)
+	if err != nil {
+		t.Fatalf("读尝试: %v", err)
+	}
+	if a.Status != models.AttemptClosing {
+		t.Fatalf("行锁复核后应保持 CLOSING(修复前被盲写覆盖成 READY 致永久滞留),实际: %v", a.Status)
+	}
+}
+
+// failRQGateway 的退款查单恒返回 Failed,经 QueryRefund 走公开路径触发 failRefund。
+type failRQGateway struct{ itGateway }
+
+func (failRQGateway) RefundQuery(context.Context, paygateway.RefundQueryInput) (paygateway.RefundQueryResult, error) {
+	return paygateway.RefundQueryResult{State: paygateway.RefundQueryFailed}, nil
+}
+
+type failRQRouter struct{}
+
+func (failRQRouter) Resolve(string, string) (paygateway.Gateway, error) { return failRQGateway{}, nil }
+
+// TestIntegrationRefundFailSuccessRace 反证 P1-B:失败与成功终态互不覆盖,分歧不静默。
+func TestIntegrationRefundFailSuccessRace(t *testing.T) {
+	st := openTestStore(t)
+	defer func() { _ = st.Close() }()
+	rec := &recAlerter{}
+	var n int64
+	mkRef := func(router paygateway.Router, al alert.Alerter) *refundapp.Service {
+		return refundapp.New(refundapp.Deps{
+			Store: st, Router: router, Accounts: gormstore.NewAccountResolver(st.DB()), Alerter: al, Clock: time.Now,
+			NewRefundNo: func() string { n++; return "RF-c-" + strconv.FormatInt(n, 10) },
+			NewEventID:  func() (string, error) { n++; return "evt-c-" + strconv.FormatInt(n, 10), nil },
+			Enabled:     true,
+		})
+	}
+	refNormal := mkRef(itRouter{}, rec)           // ConfirmRefundSuccess 用;告警落 rec
+	refFail := mkRef(failRQRouter{}, alert.Nop{}) // QueryRefund→Failed→failRefund
+	readRf := func(no string) *models.Refund { rf, _ := st.Reader().Refunds().GetByRefundNo(bg, no, false); return rf }
+	seed := func(orderNo, refundNo string) {
+		if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+			if e := r.Orders().Insert(ctx, &models.Order{
+				AppID: "app1", OrderNo: orderNo, OrderToken: "tok-" + orderNo, UserID: 42, Status: models.OrderRefunding,
+				ProductID: 1, ProductTitle: "x", Currency: "CNY", OriginalPrice: 90, PayAmount: 90,
+				PayMethod: models.PayMethodWechat, PayChannel: "wechat", PayAccountID: "acc-wechat",
+				SettledChannel: "wechat", SettledOutTradeNo: "PT-" + orderNo, SettledPayAccountID: "acc-wechat",
+				ExpireAt: time.Now().Add(time.Hour),
+			}); e != nil {
+				return e
+			}
+			return r.Refunds().Insert(ctx, &models.Refund{
+				AppID: "app1", RefundNo: refundNo, OutRefundNo: "or-" + refundNo, OrderNo: orderNo,
+				PayAccountID: "acc-wechat", RefundAmount: 90, Status: models.RefundProcessing,
+			})
+		}); err != nil {
+			t.Fatalf("播种 %s: %v", refundNo, err)
+		}
+	}
+
+	// 正向:failRefund 先(QueryRefund→Failed→退款 FAILED+订单回 PAID),迟到的成功确认不覆盖 + 告警。
+	seed("OD-rc", "RF-rc")
+	if err := refFail.QueryRefund(bg, readRf("RF-rc")); err != nil {
+		t.Fatalf("QueryRefund(失败): %v", err)
+	}
+	if err := refNormal.ConfirmRefundSuccess(bg, "app1", "RF-rc", "gwr-rc", 90, time.Now()); err != nil {
+		t.Fatalf("ConfirmRefundSuccess 不应报错(应降级告警): %v", err)
+	}
+	if readRf("RF-rc").Status != models.RefundFailed {
+		t.Fatalf("失败已终态,成功确认不得覆盖为 SUCCEEDED,实际: %v", readRf("RF-rc").Status)
+	}
+	o, _ := st.Reader().Orders().GetByOrderNo(bg, "app1", "OD-rc", false)
+	if o.Status != models.OrderPaid {
+		t.Fatalf("订单应保持 failRefund 回退后的 PAID,实际: %v", o.Status)
+	}
+	if !rec.has("refund_terminal_conflict") {
+		t.Fatal("成功与失败终态分歧必须告警 refund_terminal_conflict(不静默)")
+	}
+
+	// 反向:成功先落定,failRefund 迟到不得覆盖 SUCCEEDED。
+	seed("OD-rc2", "RF-rc2")
+	if err := refNormal.ConfirmRefundSuccess(bg, "app1", "RF-rc2", "gwr-rc2", 90, time.Now()); err != nil {
+		t.Fatalf("ConfirmRefundSuccess: %v", err)
+	}
+	if err := refFail.QueryRefund(bg, readRf("RF-rc2")); err != nil {
+		t.Fatalf("QueryRefund(迟到失败): %v", err)
+	}
+	if readRf("RF-rc2").Status != models.RefundSucceeded {
+		t.Fatalf("成功已终态,迟到失败不得覆盖为 FAILED,实际: %v", readRf("RF-rc2").Status)
+	}
+}
+
+// TestIntegrationOutboxDeadNoOverwriteDelivered 反证:MarkDelivered 后 MarkDead 不覆盖(status 守卫)。
+func TestIntegrationOutboxDeadNoOverwriteDelivered(t *testing.T) {
+	st := openTestStore(t)
+	defer func() { _ = st.Close() }()
+	var id uint64
+	if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		o := &models.EventOutbox{
+			EventID: "evt-od", AppID: "app1", OrderNo: "OD-od", EventType: models.EventTypePaid,
+			Payload: []byte("p"), Status: models.OutboxPending, NextAttemptAt: time.Now(),
+		}
+		if e := r.Events().InsertOutbox(ctx, o); e != nil {
+			return e
+		}
+		id = o.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("播种: %v", err)
+	}
+	// A 成功:MarkDelivered。
+	if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		return r.Outbox().MarkDelivered(ctx, id)
+	}); err != nil {
+		t.Fatalf("MarkDelivered: %v", err)
+	}
+	// B(陈旧)失败达阈值:MarkDead —— status 守卫应使其不生效。
+	if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		return r.Outbox().MarkDead(ctx, id, 8, "stale failure")
+	}); err != nil {
+		t.Fatalf("MarkDead: %v", err)
+	}
+	ob, _ := st.Reader().Outbox().GetByEventID(bg, "evt-od", false)
+	if ob.Status != models.OutboxDelivered {
+		t.Fatalf("已 Delivered 不得被陈旧 MarkDead 覆盖成 Dead,实际 status=%d", ob.Status)
 	}
 }

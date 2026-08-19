@@ -180,9 +180,12 @@ func (s *Service) markRefundProcessing(orderNo, refundNo, gatewayRefundID string
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
+		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo, true) // 行锁:只写退款单行,与并发写回串行
 		if err != nil {
 			return err
+		}
+		if rf.Status != models.RefundCreated {
+			return nil // 已被推进(查单已收敛/已 PROCESSING),不回写
 		}
 		rf.Status = models.RefundProcessing
 		if gatewayRefundID != "" {
@@ -202,17 +205,23 @@ func (s *Service) failRefund(appID, orderNo, refundNo, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
+		// 统一锁序:先锁订单,再锁退款重读复核(与 ConfirmRefundSuccess 同序,消除死锁环)。
+		o, err := r.Orders().GetByOrderNo(ctx, appID, orderNo, true)
 		if err != nil {
 			return err
+		}
+		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo, true)
+		if err != nil {
+			return err
+		}
+		// 状态前置:仅在途退款(CREATED/PROCESSING)可判失败;已 SUCCEEDED/ABNORMAL/FAILED 终态一律不覆盖
+		// (防成功被迟到的失败路径盲写覆盖 → 账实分歧)。
+		if rf.Status != models.RefundCreated && rf.Status != models.RefundProcessing {
+			return nil
 		}
 		rf.Status = models.RefundFailed
 		rf.LastError = sqlutil.Str(reason)
 		if err := r.Refunds().Update(ctx, rf); err != nil {
-			return err
-		}
-		o, err := r.Orders().GetByOrderNo(ctx, appID, orderNo, true)
-		if err != nil {
 			return err
 		}
 		if o.Status == models.OrderRefunding {
@@ -239,16 +248,33 @@ func (s *Service) failRefund(appID, orderNo, refundNo, reason string) {
 func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gatewayRefundID string, amount int64, at time.Time) error {
 	var (
 		mismatch              bool
+		conflict              bool // 被失败路径抢先(rf 已 FAILED)但渠道确认成功 → 资金分歧,告警人工
 		wantAmount, gotAmount int64
 		orderNo               string
 	)
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
+		// 统一锁序:先无锁读取不可变的 order_no,再"先订单后退款"加锁重读(与 failRefund 同序)。
+		rf0, err := r.Refunds().GetByRefundNo(ctx, refundNo, false)
+		if err != nil {
+			return err
+		}
+		o, err := r.Orders().GetByOrderNo(ctx, appID, rf0.OrderNo, true)
+		if err != nil {
+			return err
+		}
+		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo, true)
 		if err != nil {
 			return err
 		}
 		if rf.Status == models.RefundSucceeded || rf.Status == models.RefundAbnormal {
 			return nil // 幂等:成功与人工终态都不重复处置、不重复告警
+		}
+		if rf.Status == models.RefundFailed {
+			// 失败路径已抢先(如 NotExist 阈值误判/渠道摆动),而此刻渠道确认成功:
+			// 钱可能已退而订单已回退 PAID → 绝不静默,高等级告警交人工核查渠道并调账。
+			// 不自动改状态(避免与可能已发起的第二笔退款撞 active_guard),把 P1 静默资损降级为可见分歧。
+			conflict, orderNo = true, rf.OrderNo
+			return nil
 		}
 		// 校验成功金额与退款单金额一致(评审 P1):不一致=资金异常,同事务落人工终态——
 		// 退款 ABNORMAL(活跃守卫内,人工确认前阻断再次退款)+ 订单 REFUNDING→REFUND_EXCEPTION。
@@ -260,11 +286,7 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gat
 			if err := r.Refunds().Update(ctx, rf); err != nil {
 				return err
 			}
-			o, err := r.Orders().GetByOrderNo(ctx, appID, rf.OrderNo, true)
-			if err != nil {
-				return err
-			}
-			if o.Status == models.OrderRefunding {
+			if o.Status == models.OrderRefunding { // o 为外层已锁定的订单
 				prev := o.Status
 				o.Status = models.OrderRefundException
 				o.AggregateVersion++
@@ -275,11 +297,7 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gat
 			}
 			return nil // 订单已离开 REFUNDING:只落退款终态,不动订单
 		}
-		o, err := r.Orders().GetByOrderNo(ctx, appID, rf.OrderNo, true)
-		if err != nil {
-			return err
-		}
-		// 退款成功不可变流水(kind=2,回指 refund_no;渠道用结算渠道)。
+		// 退款成功不可变流水(kind=2,回指 refund_no;渠道用结算渠道)。o 为外层已锁定的订单。
 		// transaction_id 用【渠道退款单号】(空则回退 out_refund_no):它才是退款这条资金腿的
 		// 第三方唯一标识;原支付交易号已被 kind=1 流水占用 uk_txn,复用它会让本条流水
 		// 永远因唯一键冲突被丢弃。换源后 ErrDuplicate 只在同一退款重复确认时命中,才是真幂等。
@@ -324,6 +342,12 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gat
 			"refund_no": refundNo, "order_no": orderNo, "expected": wantAmount, "got": gotAmount,
 		})
 	}
+	if conflict {
+		s.d.Alerter.Anomaly(ctx, "refund_terminal_conflict", map[string]any{
+			"refund_no": refundNo, "order_no": orderNo,
+			"detail": "退款已判 FAILED 但渠道确认成功:钱可能已退而订单已回退,人工核查渠道并调账",
+		})
+	}
 	return nil
 }
 
@@ -331,7 +355,7 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gat
 func (s *Service) GetRefund(ctx context.Context, appID, refundNo, outRefundNo string) (*models.Refund, error) {
 	r := s.d.Store.Reader().Refunds()
 	if refundNo != "" {
-		rf, err := r.GetByRefundNo(ctx, refundNo)
+		rf, err := r.GetByRefundNo(ctx, refundNo, false)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return nil, models.ErrRefundNotFound

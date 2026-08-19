@@ -215,7 +215,7 @@ func (s *Service) markAttemptUnknown(outTradeNo string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, true) // 行锁:只写尝试单行,读-复核-写原子
 		if err != nil || a == nil {
 			return err
 		}
@@ -420,7 +420,7 @@ func (s *Service) ConfirmPayFromQuery(ctx context.Context, a *models.PaymentAtte
 // RecoverStuckRequesting 卡死在 REQUESTING 的尝试 → UNKNOWN(交查单 worker 收敛,超时 watchdog 调用)。
 func (s *Service) RecoverStuckRequesting(ctx context.Context, outTradeNo string) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, true) // 行锁:只写尝试单行,读-复核-写原子
 		if err != nil || a == nil {
 			return err
 		}
@@ -435,7 +435,9 @@ func (s *Service) RecoverStuckRequesting(ctx context.Context, outTradeNo string)
 // ApplyQueryNotPaid 查单=有单未支付 → UNKNOWN 尝试恢复为 READY(可继续等待回调)。
 func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
+		// 行锁:只写尝试单行,读-复核-写原子。防并发取消/超时把该尝试置 CLOSING 后,
+		// 本函数基于陈旧 UNKNOWN 盲写 READY → 订单 CLOSING+尝试 READY 无人收敛的永久滞留(P1-A)。
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, true)
 		if err != nil || a == nil {
 			return err
 		}
@@ -451,7 +453,18 @@ func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string) erro
 // 若订单处于 CLOSING 且已无活跃尝试,则订单转 CLOSED 并发 order.closed 事件(完成取消/关单闭环)。
 func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo string) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
+		// 统一锁序订单→尝试:先无锁读取不可变的 app_id/order_no,再锁订单,再锁尝试重读复核。
+		// (旧实现"先写尝试后锁订单"是全库唯一逆序,与五条订单→尝试路径互为死锁环;
+		//  且无锁复核会把并发已 PAID 的尝试盲写覆盖成 CLOSED。)
+		a0, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
+		if err != nil || a0 == nil {
+			return err
+		}
+		o, err := r.Orders().GetByOrderNo(ctx, a0.AppID, a0.OrderNo, true)
+		if err != nil {
+			return err
+		}
+		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, true)
 		if err != nil || a == nil {
 			return err
 		}
@@ -460,10 +473,6 @@ func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo stri
 			if err := r.Attempts().Update(ctx, a); err != nil {
 				return err
 			}
-		}
-		o, err := r.Orders().GetByOrderNo(ctx, a.AppID, a.OrderNo, true)
-		if err != nil {
-			return err
 		}
 		if o.Status != models.OrderClosing {
 			return nil
@@ -524,7 +533,11 @@ const (
 	txnDupConflict                          // 命中唯一键但属其它订单/金额/账号(禁止结算)
 )
 
-// insertWinningTxn 结算前插入正常流水;命中唯一键时重读比对,区分"并发同笔"与"跨订单冲突"(评审 P0)。
+// insertWinningTxn 结算前插入正常流水;命中 uk_txn 时重读比对,区分"并发同笔"与"跨订单冲突"(评审 P0)。
+// 注:RR 隔离下本事务的重读是快照读,看不到并发【同订单】另一事务刚提交的流水行——但同订单并发确认
+// 已被订单行锁 + CanSettlePayment 前置串行化(第二个确认见 PAID 走 second_real_payment,不到此),故
+// txnDupConsistent 在正常并发下罕见,是防御性保留;此处主要拦【跨订单复用同交易号】(不同订单锁,
+// 能并发到此并撞 uk_txn,重读到他订单已提交流水 → txnDupConflict 禁止结算本单)。
 func (s *Service) insertWinningTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt) (txnInsertResult, error) {
 	err := r.Transactions().Insert(ctx, payTxn(o, in, attempt, false, ""))
 	if err == nil {

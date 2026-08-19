@@ -41,7 +41,7 @@ func TestRefundTxnUsesGatewayRefundID(t *testing.T) {
 	h.gateway.refundQuerySet = true
 	h.gateway.mu.Unlock()
 
-	rf, err := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+	rf, err := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo, false)
 	if err != nil {
 		t.Fatalf("读退款失败: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestRefundGatewayErrorGoesProcessing(t *testing.T) {
 	if err != nil || out.Status != models.RefundProcessing {
 		t.Fatalf("结果未知应返回 PROCESSING 且无错误: out=%+v err=%v", out, err)
 	}
-	rf, err := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+	rf, err := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo, false)
 	if err != nil || rf.Status != models.RefundProcessing || !rf.NextQueryAt.Valid {
 		t.Fatalf("退款应 PROCESSING 且已设查单时间: rf=%+v err=%v", rf, err)
 	}
@@ -145,7 +145,7 @@ func TestRefundGatewayRejectedFails(t *testing.T) {
 	if err != nil || out.Status != models.RefundFailed {
 		t.Fatalf("明确拒绝应返回 FAILED: out=%+v err=%v", out, err)
 	}
-	rf, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+	rf, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo, false)
 	if rf.Status != models.RefundFailed {
 		t.Fatalf("退款应 FAILED,实际: %v", rf.Status)
 	}
@@ -181,7 +181,7 @@ func TestRefundQueryNotExistThreshold(t *testing.T) {
 			}
 			// 播种已查次数。
 			err = h.mem.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
-				rf, e := r.Refunds().GetByRefundNo(ctx, out.RefundNo)
+				rf, e := r.Refunds().GetByRefundNo(ctx, out.RefundNo, true)
 				if e != nil {
 					return e
 				}
@@ -196,11 +196,11 @@ func TestRefundQueryNotExistThreshold(t *testing.T) {
 			h.gateway.refundQuerySet = true
 			h.gateway.mu.Unlock()
 
-			rf, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+			rf, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo, false)
 			if err := h.refund.QueryRefund(bg, rf); err != nil {
 				t.Fatalf("退款查单失败: %v", err)
 			}
-			got, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+			got, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo, false)
 			if got.Status != tc.wantRefund {
 				t.Fatalf("退款状态期望 %v,实际 %v", tc.wantRefund, got.Status)
 			}
@@ -229,11 +229,11 @@ func TestRefundAmountMismatchGoesAbnormal(t *testing.T) {
 	h.gateway.refundQuerySet = true
 	h.gateway.mu.Unlock()
 
-	rf, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+	rf, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo, false)
 	if err := h.refund.QueryRefund(bg, rf); err != nil {
 		t.Fatalf("金额不符已终态处置,不应返回错误: %v", err)
 	}
-	got, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+	got, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo, false)
 	if got.Status != models.RefundAbnormal || !got.LastError.Valid {
 		t.Fatalf("退款应 ABNORMAL 且记 last_error,实际: %+v", got)
 	}

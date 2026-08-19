@@ -175,7 +175,8 @@ type RefundRepo interface {
 	// Insert 命中 uk_active_refund 时返回 ErrDuplicate(活跃退款唯一守卫,含 ABNORMAL)。
 	Insert(ctx context.Context, r *models.Refund) error
 	GetActiveByOrder(ctx context.Context, orderNo string, forUpdate bool) (*models.Refund, error)
-	GetByRefundNo(ctx context.Context, refundNo string) (*models.Refund, error)
+	// GetByRefundNo 按退款号取;forUpdate=true 行锁(写路径 read-check-write 原子,防终态被陈旧盲写覆盖)。
+	GetByRefundNo(ctx context.Context, refundNo string, forUpdate bool) (*models.Refund, error)
 	// FindByOutRefundNo 未命中返回 (nil, nil)。
 	FindByOutRefundNo(ctx context.Context, appID, outRefundNo string) (*models.Refund, error)
 	// ClaimQueryDue 认领待查单退款(status=PROCESSING 且 next_query_at 到期/空、租约空闲),打租约后返回。

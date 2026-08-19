@@ -105,7 +105,7 @@ func (w *RefundQueryWorker) recoverStuckCreated(ctx context.Context, now time.Ti
 	}
 	for _, rf := range stuck {
 		rerr := w.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-			cur, err := r.Refunds().GetByRefundNo(ctx, rf.RefundNo)
+			cur, err := r.Refunds().GetByRefundNo(ctx, rf.RefundNo, true) // 行锁:读-复核-写原子
 			if err != nil {
 				return err
 			}
@@ -133,7 +133,7 @@ func (w *RefundQueryWorker) rescheduleIfProcessing(ctx context.Context, refundNo
 		orderNo string
 	)
 	err := w.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
+		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo, true)
 		if err != nil {
 			return err
 		}

@@ -333,7 +333,7 @@ func (r refundRepo) GetActiveByOrder(_ context.Context, orderNo string, _ bool) 
 	return nil, nil
 }
 
-func (r refundRepo) GetByRefundNo(_ context.Context, refundNo string) (*models.Refund, error) {
+func (r refundRepo) GetByRefundNo(_ context.Context, refundNo string, _ bool) (*models.Refund, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.refunds {
@@ -597,8 +597,13 @@ func (r outboxRepo) MarkDelivered(_ context.Context, id uint64) error {
 	})
 }
 
+// Reschedule / MarkDead 仅对 Pending 生效(与 gormstore 的 status=Pending 守卫一致):
+// 不覆盖他副本已 MarkDelivered 的行。
 func (r outboxRepo) Reschedule(_ context.Context, id uint64, nextAttemptAt time.Time, attempts int32, lastErr string) error {
 	return r.mutate(id, func(o *models.EventOutbox) {
+		if o.Status != models.OutboxPending {
+			return
+		}
 		o.Attempts = attempts
 		o.NextAttemptAt = nextAttemptAt
 		o.LastError = sql.NullString{String: lastErr, Valid: lastErr != ""}
@@ -609,6 +614,9 @@ func (r outboxRepo) Reschedule(_ context.Context, id uint64, nextAttemptAt time.
 
 func (r outboxRepo) MarkDead(_ context.Context, id uint64, attempts int32, lastErr string) error {
 	return r.mutate(id, func(o *models.EventOutbox) {
+		if o.Status != models.OutboxPending {
+			return
+		}
 		o.Status = models.OutboxDead
 		o.Attempts = attempts
 		o.LastError = sql.NullString{String: lastErr, Valid: lastErr != ""}

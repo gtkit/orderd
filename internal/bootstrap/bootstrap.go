@@ -100,7 +100,15 @@ func Run(ctx context.Context, cfg config.Config) error {
 	// 积压指标(纯计数/年龄,无敏感数据);来源限制属入口层(防火墙/网关)职责。
 	mux.Handle("GET /metrics", app.Metrics)
 
-	hs := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// 超时齐全防慢速 DoS(slowloris):/notify 无鉴权且每请求触发验签,慢 body 会占住连接与 CPU。
+	hs := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		logger.Infow("HTTP 启动", "addr", cfg.HTTPAddr)
 		if serr := hs.ListenAndServe(); serr != nil && !errors.Is(serr, http.ErrServerClosed) {

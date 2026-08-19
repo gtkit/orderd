@@ -59,6 +59,6 @@ func (TrustedCallerPricing) Kind() string                                 { retu
 type DenyAllPricing struct{}
 
 func (DenyAllPricing) Authorize(string, models.Money, string) error {
-	return fmt.Errorf("%w: 未配置可信定价来源,拒绝采信客户端金额(设 ORDERD_PRICING_TRUST_CALLER=true 或接报价校验)", models.ErrAmountPolicy)
+	return fmt.Errorf("%w: 未配置可信定价来源,拒绝采信客户端金额(配置 pricing.trustcaller=true 或接报价校验)", models.ErrAmountPolicy)
 }
 func (DenyAllPricing) Kind() string { return "deny" }
