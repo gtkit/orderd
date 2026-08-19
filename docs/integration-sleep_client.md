@@ -129,11 +129,11 @@ message MembershipBenefit {
 
 | 组件 | 说明 |
 |---|---|
-| **orderd 客户端**(gRPC 或 REST) | 下单 `CreateOrder`、换渠道 `PreparePayment`、查状态 `GetOrderStatus`;sleep_admin 侧 `RefundOrder`/`GetRefund` |
+| **orderd 客户端**(gRPC 或 REST) | 下单 `CreateOrder`、换渠道 `PreparePayment`、查状态 `GetOrderStatus`、按单号回查 `GetOrder`(镜像失步恢复 order_token,支持 `client_order_no`=sleep 业务单号);sleep_admin 侧 `RefundOrder`/`GetRefund` |
 | **服务间 JWT 签发** | 用 orderd 约定的 HS256 + kid,claims 带 `app_id`/`user_id`/`perms`(order:create/read/cancel、refund:execute/read、event:read)、iss/aud/exp |
 | **事件消费 handler** | 用 `orderevents.NewHandler`(OnPaid/OnRefunded/OnClosed);在**同一业务事务**里 `INSERT inbox_events` 去重 + 按 (order_no, aggregate_version) 单调 + 发权益/落账单 + 推进本地镜像,提交后才回 2xx |
 | **`inbox_events` 表** | 按 `sdk/orderevents/inbox_schema.sql` 建在 **sleep 业务库** |
-| **状态回填(可选兜底)** | 定时/按需 `GetOrderStatus` 补拉,纠正漏事件的本地镜像 + 触发 SSE |
+| **状态回填(可选兜底)** | 定时/按需 `GetOrderStatus` 补拉,纠正漏事件的本地镜像 + 触发 SSE;镜像丢失 order_token 时用 `GetOrder(client_order_no)` 回查恢复 |
 
 发权益 handler 骨架(把原 `DeliveryService.AfterPaid` 挪进来):
 
@@ -296,3 +296,12 @@ sleep(BFF)签发、orderd 验签,双方必须一致:
 | sleep | order 模块瘦身(删支付/关单,CreateOrder 改调 orderd) | 中 |
 | sleep | 状态镜像 + SSE 数据源切换 | 中 |
 | 双方 | 对账脚本 + 灰度开关 | 小-中 |
+
+---
+
+## 7. 接入注意事项(2026-08 服务端加固后)
+
+- **单用户未付单上限**:orderd 对同 (app, user) 的 PENDING 订单数设上限(默认 5,`order.maxpendingperuser`),超限 `CreateOrder` 返回 `ResourceExhausted`——sleep_client 收到后应引导用户支付/取消既有订单,而不是重试;携带稳定幂等键的重试命中复用,不受上限影响。
+- **金额策略 per-app**:上线前在 orderd 的 `app_amount_policies` 表为 sleep 的 app_id 配置实付上下限与 `allowed_business='membership'` 白名单(未配置时回退全局默认档:1 分~100 万,业务类型不限)。
+- **client_order_no 冲突**:同 app 重复业务单号返回 `AlreadyExists / CLIENT_ORDER_NO_CONFLICT`(区别于幂等键冲突的 `IDEMPOTENCY_CONFLICT`)——前者应查旧单,后者是同键改参。
+- **权限集**:sleep_client token 用 `order:create/read/cancel` + `event:read`;sleep_admin 退款用 `refund:execute/read`。运维权限(`ops:*`/`event:requeue`)属 orderd 值班,不进接入方 token。

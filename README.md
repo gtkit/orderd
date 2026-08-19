@@ -378,7 +378,7 @@ ORDERD_TEST_MYSQL_DSN='root@tcp(127.0.0.1:3306)/orderd_it?parseTime=true' make t
 
 ## 现状:已接 / 未接
 
-**已接并验证**:下单/幂等/金额权威、支付准备与多尝试、支付成功核心事务(§7 CAS/唯一成功/第二笔真实付款落库告警)、取消(§8)、超时关单、退款闭环 + 退款查单、事件双写 + Outbox 投递(SSRF/HMAC)、支付查单、对账逻辑、JWT 鉴权 + 方法级权限、跨租户隔离、**支付宝(gtkit/go-pay,沙箱)**、**持久化 gtkit/ormx + gorm(store.Store 工作单元,真实 MySQL 集成回归)**、**gRPC + REST(grpc-gateway)+ OpenAPI 同源**、**异常处置闭环(AdminService:对账差异处置/死信重放/anomaly 流水查询 + ops_audit_logs 审计 + 死信兜底重放 worker)**、**告警送达通道(alert 段:钉钉/飞书/generic webhook,日志保底)**。
+**已接并验证**:下单/幂等/金额权威、支付准备与多尝试、支付成功核心事务(§7 CAS/唯一成功/第二笔真实付款落库告警)、取消(§8)、超时关单、退款闭环 + 退款查单、事件双写 + Outbox 投递(SSRF/HMAC)、支付查单、对账逻辑、JWT 鉴权 + 方法级权限、跨租户隔离、**支付宝(gtkit/go-pay,沙箱)**、**持久化 gtkit/ormx + gorm(store.Store 工作单元,真实 MySQL 集成回归)**、**gRPC + REST(grpc-gateway)+ OpenAPI 同源**、**异常处置闭环(AdminService:对账差异处置/死信重放/anomaly 流水查询 + ops_audit_logs 审计 + 死信兜底重放 worker)**、**告警送达通道(alert 段:钉钉/飞书/generic webhook,日志保底)**、**per-app 金额策略(app_amount_policies,DB 优先/默认档回退/查询失败拒单)**、**单用户未付订单数上限(order.maxpendingperuser)与按单号回查(GetOrder,镜像失步恢复 token)**、**Prometheus 指标(/metrics:积压 gauge + 投递/支付确认速率时延)**、**密钥挂载目录(secrets.dir,轮换免重启)**、**CLOSING 滞留兜底 watchdog**。以上均经真实进程冒烟(gRPC/REST/权限矩阵/metrics/fail-fast)。
 
 **已接代码、待凭据联调**:
 - **微信支付**(下单/回调/退款,APIv3)—— 网关适配 `wechatgw` + 配置 + `/notify/wechat/{route}` 回调 + 装配已完成并单测覆盖;
