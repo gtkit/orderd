@@ -11,6 +11,7 @@ import (
 	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
 	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
 	"github.com/gtkit/orderd/internal/paygateway"
+	"github.com/gtkit/orderd/internal/shared/obs"
 	"github.com/gtkit/orderd/internal/store/memstore"
 )
 
@@ -21,9 +22,14 @@ type fakePricing struct{ err error }
 func (f fakePricing) Authorize(string, models.Money, string) error { return f.err }
 func (fakePricing) Kind() string                                   { return "trusted-caller" }
 
-type fakeAmounts struct{ b models.AmountBounds }
+type fakeAmounts struct {
+	b   models.AmountBounds
+	err error // 非 nil 时模拟策略查询失败(fail-closed 反证用)
+}
 
-func (f fakeAmounts) Bounds(string) (models.AmountBounds, bool) { return f.b, true }
+func (f fakeAmounts) Bounds(context.Context, string) (models.AmountBounds, bool, error) {
+	return f.b, true, f.err
+}
 
 type fakeAccounts struct{}
 
@@ -156,7 +162,7 @@ func newHarness(refundEnabled bool) *harness {
 	})
 	ord := orderapp.New(orderapp.Deps{
 		Store: mem, Payment: pay, Pricing: fakePricing{},
-		Amounts:  fakeAmounts{models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}}},
+		Amounts:  fakeAmounts{b: models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}}},
 		Accounts: fakeAccounts{}, Clock: clock,
 		NewOrderNo: func() string { return fmt.Sprintf("OD%d", next(&ordN)) },
 		NewToken:   func() (string, error) { return fmt.Sprintf("tok-%d", next(&tokN)), nil },
@@ -179,12 +185,41 @@ func newOrderWithCap(h *harness, maxN int) *orderapp.Service {
 	clock := func() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) }
 	return orderapp.New(orderapp.Deps{
 		Store: h.mem, Payment: h.payment, Pricing: fakePricing{},
-		Amounts:  fakeAmounts{models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}}},
+		Amounts:  fakeAmounts{b: models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}}},
 		Accounts: fakeAccounts{}, Clock: clock,
 		NewOrderNo:        func() string { return fmt.Sprintf("OD-cap-%d", next()) },
 		NewToken:          func() (string, error) { return fmt.Sprintf("tok-cap-%d", next()), nil },
 		NewEventID:        func() (string, error) { return fmt.Sprintf("evt-cap-%d", next()), nil },
 		MaxPendingPerUser: maxN,
+	})
+}
+
+// orderWithAmounts 用指定金额策略重建 order 服务(其余依赖沿用 harness)。
+func orderWithAmounts(h *harness, amounts fakeAmounts) *orderapp.Service {
+	var n int64
+	var mu sync.Mutex
+	next := func() int64 { mu.Lock(); defer mu.Unlock(); n++; return n }
+	clock := func() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) }
+	return orderapp.New(orderapp.Deps{
+		Store: h.mem, Payment: h.payment, Pricing: fakePricing{}, Amounts: amounts,
+		Accounts: fakeAccounts{}, Clock: clock,
+		NewOrderNo: func() string { return fmt.Sprintf("OD-amt-%d", next()) },
+		NewToken:   func() (string, error) { return fmt.Sprintf("tok-amt-%d", next()), nil },
+		NewEventID: func() (string, error) { return fmt.Sprintf("evt-amt-%d", next()), nil },
+	})
+}
+
+// paymentWithObs 用指定埋点端口重建 payment 服务(其余依赖沿用 harness)。
+func paymentWithObs(h *harness, ob obs.FlowObserver) *paymentapp.Service {
+	var n int64
+	var mu sync.Mutex
+	next := func() int64 { mu.Lock(); defer mu.Unlock(); n++; return n }
+	clock := func() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) }
+	return paymentapp.New(paymentapp.Deps{
+		Store: h.mem, Router: fakeRouter{gw: h.gateway}, Accounts: fakeAccounts{}, Alerter: h.alerter, Clock: clock,
+		NewEventID: func() (string, error) { return fmt.Sprintf("evt-obs-%d", next()), nil },
+		OutTradeNo: func() string { return fmt.Sprintf("PT-obs-%d", next()) },
+		Obs:        ob,
 	})
 }
 

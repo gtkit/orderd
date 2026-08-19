@@ -1,6 +1,7 @@
 package models
 
 import (
+	"context"
 	"fmt"
 
 	orderv1 "github.com/gtkit/orderd/pb/order/v1"
@@ -55,16 +56,22 @@ type AmountBounds struct {
 }
 
 // AmountPolicy 金额策略仓(按 app 查),应用层注入。
+// 查询失败必须返回 error(fail-closed:金额校验绝不因基础设施故障放行)。
 type AmountPolicy interface {
-	Bounds(appID string) (AmountBounds, bool)
+	Bounds(ctx context.Context, appID string) (AmountBounds, bool, error)
 }
 
 // ValidateAmount 在基础不变量之外,施加 app 级白名单与上下限校验。
-func ValidateAmount(policy AmountPolicy, appID string, m Money, businessType string) error {
+// 策略查询失败 → 拒单(包装 ErrAmountPolicy):金额策略在下单主链,DB 故障时建单同样失败,
+// fail-open 放行金额校验不可接受。
+func ValidateAmount(ctx context.Context, policy AmountPolicy, appID string, m Money, businessType string) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
-	b, ok := policy.Bounds(appID)
+	b, ok, err := policy.Bounds(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("%w: 金额策略查询失败: %v", ErrAmountPolicy, err)
+	}
 	if !ok {
 		return fmt.Errorf("%w: 未配置 app=%s 的金额策略", ErrAmountPolicy, appID)
 	}

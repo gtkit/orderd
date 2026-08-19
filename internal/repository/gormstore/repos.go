@@ -67,6 +67,16 @@ func (r orderRepo) ListExpiredPending(ctx context.Context, now time.Time, limit 
 	return out, nil
 }
 
+func (r orderRepo) ListStalledClosing(ctx context.Context, before time.Time, limit int) ([]*models.Order, error) {
+	var out []*models.Order
+	// status=30(CLOSING)行数极少(本身即异常滞留),status 前缀索引足够。
+	err := dbOf(ctx, r.base).Where("status = ? AND updated_at < ?", models.OrderClosing, before).Limit(limit).Find(&out).Error
+	if err != nil {
+		return nil, fmt.Errorf("gormstore: list stalled closing: %w", err)
+	}
+	return out, nil
+}
+
 func (r orderRepo) CountPendingByUser(ctx context.Context, appID string, userID int64) (int, error) {
 	var n int64
 	// idx_app_user_status 精确覆盖。

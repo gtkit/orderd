@@ -48,7 +48,8 @@ type Config struct {
 	WorkerID          string            // 副本实例标识(租约持有者)
 	WebhookAllowHosts []string          // SSRF 白名单主机
 	WebhookAllowCIDRs []string          // SSRF 白名单 CIDR
-	WebhookSecrets    map[string][]byte // 仅 dev:密钥引用→明文(env 覆盖;生产用 KMS)
+	WebhookSecrets    map[string][]byte // dev:密钥引用→明文(env 覆盖;生产用 SecretsDir)
+	SecretsDir        string            // 密钥挂载目录(K8s Secret volume);配置后优先于 env Static
 
 	// 对账 worker(需真实渠道账单源;V1 默认关闭)。
 	ReconcileEnabled  bool
@@ -227,6 +228,9 @@ type fileConfig struct {
 		AllowHosts []string `yaml:"allowhosts"`
 		AllowCIDRs []string `yaml:"allowcidrs"`
 	} `yaml:"webhook"`
+	Secrets struct {
+		Dir string `yaml:"dir"`
+	} `yaml:"secrets"`
 	Pricing struct {
 		TrustCaller bool `yaml:"trustcaller"`
 	} `yaml:"pricing"`
@@ -317,6 +321,7 @@ func Load(path string) (Config, error) {
 		RefundEnabled:      fc.Refund.Enabled,
 		WebhookAllowHosts:  fc.Webhook.AllowHosts,
 		WebhookAllowCIDRs:  fc.Webhook.AllowCIDRs,
+		SecretsDir:         fc.Secrets.Dir,
 		ReconcileEnabled:   fc.Reconcile.Enabled,
 		JWTIssuer:          fc.Auth.Issuer,
 		JWTAudience:        fc.Auth.Audience,

@@ -342,6 +342,16 @@ type AppPayAccount struct {
 	Enabled       bool
 }
 
+// AppAmountPolicy per-app 金额策略(app_amount_policies;未配置/停用回退全局默认档)。
+type AppAmountPolicy struct {
+	AppID           string `gorm:"primaryKey"`
+	MinPayable      int64
+	MaxPayable      int64
+	AllowedBusiness string // 逗号分隔白名单,空=不限
+	AllowedCurrency string // 逗号分隔白名单,空=仅 CNY
+	Enabled         bool
+}
+
 // AppEndpoint 接入方回调配置(app_endpoints)。
 type AppEndpoint struct {
 	AppID             string `gorm:"primaryKey"`

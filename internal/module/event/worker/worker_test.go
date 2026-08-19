@@ -83,7 +83,7 @@ var mustGuardT, _ = webhook.NewSSRFGuard([]string{"127.0.0.1"}, nil)
 func newDelivery(mem *memstore.Mem, url string, alerter *recAlerter, maxAttempts int32) *Delivery {
 	sender := webhook.NewSender(mustGuardT, 5*time.Second)
 	return NewDelivery(mem, fakeEndpoints{url: url}, secret.NewStatic(map[string][]byte{"ref1": []byte("s3cr3t")}),
-		sender, alerter, Config{WorkerID: "w1", MaxAttempts: maxAttempts, BaseBackoff: time.Minute}, func() time.Time { return time.Unix(1_700_000_000, 0) })
+		sender, alerter, nil, Config{WorkerID: "w1", MaxAttempts: maxAttempts, BaseBackoff: time.Minute}, func() time.Time { return time.Unix(1_700_000_000, 0) })
 }
 
 func TestDeliverySuccess(t *testing.T) {
@@ -170,5 +170,92 @@ func TestDeliverySSRFBlocked(t *testing.T) {
 	}
 	if ob := mem.Outbox()[0]; ob.Status != models.OutboxPending || ob.Attempts != 1 {
 		t.Fatalf("SSRF 失败应重排: %+v", ob)
+	}
+}
+
+// recObserver 记录型埋点端口(flow-metrics spec 验证)。
+type recObserver struct {
+	mu       sync.Mutex
+	outcomes []string
+	seconds  []float64
+}
+
+func (o *recObserver) DeliveryResult(outcome string, seconds float64) {
+	o.mu.Lock()
+	o.outcomes = append(o.outcomes, outcome)
+	o.seconds = append(o.seconds, seconds)
+	o.mu.Unlock()
+}
+func (o *recObserver) ConfirmOutcome(string) {}
+
+// TestDeliveryObserverOutcomes delivered/failed/dead 互斥计数,耗时非负。
+func TestDeliveryObserverOutcomes(t *testing.T) {
+	var status int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		st := status
+		mu.Unlock()
+		w.WriteHeader(st)
+	}))
+	defer srv.Close()
+
+	mem := memstore.New()
+	ob := &recObserver{}
+	sender := webhook.NewSender(mustGuardT, 5*time.Second)
+	d := NewDelivery(mem, fakeEndpoints{url: srv.URL}, secret.NewStatic(map[string][]byte{"ref1": []byte("s3cr3t")}),
+		sender, &recAlerter{}, ob, Config{WorkerID: "w1", MaxAttempts: 2, BaseBackoff: time.Minute},
+		func() time.Time { return qClock().Add(time.Minute) })
+
+	enqueue(t, mem, paidPayload(t), qClock().Add(-time.Minute))
+	// 第一轮失败(attempts 1 < 2)→ failed;第二轮失败(attempts 2 >= 2)→ dead。
+	mu.Lock()
+	status = http.StatusInternalServerError
+	mu.Unlock()
+	if _, _, err := d.RunOnce(bg); err != nil {
+		t.Fatal(err)
+	}
+	// 重排后立即可再投(把 next_attempt_at 拉回)。
+	err := mem.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		o, e := r.Outbox().GetByEventID(ctx, "evt-1", true)
+		if e != nil {
+			return e
+		}
+		return r.Outbox().Reschedule(ctx, o.ID, qClock(), o.Attempts, "x")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := d.RunOnce(bg); err != nil {
+		t.Fatal(err)
+	}
+	// 重放 + 成功 → delivered。
+	err = mem.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		o, e := r.Outbox().GetByEventID(ctx, "evt-1", true)
+		if e != nil {
+			return e
+		}
+		return r.Outbox().Requeue(ctx, o.ID, qClock())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	status = http.StatusOK
+	mu.Unlock()
+	if _, _, err := d.RunOnce(bg); err != nil {
+		t.Fatal(err)
+	}
+
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	want := []string{"failed", "dead", "delivered"}
+	if len(ob.outcomes) != 3 || ob.outcomes[0] != want[0] || ob.outcomes[1] != want[1] || ob.outcomes[2] != want[2] {
+		t.Fatalf("outcome 序列应互斥且为 %v,实际 %v", want, ob.outcomes)
+	}
+	for i, s := range ob.seconds {
+		if s < 0 {
+			t.Fatalf("耗时 #%d 非法: %v", i, s)
+		}
 	}
 }

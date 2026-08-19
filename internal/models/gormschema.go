@@ -16,3 +16,4 @@ func (ReconcileDiff) TableName() string      { return "reconcile_diffs" }
 func (AppPayAccount) TableName() string      { return "app_pay_accounts" }
 func (AppEndpoint) TableName() string        { return "app_endpoints" }
 func (OpsAuditLog) TableName() string        { return "ops_audit_logs" }
+func (AppAmountPolicy) TableName() string    { return "app_amount_policies" }

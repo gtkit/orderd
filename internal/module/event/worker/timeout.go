@@ -17,6 +17,8 @@ type TimeoutConfig struct {
 	BatchSize    int
 	// RequestingStuckAfter:REQUESTING 停留超过此时长视为卡死 → UNKNOWN(交查单收敛)。
 	RequestingStuckAfter time.Duration
+	// StalledClosingAfter:CLOSING 停留超过此时长且无活跃尝试 → 兜底落定 CLOSED(默认 30m)。
+	StalledClosingAfter time.Duration
 }
 
 func (c *TimeoutConfig) withDefaults() {
@@ -31,6 +33,9 @@ func (c *TimeoutConfig) withDefaults() {
 	}
 	if c.RequestingStuckAfter == 0 {
 		c.RequestingStuckAfter = 2 * time.Minute
+	}
+	if c.StalledClosingAfter == 0 {
+		c.StalledClosingAfter = 30 * time.Minute
 	}
 }
 
@@ -80,6 +85,22 @@ func (w *TimeoutWorker) RunOnce(ctx context.Context) (int, error) {
 			continue
 		}
 		n++
+	}
+
+	// 第三轮:CLOSING 滞留兜底(与生产路径解耦;有活跃尝试的单在应用层复核后跳过)。
+	stalled, err := w.store.Reader().Orders().ListStalledClosing(ctx, now.Add(-w.cfg.StalledClosingAfter), w.cfg.BatchSize)
+	if err != nil {
+		return n, err
+	}
+	for _, o := range stalled {
+		closed, cerr := w.order.CloseStalledClosing(ctx, o.AppID, o.OrderNo)
+		if cerr != nil {
+			logger.Warnw("CLOSING 滞留兜底失败", "order_no", o.OrderNo, "err", cerr)
+			continue
+		}
+		if closed {
+			n++
+		}
 	}
 	return n, nil
 }

@@ -37,7 +37,7 @@ func seedDead(t *testing.T, mem *memstore.Mem, eventID string, attempts int32, c
 func dlDelivery(mem *memstore.Mem, url string, alerter *recAlerter, maxAttempts int32) *Delivery {
 	sender := webhook.NewSender(mustGuardT, 5*time.Second)
 	return NewDelivery(mem, fakeEndpoints{url: url}, secret.NewStatic(map[string][]byte{"ref1": []byte("s3cr3t")}),
-		sender, alerter, Config{WorkerID: "w1", MaxAttempts: maxAttempts, BaseBackoff: time.Minute},
+		sender, alerter, nil, Config{WorkerID: "w1", MaxAttempts: maxAttempts, BaseBackoff: time.Minute},
 		func() time.Time { return qClock().Add(time.Minute) })
 }
 

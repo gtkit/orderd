@@ -253,3 +253,16 @@ func TestLoadMaxPendingPerUser(t *testing.T) {
 		t.Fatal("负值应拒")
 	}
 }
+
+// TestLoadSecretsDir secrets.dir 解析(未配置为空,配置后可读)。
+func TestLoadSecretsDir(t *testing.T) {
+	setSecrets(t)
+	c, err := Load(writeTemp(t, validYAML))
+	if err != nil || c.SecretsDir != "" {
+		t.Fatalf("未配置应为空: %q err=%v", c.SecretsDir, err)
+	}
+	c, err = Load(writeTemp(t, validYAML+"secrets:\n  dir: \"/var/run/secrets/orderd\"\n"))
+	if err != nil || c.SecretsDir != "/var/run/secrets/orderd" {
+		t.Fatalf("secrets.dir 解析失败: %q err=%v", c.SecretsDir, err)
+	}
+}

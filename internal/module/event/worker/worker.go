@@ -14,6 +14,7 @@ import (
 	"github.com/gtkit/orderd/internal/pkg/webhook"
 	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/shared/endpoint"
+	"github.com/gtkit/orderd/internal/shared/obs"
 	"github.com/gtkit/orderd/internal/shared/secret"
 	"github.com/gtkit/orderd/internal/store"
 )
@@ -60,17 +61,21 @@ type Delivery struct {
 	secrets   secret.Resolver
 	sender    *webhook.Sender
 	alerter   alert.Alerter
+	obs       obs.FlowObserver
 	cfg       Config
 	clock     func() time.Time
 }
 
-// NewDelivery 构造投递逻辑。
-func NewDelivery(st store.Store, ep endpoint.Resolver, sec secret.Resolver, sender *webhook.Sender, alerter alert.Alerter, cfg Config, clock func() time.Time) *Delivery {
+// NewDelivery 构造投递逻辑。ob 为关键路径埋点端口(nil → Nop,行为不变)。
+func NewDelivery(st store.Store, ep endpoint.Resolver, sec secret.Resolver, sender *webhook.Sender, alerter alert.Alerter, ob obs.FlowObserver, cfg Config, clock func() time.Time) *Delivery {
 	cfg.withDefaults()
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Delivery{store: st, endpoints: ep, secrets: sec, sender: sender, alerter: alerter, cfg: cfg, clock: clock}
+	if ob == nil {
+		ob = obs.Nop{}
+	}
+	return &Delivery{store: st, endpoints: ep, secrets: sec, sender: sender, alerter: alerter, obs: ob, cfg: cfg, clock: clock}
 }
 
 // RunOnce 认领一批并逐条投递;返回本轮成功/失败数。
@@ -102,15 +107,20 @@ func (d *Delivery) RunOnce(ctx context.Context) (delivered, failed int, err erro
 }
 
 // deliverOne 投递一条并落地结果;返回(是否投递成功, 记账错误)。
+// 埋点(事务外纯内存计数):delivered/failed/dead 互斥,耗时含端点响应。
 func (d *Delivery) deliverOne(ctx context.Context, ob *models.EventOutbox) (bool, error) {
+	started := time.Now()
 	sendErr := d.trySend(ctx, ob)
+	elapsed := time.Since(started).Seconds()
 	if sendErr == nil {
+		d.obs.DeliveryResult(obs.DeliveryDelivered, elapsed)
 		return true, d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 			return r.Outbox().MarkDelivered(ctx, ob.ID)
 		})
 	}
 	attempts := ob.Attempts + 1
 	if attempts >= d.cfg.MaxAttempts {
+		d.obs.DeliveryResult(obs.DeliveryDead, elapsed)
 		markErr := d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 			return r.Outbox().MarkDead(ctx, ob.ID, attempts, sendErr.Error())
 		})
@@ -121,6 +131,7 @@ func (d *Delivery) deliverOne(ctx context.Context, ob *models.EventOutbox) (bool
 		logger.Errorw("Outbox 事件转死信", "event_id", ob.EventID, "attempts", attempts, "err", sendErr)
 		return false, markErr
 	}
+	d.obs.DeliveryResult(obs.DeliveryFailed, elapsed)
 	next := d.clock().Add(d.backoff(attempts))
 	return false, d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		return r.Outbox().Reschedule(ctx, ob.ID, next, attempts, sendErr.Error())

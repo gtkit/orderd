@@ -301,6 +301,22 @@ SDK 行为(资金安全):`OnPaid` 必填(缺失 panic);资金事件(paid/refunde
 
 ### 3) 健康检查
 
+### Webhook 密钥来源
+
+`app_endpoints.hmac_secret_ref` 存的是**引用**;解析来源二选一:
+- **挂载目录**(生产):配置 `secrets.dir`,引用名 → 目录下同名文件内容(去尾部换行)。
+  K8s 用 Secret volume 挂载(`kubectl create secret generic orderd-webhook --from-literal=app1-hmac=<secret>`,
+  volume 挂到 `secrets.dir`);轮换由编排层滚动更新文件完成,免重启。引用名限 `[A-Za-z0-9._-]+`,不可穿越目录。
+- **env**(仅 dev):`ORDERD_WEBHOOK_SECRETS="ref1=secret1,ref2=secret2"`。
+
+### 金额策略(per-app)
+
+实付上下限/业务类型白名单/币种白名单按接入方配置在 `app_amount_policies` 表(改库即生效):
+`min_payable`/`max_payable`(分,0=不限)、`allowed_business`(逗号分隔,空=不限)、
+`allowed_currency`(逗号分隔,空=仅 CNY)、`enabled`。未配置或 `enabled=0` 的 app 回退全局默认档
+(实付 1 分~100 万,仅 CNY,业务类型不限);策略查询失败时下单被拒(fail-closed)。
+金额**真实性**仍由定价可信边界(pricing 段)保证——策略只拦异常值。
+
 `GET /healthz` → `200 ok`。
 
 `GET /metrics` → Prometheus 积压类指标(scrape 时对 DB 聚合,全索引覆盖 + 5s 超时;采集失败只缺该指标并递增 `orderd_metrics_scrape_errors_total`,不 5xx):

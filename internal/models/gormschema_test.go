@@ -66,6 +66,10 @@ var ddlColumns = map[string]map[string]bool{
 	"ops_audit_logs": set(
 		"id", "actor", "action", "target_type", "target_id", "detail", "created_at",
 	),
+	"app_amount_policies": set(
+		"app_id", "min_payable", "max_payable", "allowed_business", "allowed_currency",
+		"enabled", "created_at", "updated_at",
+	),
 }
 
 func set(cols ...string) map[string]bool {
@@ -98,6 +102,7 @@ func TestGormSchemaMappingMatchesDDL(t *testing.T) {
 		{&AppPayAccount{}, "app_pay_accounts"},
 		{&AppEndpoint{}, "app_endpoints"},
 		{&OpsAuditLog{}, "ops_audit_logs"},
+		{&AppAmountPolicy{}, "app_amount_policies"},
 	}
 	namer := schema.NamingStrategy{}
 	cache := &sync.Map{}

@@ -12,6 +12,7 @@ import (
 	eventapp "github.com/gtkit/orderd/internal/module/event/application"
 	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
 	"github.com/gtkit/orderd/internal/shared/account"
+	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/store"
 )
 
@@ -30,6 +31,8 @@ type Deps struct {
 	// MaxPendingPerUser 单用户 PENDING 订单数上限(<=0 不限)。近似防刷阈值,非资金不变量:
 	// 计数与插入非原子,并发窗口内可短暂超出。
 	MaxPendingPerUser int
+	// Alerter 高等级告警(CLOSING 滞留兜底触发时上报;nil → Nop)。
+	Alerter alert.Alerter
 }
 
 // Service 订单应用服务。
@@ -42,6 +45,9 @@ func New(d Deps) *Service {
 	}
 	if d.OrderTTL == 0 {
 		d.OrderTTL = 30 * time.Minute
+	}
+	if d.Alerter == nil {
+		d.Alerter = alert.Nop{}
 	}
 	return &Service{d: d}
 }
@@ -81,7 +87,7 @@ func (s *Service) CreateOrder(ctx context.Context, in CreateInput) (CreateOutcom
 		return CreateOutcome{}, fmt.Errorf("%w: 支付方式非法", models.ErrIllegalTransition)
 	}
 	// 金额权威:基础不变量 + app 白名单/上下限 + 定价可信边界(评审 #8)。
-	if err := models.ValidateAmount(s.d.Amounts, in.AppID, in.Amount, in.BusinessType); err != nil {
+	if err := models.ValidateAmount(ctx, s.d.Amounts, in.AppID, in.Amount, in.BusinessType); err != nil {
 		return CreateOutcome{}, err
 	}
 	if err := s.d.Pricing.Authorize(in.AppID, in.Amount, in.QuoteID); err != nil {
@@ -421,6 +427,58 @@ func (s *Service) GetOrder(ctx context.Context, appID string, userID int64, orde
 		return nil, models.ErrOrderNotOwned
 	}
 	return o, nil
+}
+
+// CloseStalledClosing 滞留 CLOSING 兜底(超时 watchdog 第三轮):锁行复核仍 CLOSING 且
+// 无活跃尝试 → 同事务落定 CLOSED + 日志 + closed 事件;有活跃尝试不动(查单 worker 职责)。
+// 兜底与 CLOSING 的生产路径解耦:任何来源的孤儿单最终都被关闭。落定后事务外告警一次
+// order_closing_stalled(不落定不告警,对单笔订单天然恰好一次)——兜底被触发说明存在
+// 未收敛的生产路径,需排查。
+func (s *Service) CloseStalledClosing(ctx context.Context, appID, orderNo string) (closed bool, err error) {
+	err = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		o, err := r.Orders().GetByOrderNo(ctx, appID, orderNo, true)
+		if err != nil {
+			return err
+		}
+		if o.Status != models.OrderClosing {
+			return nil // 已被并发收敛,幂等返回
+		}
+		active, err := r.Attempts().GetActiveByOrder(ctx, orderNo, true)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return nil // 仍有活跃尝试:正常收敛属查单 worker,不越权
+		}
+		prev := o.Status
+		o.Status = models.OrderClosed
+		o.AggregateVersion++
+		if err := r.Orders().Update(ctx, o); err != nil {
+			return err
+		}
+		if err := eventapp.WriteLog(ctx, r, o, prev, "system", "关单兜底(CLOSING 滞留)"); err != nil {
+			return err
+		}
+		eid, err := s.d.NewEventID()
+		if err != nil {
+			return err
+		}
+		env := models.BuildClosedEnvelope(o, prev, eid, s.d.Clock())
+		if err := eventapp.WriteEvent(ctx, r, o.AppID, o.OrderNo, env); err != nil {
+			return err
+		}
+		closed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if closed {
+		s.d.Alerter.Anomaly(ctx, "order_closing_stalled", map[string]any{
+			"app_id": appID, "order_no": orderNo,
+		})
+	}
+	return closed, nil
 }
 
 // GetOrderStatus 按 order_token 查订单(前端反馈 + 对账兜底);校验租户 + 归属(评审 P1)。

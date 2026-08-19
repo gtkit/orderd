@@ -1,7 +1,9 @@
 package models
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -142,7 +144,16 @@ func TestAttemptAndRefundTransitions(t *testing.T) {
 
 type fixedPolicy struct{ b AmountBounds }
 
-func (f fixedPolicy) Bounds(string) (AmountBounds, bool) { return f.b, true }
+func (f fixedPolicy) Bounds(context.Context, string) (AmountBounds, bool, error) {
+	return f.b, true, nil
+}
+
+// errPolicy 模拟策略查询失败(fail-closed 反证)。
+type errPolicy struct{}
+
+func (errPolicy) Bounds(context.Context, string) (AmountBounds, bool, error) {
+	return AmountBounds{}, false, errors.New("db down")
+}
 
 func TestMoneyValidate(t *testing.T) {
 	bad := []Money{
@@ -164,17 +175,21 @@ func TestMoneyValidate(t *testing.T) {
 func TestValidateAmountBounds(t *testing.T) {
 	p := fixedPolicy{AmountBounds{MinPayable: 50, MaxPayable: 1000, AllowedBusiness: map[string]bool{"vip": true}}}
 	ok := Money{Original: 90, Discount: 0, Payable: 90, Currency: "CNY"}
-	if err := ValidateAmount(p, "app1", ok, "vip"); err != nil {
+	if err := ValidateAmount(context.Background(), p, "app1", ok, "vip"); err != nil {
 		t.Fatalf("合规金额被拒:%v", err)
 	}
-	if err := ValidateAmount(p, "app1", Money{Original: 10, Payable: 10, Currency: "CNY"}, "vip"); err == nil {
+	if err := ValidateAmount(context.Background(), p, "app1", Money{Original: 10, Payable: 10, Currency: "CNY"}, "vip"); err == nil {
 		t.Fatal("低于下限应被拒")
 	}
-	if err := ValidateAmount(p, "app1", ok, "unknown"); err == nil {
+	if err := ValidateAmount(context.Background(), p, "app1", ok, "unknown"); err == nil {
 		t.Fatal("业务类型不在白名单应被拒")
 	}
-	if err := ValidateAmount(p, "app1", Money{Original: 90, Payable: 90, Currency: "USD"}, "vip"); err == nil {
+	if err := ValidateAmount(context.Background(), p, "app1", Money{Original: 90, Payable: 90, Currency: "USD"}, "vip"); err == nil {
 		t.Fatal("非允许币种应被拒")
+	}
+	// 策略查询失败 → 拒单(fail-closed),不放行金额校验。
+	if err := ValidateAmount(context.Background(), errPolicy{}, "app1", ok, "vip"); !errors.Is(err, ErrAmountPolicy) {
+		t.Fatalf("查询失败应包装 ErrAmountPolicy 拒单,实际: %v", err)
 	}
 }
 

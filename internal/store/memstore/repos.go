@@ -34,6 +34,12 @@ func (r orderRepo) Insert(_ context.Context, o *models.Order) error {
 	}
 	d.seq++
 	o.ID = d.seq
+	if o.CreatedAt.IsZero() {
+		o.CreatedAt = time.Now() // 对齐 DDL DEFAULT CURRENT_TIMESTAMP
+	}
+	if o.UpdatedAt.IsZero() {
+		o.UpdatedAt = o.CreatedAt
+	}
 	d.orders[o.ID] = *o
 	return nil
 }
@@ -90,6 +96,22 @@ func (r orderRepo) ListExpiredPending(_ context.Context, now time.Time, limit in
 	return out, nil
 }
 
+func (r orderRepo) ListStalledClosing(_ context.Context, before time.Time, limit int) ([]*models.Order, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	var out []*models.Order
+	for _, e := range r.m.d.orders {
+		if e.Status == models.OrderClosing && e.UpdatedAt.Before(before) {
+			cp := e
+			out = append(out, &cp)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 func (r orderRepo) CountPendingByUser(_ context.Context, appID string, userID int64) (int, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -120,6 +142,7 @@ func (r orderRepo) Update(_ context.Context, o *models.Order) error {
 	if _, ok := r.m.d.orders[o.ID]; !ok {
 		return store.ErrNotFound
 	}
+	o.UpdatedAt = time.Now() // 对齐 DDL ON UPDATE CURRENT_TIMESTAMP
 	r.m.d.orders[o.ID] = *o
 	return nil
 }

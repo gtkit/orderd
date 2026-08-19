@@ -74,7 +74,7 @@ func applySchema(t *testing.T, dsn string) {
 	defer func() { _ = db.Close() }()
 
 	tables := []string{
-		"ops_audit_logs", "reconcile_diffs", "reconcile_batches", "order_events", "payment_transactions",
+		"app_amount_policies", "ops_audit_logs", "reconcile_diffs", "reconcile_batches", "order_events", "payment_transactions",
 		"app_pay_accounts", "payment_attempts", "refunds", "app_endpoints", "event_outbox", "order_logs", "orders",
 	}
 	for _, tb := range tables {
@@ -476,5 +476,39 @@ func TestIntegrationBacklogMetrics(t *testing.T) {
 				t.Fatalf("最老待投递年龄应约 600s: %q", l)
 			}
 		}
+	}
+}
+
+// TestIntegrationAmountPolicy 真库(app-amount-policy spec):配置行生效、enabled=0 与未配置
+// 回退(resolver 返回 miss)、白名单 split 语义(币种空=仅 CNY 由 AmountBounds 层保证)。
+func TestIntegrationAmountPolicy(t *testing.T) {
+	st := openTestStore(t)
+	defer func() { _ = st.Close() }()
+	if err := st.DB().Exec(`INSERT INTO app_amount_policies(app_id, min_payable, max_payable, allowed_business, allowed_currency, enabled)
+		VALUES('app1', 100, 0, 'membership, course', '', 1), ('app2', 1, 0, '', '', 0)`).Error; err != nil {
+		t.Fatalf("播种策略失败: %v", err)
+	}
+	r := gormstore.NewAmountPolicyResolver(st.DB())
+
+	b, ok, err := r.Bounds(bg, "app1")
+	if err != nil || !ok || b.MinPayable != 100 {
+		t.Fatalf("已配置 app 应命中: %+v ok=%v err=%v", b, ok, err)
+	}
+	if !b.AllowedBusiness["membership"] || !b.AllowedBusiness["course"] || b.AllowedBusiness[""] {
+		t.Fatalf("业务白名单 split 语义不符: %+v", b.AllowedBusiness)
+	}
+	if b.AllowedCurrency != nil {
+		t.Fatalf("币种空应为 nil(=仅 CNY): %+v", b.AllowedCurrency)
+	}
+	// min_payable 生效(经 ValidateAmount)。
+	if err := models.ValidateAmount(bg, r, "app1", models.Money{Original: 90, Payable: 90, Currency: "CNY"}, "membership"); err == nil {
+		t.Fatal("低于 per-app 下限应被拒")
+	}
+	// enabled=0 与未配置 → miss(由装配层回退链兜底)。
+	if _, ok, err := r.Bounds(bg, "app2"); err != nil || ok {
+		t.Fatalf("enabled=0 应 miss: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := r.Bounds(bg, "app-none"); err != nil || ok {
+		t.Fatalf("未配置应 miss: ok=%v err=%v", ok, err)
 	}
 }

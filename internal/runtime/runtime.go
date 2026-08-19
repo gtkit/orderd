@@ -130,20 +130,32 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	var router paygateway.Router = channelRouter{alipay: alipayR, wechat: wechatR, fallback: stub.Router{}}
 
+	// 指标 Registry:积压 gauge(scrape 时聚合)+ 关键路径速率/时延(进程内埋点)。
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(metrics.NewBacklogCollector(st.DB()))
+	flow := metrics.NewFlowMetrics(reg)
+
 	pay := paymentapp.New(paymentapp.Deps{
 		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
-		NewEventID: idgen.UUIDv4, OutTradeNo: gen.OutTradeNo, AttemptTTL: cfg.AttemptTTL,
+		NewEventID: idgen.UUIDv4, OutTradeNo: gen.OutTradeNo, AttemptTTL: cfg.AttemptTTL, Obs: flow,
 	})
 	// 定价:默认 fail-closed;仅显式开启(BFF 经严格服务身份)才采信调用方金额(评审 P1)。
 	var pricing models.PricingAuthority = policy.DenyAllPricing{}
 	if cfg.PricingTrustCaller {
 		pricing = policy.TrustedCallerPricing{}
 	}
+	// 金额策略:per-app 配置(app_amount_policies)优先,未配置/停用回退全局默认档;
+	// 查询错误 fail-closed 拒单(FallbackAmountPolicy 语义)。
+	amounts := policy.FallbackAmountPolicy{
+		Primary:  gormstore.NewAmountPolicyResolver(st.DB()),
+		Fallback: policy.DefaultAmountPolicy(),
+	}
 	ord := orderapp.New(orderapp.Deps{
 		Store: st, Payment: pay, Pricing: pricing,
-		Amounts: policy.DefaultAmountPolicy(), Accounts: accounts, Clock: clock,
+		Amounts: amounts, Accounts: accounts, Clock: clock,
 		NewOrderNo: gen.OrderNo, NewToken: func() (string, error) { return idgen.SecureToken(32) },
 		NewEventID: idgen.UUIDv4, OrderTTL: cfg.OrderTTL, MaxPendingPerUser: cfg.MaxPendingPerUser,
+		Alerter: alerter,
 	})
 	ref := refundapp.New(refundapp.Deps{
 		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
@@ -170,8 +182,13 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	sender := webhook.NewSender(guard, 10*time.Second)
 	endpoints := gormstore.NewEndpointResolver(st.DB())
-	secrets := secret.NewStatic(cfg.WebhookSecrets)
-	delivery := worker.NewDelivery(st, endpoints, secrets, sender, alerter,
+	// 密钥来源:挂载目录(生产,轮换免重启)优先;未配置回退 env Static(dev)。不合并两来源。
+	var secrets secret.Resolver = secret.NewStatic(cfg.WebhookSecrets)
+	if cfg.SecretsDir != "" {
+		secrets = secret.NewDir(cfg.SecretsDir)
+		logger.Infow("密钥解析走挂载目录", "dir", cfg.SecretsDir)
+	}
+	delivery := worker.NewDelivery(st, endpoints, secrets, sender, alerter, flow,
 		worker.Config{WorkerID: cfg.WorkerID}, clock)
 	query := worker.NewQueryWorker(st, router, pay, alerter, worker.QueryConfig{WorkerID: cfg.WorkerID}, clock)
 	timeout := worker.NewTimeoutWorker(st, ord, pay, worker.TimeoutConfig{WorkerID: cfg.WorkerID}, clock)
@@ -196,10 +213,6 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		})
 		set.Reconcile = worker.NewReconcileWorker(reconcileSvc, accounts, cfg.ReconcileInterval, clock)
 	}
-
-	// 积压指标:自建 Registry(只含本服务指标,不带默认 go/process 噪声之外的业务面)。
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(metrics.NewBacklogCollector(st.DB()))
 
 	return &App{
 		Cfg: cfg, Store: st, GRPC: grpcSrv, AdminGRPC: adminSrv, Interceptor: interceptor,

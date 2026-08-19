@@ -3,6 +3,7 @@ package apptest
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -358,5 +359,66 @@ func TestGetOrderLookup(t *testing.T) {
 	// 恢复的 token 可继续走 GetOrderStatus。
 	if _, err := h.order.GetOrderStatus(bg, "app1", o.OrderToken, 42); err != nil {
 		t.Fatalf("回查 token 应可用: %v", err)
+	}
+}
+
+// TestAmountPolicyQueryFailureRejects 反证 app-amount-policy fail-closed:
+// 策略查询失败 → 下单被拒,绝不放行金额校验。
+func TestAmountPolicyQueryFailureRejects(t *testing.T) {
+	h := newHarness(false)
+	// 用查询失败的策略重建 order 服务。
+	broken := newOrderWithCap(h, 0)
+	_ = broken
+	h.order = orderWithAmounts(h, fakeAmounts{
+		b:   models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}},
+		err: errors.New("db down"),
+	})
+	if _, err := h.order.CreateOrder(bg, baseCreate()); !errors.Is(err, models.ErrAmountPolicy) {
+		t.Fatalf("策略查询失败应拒单(ErrAmountPolicy),实际: %v", err)
+	}
+	if n, _ := h.mem.Reader().Orders().CountPendingByUser(bg, "app1", 42); n != 0 {
+		t.Fatalf("拒单后不得有订单: %d", n)
+	}
+}
+
+// obsRecorder 记录 ConfirmOutcome(flow-metrics spec)。
+type obsRecorder struct {
+	mu       sync.Mutex
+	outcomes []string
+}
+
+func (o *obsRecorder) DeliveryResult(string, float64) {}
+func (o *obsRecorder) ConfirmOutcome(outcome string) {
+	o.mu.Lock()
+	o.outcomes = append(o.outcomes, outcome)
+	o.mu.Unlock()
+}
+
+// TestConfirmOutcomeObserved paid/duplicate/anomaly 三类结果均被埋点记录。
+func TestConfirmOutcomeObserved(t *testing.T) {
+	h := newHarness(false)
+	rec := &obsRecorder{}
+	h.payment = paymentWithObs(h, rec)
+
+	out, err := h.order.CreateOrder(bg, baseCreate())
+	if err != nil {
+		t.Fatalf("下单失败: %v", err)
+	}
+	acct := h.mem.Attempts(out.OrderNo)[0].PayAccountID
+	in := confirmInput(h, out.OrderNo, acct, "tx-obs", 90)
+	if _, err := h.payment.ConfirmPaySuccess(bg, in); err != nil { // paid
+		t.Fatal(err)
+	}
+	if _, err := h.payment.ConfirmPaySuccess(bg, in); err != nil { // duplicate
+		t.Fatal(err)
+	}
+	if _, err := h.payment.ConfirmPaySuccess(bg, confirmInput(h, out.OrderNo, acct, "tx-obs-2", 90)); err != nil { // anomaly(second)
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	want := []string{"paid", "duplicate", "anomaly"}
+	if len(rec.outcomes) != 3 || rec.outcomes[0] != want[0] || rec.outcomes[1] != want[1] || rec.outcomes[2] != want[2] {
+		t.Fatalf("outcome 序列应为 %v,实际 %v", want, rec.outcomes)
 	}
 }

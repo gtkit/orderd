@@ -139,6 +139,8 @@ type OrderRepo interface {
 	FindByIdempotencyKey(ctx context.Context, appID, key string) (*models.Order, error)
 	// ListExpiredPending 列出已过期的待支付订单(status=PENDING 且 expire_at<now),供超时关单 worker。
 	ListExpiredPending(ctx context.Context, now time.Time, limit int) ([]*models.Order, error)
+	// ListStalledClosing 列出 CLOSING 且 updated_at 早于 before 的订单(滞留兜底 watchdog)。
+	ListStalledClosing(ctx context.Context, before time.Time, limit int) ([]*models.Order, error)
 	// CountPendingByUser 统计同 (app_id, user_id) 的 PENDING 订单数(下单防刷上限用,近似语义)。
 	CountPendingByUser(ctx context.Context, appID string, userID int64) (int, error)
 	// FindByClientOrderNo 按业务单号查(uk_app_client_order 唯一);未命中返回 (nil, nil)。

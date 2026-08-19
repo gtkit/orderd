@@ -16,6 +16,7 @@ import (
 	"github.com/gtkit/orderd/internal/pkg/sqlutil"
 	"github.com/gtkit/orderd/internal/shared/account"
 	"github.com/gtkit/orderd/internal/shared/alert"
+	"github.com/gtkit/orderd/internal/shared/obs"
 	"github.com/gtkit/orderd/internal/store"
 )
 
@@ -30,6 +31,8 @@ type Deps struct {
 	AttemptTTL     time.Duration
 	OutTradeNo     func() string // 生成商户订单号(每尝试独立)
 	GatewayTimeout time.Duration // 单次网关调用强制超时(评审 P1)
+	// Obs 关键路径埋点端口(nil → Nop,行为不变)。
+	Obs obs.FlowObserver
 }
 
 // Service 支付应用服务。
@@ -45,6 +48,9 @@ func New(d Deps) *Service {
 	}
 	if d.GatewayTimeout == 0 {
 		d.GatewayTimeout = 10 * time.Second
+	}
+	if d.Obs == nil {
+		d.Obs = obs.Nop{}
 	}
 	return &Service{d: d}
 }
@@ -394,6 +400,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 			"amount": in.Amount, "channel": in.Channel, "pay_account_id": in.PayAccountID,
 		})
 	}
+	s.d.Obs.ConfirmOutcome(res.Outcome) // 事务外纯内存计数
 	return res, nil
 }
 
