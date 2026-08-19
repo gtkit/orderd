@@ -715,3 +715,101 @@ func TestIntegrationOutboxDeadNoOverwriteDelivered(t *testing.T) {
 		t.Fatalf("已 Delivered 不得被陈旧 MarkDead 覆盖成 Dead,实际 status=%d", ob.Status)
 	}
 }
+
+func isDeadlockErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "deadlock") || strings.Contains(s, "1213")
+}
+
+// TestIntegrationLockOrderPreventsDeadlock 反证 fix-concurrent-writeback-races 的锁序统一:
+// 写回路径统一按"订单→尝试/退款"加锁以消解 AB-BA 死锁环。分两段坐实该声明——
+// (1) 反向锁序对(尝试→订单 vs 订单→尝试)交错,数据库必检出死锁(Error 1213)回滚一方,
+//
+//	证明死锁环客观存在、锁序统一并非多余;
+//
+// (2) 统一锁序对(两者皆订单→尝试)并发,不死锁、两事务均成功,证明该机制消解了环。
+// 边界:本测试证明"锁序统一这一机制消解了 AB-BA 环",生产各写路径遵守该序仍由代码审查保证。
+func TestIntegrationLockOrderPreventsDeadlock(t *testing.T) {
+	st := openTestStore(t)
+	defer func() { _ = st.Close() }()
+	if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		if e := r.Orders().Insert(ctx, &models.Order{
+			AppID: "app1", OrderNo: "OD-dl", OrderToken: "tok-dl", UserID: 42, Status: models.OrderPending,
+			ProductID: 1, ProductTitle: "x", Currency: "CNY", OriginalPrice: 90, PayAmount: 90,
+			PayMethod: models.PayMethodWechat, PayChannel: "wechat", PayAccountID: "acc-wechat",
+			ExpireAt: time.Now().Add(time.Hour),
+		}); e != nil {
+			return e
+		}
+		return r.Attempts().Insert(ctx, &models.PaymentAttempt{
+			AppID: "app1", OrderNo: "OD-dl", AttemptNo: 1, Channel: "wechat", PayAccountID: "acc-wechat",
+			OutTradeNo: "PT-dl", Status: models.AttemptUnknown, ExpireAt: time.Now().Add(time.Hour),
+		})
+	}); err != nil {
+		t.Fatalf("播种: %v", err)
+	}
+
+	// 裸事务做死锁反证:绕开 ormx.WithTx 的自动重试——重试会把死锁自动重放为成功,
+	// 并重复执行屏障(close 已关闭 channel 触发 panic),掩盖本要观测的死锁。
+	db, err := sql.Open("mysql", os.Getenv("ORDERD_TEST_MYSQL_DSN"))
+	if err != nil {
+		t.Fatalf("开裸连接: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(4)
+
+	const (
+		lockOrderSQL   = "SELECT id FROM orders WHERE app_id='app1' AND order_no='OD-dl' FOR UPDATE"
+		lockAttemptSQL = "SELECT id FROM payment_attempts WHERE out_trade_no='PT-dl' FOR UPDATE"
+	)
+	// lockPair 在一个事务内按 first→second 加两把行锁,拿到第一把后执行 afterFirst(屏障)。
+	lockPair := func(first, second string, afterFirst func()) error {
+		tx, e := db.BeginTx(bg, nil)
+		if e != nil {
+			return e
+		}
+		defer func() { _ = tx.Rollback() }()
+		var id int64
+		if e := tx.QueryRowContext(bg, first).Scan(&id); e != nil {
+			return e
+		}
+		afterFirst()
+		if e := tx.QueryRowContext(bg, second).Scan(&id); e != nil {
+			return e
+		}
+		return tx.Commit()
+	}
+
+	// (1) 反向锁序(尝试→订单 vs 订单→尝试)交错 → 必死锁。
+	aLocked, bLocked := make(chan struct{}), make(chan struct{})
+	var errA, errB error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errA = lockPair(lockAttemptSQL, lockOrderSQL, func() { close(aLocked); <-bLocked })
+	}()
+	go func() {
+		defer wg.Done()
+		errB = lockPair(lockOrderSQL, lockAttemptSQL, func() { close(bLocked); <-aLocked })
+	}()
+	wg.Wait()
+	if !isDeadlockErr(errA) && !isDeadlockErr(errB) {
+		t.Fatalf("反向锁序应触发死锁(证明死锁环客观存在),errA=%v errB=%v", errA, errB)
+	}
+
+	// (2) 统一锁序(两者皆订单→尝试)并发 → 不死锁,两事务均成功。
+	overlap := func() { time.Sleep(150 * time.Millisecond) } // 制造重叠,逼另一事务在订单锁上排队
+	var e1, e2 error
+	var wg2 sync.WaitGroup
+	wg2.Add(2)
+	go func() { defer wg2.Done(); e1 = lockPair(lockOrderSQL, lockAttemptSQL, overlap) }()
+	go func() { defer wg2.Done(); e2 = lockPair(lockOrderSQL, lockAttemptSQL, overlap) }()
+	wg2.Wait()
+	if e1 != nil || e2 != nil {
+		t.Fatalf("统一锁序并发不应死锁(证明锁序统一消解了环),e1=%v e2=%v", e1, e2)
+	}
+}

@@ -21,6 +21,7 @@ type fakeProvider struct {
 	rquery    *paymgr.QueryRefundResponse
 	rqueryErr error
 	notify    *paymgr.NotifyResult
+	notifyErr error
 	acked     bool
 }
 
@@ -45,6 +46,9 @@ func (f *fakeProvider) QueryRefund(context.Context, *paymgr.QueryRefundRequest) 
 }
 
 func (f *fakeProvider) ParseNotify(context.Context, *http.Request) (*paymgr.NotifyResult, error) {
+	if f.notifyErr != nil {
+		return nil, f.notifyErr
+	}
 	return f.notify, nil
 }
 
@@ -138,5 +142,18 @@ func TestParseNotifyAndAck(t *testing.T) {
 	gw.Ack(rec)
 	if !f.acked || rec.Code != http.StatusOK {
 		t.Fatalf("Ack 应调 Provider.ACKNotify 并回 200: acked=%v code=%d", f.acked, rec.Code)
+	}
+}
+
+// TestParseNotifyRejectsVerifyFailure 反证:底层验签失败时 ParseNotify 必须传播错误,
+// 绝不把验签失败误判为已支付通知——否则伪造回调可绕过验签直达结算。
+func TestParseNotifyRejectsVerifyFailure(t *testing.T) {
+	gw := gwWith(&fakeProvider{notifyErr: errors.New("verify signature failed")})
+	n, err := gw.ParseNotify(ctx, httptest.NewRequest(http.MethodPost, "/notify/wechat/r1", nil))
+	if err == nil {
+		t.Fatal("验签失败必须返回错误,不得吞成成功")
+	}
+	if n.Paid {
+		t.Fatalf("验签失败不得解析出已支付: %+v", n)
 	}
 }

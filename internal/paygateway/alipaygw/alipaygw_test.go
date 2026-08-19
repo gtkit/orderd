@@ -3,6 +3,8 @@ package alipaygw
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/gtkit/go-pay/paymgr"
@@ -17,6 +19,8 @@ type fakeProvider struct {
 	refund    *paymgr.RefundResponse
 	rquery    *paymgr.QueryRefundResponse
 	rqueryErr error
+	notify    *paymgr.NotifyResult
+	notifyErr error
 }
 
 func (f *fakeProvider) Channel() paymgr.Channel { return paymgr.ChannelAlipay }
@@ -37,6 +41,13 @@ func (f *fakeProvider) QueryRefund(context.Context, *paymgr.QueryRefundRequest) 
 		return nil, f.rqueryErr
 	}
 	return f.rquery, nil
+}
+
+func (f *fakeProvider) ParseNotify(context.Context, *http.Request) (*paymgr.NotifyResult, error) {
+	if f.notifyErr != nil {
+		return nil, f.notifyErr
+	}
+	return f.notify, nil
 }
 
 func gwWith(p paymgr.Provider) *Gateway {
@@ -111,5 +122,26 @@ func TestRefundQueryErrorMapping(t *testing.T) {
 	q2, err2 := gw2.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
 	if err2 == nil || q2.State != paygateway.RefundQueryError {
 		t.Fatalf("未知错误应映射 Error 并带错误: %+v err=%v", q2, err2)
+	}
+}
+
+func TestParseNotifyPaidMapping(t *testing.T) {
+	gw := gwWith(&fakeProvider{notify: &paymgr.NotifyResult{OutTradeNo: "PT1", TransactionID: "txn", TradeStatus: paymgr.TradeStatusPaid, TotalAmount: 90}})
+	n, err := gw.ParseNotify(ctx, httptest.NewRequest(http.MethodPost, "/notify/alipay/r1", nil))
+	if err != nil || !n.Paid || n.OutTradeNo != "PT1" || n.AmountFen != 90 {
+		t.Fatalf("验签后应解析出已支付通知: %+v err=%v", n, err)
+	}
+}
+
+// TestParseNotifyRejectsVerifyFailure 反证:底层验签失败时 ParseNotify 必须传播错误,
+// 绝不把验签失败误判为已支付通知——否则伪造回调可绕过验签直达结算。
+func TestParseNotifyRejectsVerifyFailure(t *testing.T) {
+	gw := gwWith(&fakeProvider{notifyErr: errors.New("verify signature failed")})
+	n, err := gw.ParseNotify(ctx, httptest.NewRequest(http.MethodPost, "/notify/alipay/r1", nil))
+	if err == nil {
+		t.Fatal("验签失败必须返回错误,不得吞成成功")
+	}
+	if n.Paid {
+		t.Fatalf("验签失败不得解析出已支付: %+v", n)
 	}
 }
