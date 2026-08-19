@@ -367,8 +367,6 @@ func TestGetOrderLookup(t *testing.T) {
 func TestAmountPolicyQueryFailureRejects(t *testing.T) {
 	h := newHarness(false)
 	// 用查询失败的策略重建 order 服务。
-	broken := newOrderWithCap(h, 0)
-	_ = broken
 	h.order = orderWithAmounts(h, fakeAmounts{
 		b:   models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}},
 		err: errors.New("db down"),

@@ -71,9 +71,6 @@ func NewGenerator(machineID int64) (*Generator, error) {
 	return &Generator{sf: sf}, nil
 }
 
-// FromSnowflake 复用已有雪花生成器。
-func FromSnowflake(sf *Snowflake) *Generator { return &Generator{sf: sf} }
-
 func (g *Generator) OrderNo() string    { return fmt.Sprintf("OD%d", g.sf.NextID()) } // 订单号
 func (g *Generator) OutTradeNo() string { return fmt.Sprintf("PT%d", g.sf.NextID()) } // 商户订单号(尝试)
 func (g *Generator) RefundNo() string   { return fmt.Sprintf("RF%d", g.sf.NextID()) } // 退款单号

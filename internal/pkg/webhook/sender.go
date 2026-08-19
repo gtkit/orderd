@@ -38,17 +38,10 @@ type Message struct {
 type Sender struct {
 	client *http.Client
 	guard  *SSRFGuard
-	now    func() time.Time
 }
 
-// Option 配置项。
-type Option func(*Sender)
-
-// WithClock 注入时钟(测试用)。
-func WithClock(f func() time.Time) Option { return func(s *Sender) { s.now = f } }
-
 // NewSender 构造投递器;guard 为 SSRF 守卫,timeout 为单次投递超时。
-func NewSender(guard *SSRFGuard, timeout time.Duration, opts ...Option) *Sender {
+func NewSender(guard *SSRFGuard, timeout time.Duration) *Sender {
 	base := &net.Dialer{Timeout: 5 * time.Second}
 	tr := &http.Transport{
 		DialContext:           guard.dialContext(base),
@@ -56,7 +49,7 @@ func NewSender(guard *SSRFGuard, timeout time.Duration, opts ...Option) *Sender 
 		ResponseHeaderTimeout: timeout,
 		DisableKeepAlives:     true,
 	}
-	s := &Sender{
+	return &Sender{
 		client: &http.Client{
 			Timeout:   timeout,
 			Transport: tr,
@@ -64,12 +57,7 @@ func NewSender(guard *SSRFGuard, timeout time.Duration, opts ...Option) *Sender 
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 		guard: guard,
-		now:   time.Now,
 	}
-	for _, o := range opts {
-		o(s)
-	}
-	return s
 }
 
 // sign 生成与 SDK 一致的签名。
@@ -91,7 +79,7 @@ func (s *Sender) Send(ctx context.Context, m Message) error {
 		return fmt.Errorf("webhook: 仅允许 https(或白名单主机),实际 scheme=%q", u.Scheme)
 	}
 
-	ts := strconv.FormatInt(s.now().Unix(), 10)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.URL, bytes.NewReader(m.Body))
 	if err != nil {
 		return err

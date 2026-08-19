@@ -1,4 +1,4 @@
-// Package dbtx 提供 context 事务传递:TxManager 把事务 *gorm.DB 放进 context,
+// Package dbtx 提供 context 事务传递:gormstore.Store.WithinTx 把事务 *gorm.DB 放进 context,
 // 同一事务内的多个 repo 经 DB(ctx, fallback) 复用它;无事务时回退到默认连接。
 //
 // 依赖方向:基础设施型包(import gorm),仅 repository / runtime/module / platform 可 import。

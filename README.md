@@ -13,19 +13,20 @@ orderd 只做订单与资金主链,**不做交付/发权益**(接入方消费事
 ## 目录
 
 1. [架构与分层](#架构与分层)
-2. [快速开始](#快速开始)
-3. [配置](#配置)
-4. [鉴权(所有 gRPC 调用必读)](#鉴权)
-5. [gRPC 接入](#grpc-接入)
-6. [REST 接入(grpc-gateway)](#rest-接入grpc-gateway供-php-等非-grpc-方)
-7. [HTTP 接入](#http-接入)
+2. [核心流程](#核心流程)
+3. [快速开始](#快速开始)
+4. [配置](#配置)
+5. [鉴权(所有 gRPC 调用必读)](#鉴权)
+6. [gRPC 接入](#grpc-接入)
+7. [REST 接入(grpc-gateway)](#rest-接入grpc-gateway供-php-等非-grpc-方)
+8. [HTTP 接入](#http-接入)
    - [支付回调(渠道 → orderd)](#1-支付回调渠道--orderd)
    - [事件 webhook(orderd → 接入方)](#2-事件-webhook-orderd--接入方)
    - [健康检查](#3-健康检查)
-8. [支付宝接入与沙箱联调](#支付宝接入与沙箱联调)
-9. [后台 worker](#后台-worker)
-10. [开发与门禁](#开发与门禁)
-11. [现状:已接 / 未接](#现状已接--未接)
+9. [支付宝接入与沙箱联调](#支付宝接入与沙箱联调)
+10. [后台 worker](#后台-worker)
+11. [开发与门禁](#开发与门禁)
+12. [现状:已接 / 未接](#现状已接--未接)
 
 ---
 
@@ -54,6 +55,60 @@ internal/
   runtime/ bootstrap/      装配 + 生命周期(gRPC + REST 网关 + worker)
 sdk/orderevents/           接入方事件消费 SDK(含 inbox_schema.sql)
 ```
+
+---
+
+## 核心流程
+
+### 支付主链(下单 → 支付 → 入账 → 事件 → 发权益)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant BFF as 接入方 BFF
+    participant O as orderd
+    participant GW as 支付渠道
+    participant W as 投递 worker
+
+    BFF->>O: CreateOrder,JWT 带 order:create
+    Note over O: 金额不变量 + per-app 策略 + 定价边界<br/>幂等键命中 → 复用既有单<br/>未付单上限,默认 5
+    O->>O: 建单 PENDING + 支付尝试 REQUESTING,同事务
+    O->>GW: 统一下单,不持锁,强制超时
+    GW-->>O: prepay / 调起参数
+    O-->>BFF: order_no + order_token + app_params
+    BFF-->>BFF: APP 用 app_params 调起支付
+
+    GW->>O: 异步回调 /notify/{渠道}/{route_id}
+    Note over O: 按 route_id 定位账号 → 验签<br/>由 out_trade_no 派生订单,不信任回调参数
+    O->>O: §7 支付成功事务:CAS 唯一成功<br/>流水 + 成功快照 + 关其它尝试<br/>order.paid 双写 order_events + outbox
+    O-->>GW: ACK,paid/duplicate/anomaly 均已落地
+
+    W->>O: 租约认领 outbox
+    W->>BFF: webhook order.paid,HMAC 签名
+    Note over BFF: inbox 幂等,event_id 唯一 + 版本单调<br/>同事务发权益/落账单 → 回 2xx
+```
+
+兜底路径(图外,均已实现):回调丢失由**查单 worker** 收敛 UNKNOWN/CLOSING 尝试;支付超时由**超时 watchdog** 关单(含 REQUESTING 卡死、CLOSING 滞留);webhook 漏投由接入方 `ListOrderEvents` 游标补拉;投递失败退避重试,达上限转死信(AdminService 可查可重放,兜底重放 worker 可选)。
+
+### 退款执行(审批在接入方 admin,orderd 只执行)
+
+```mermaid
+flowchart TD
+    A["RefundOrder<br/>refund:execute + enabled"] --> B{"订单 PAID?全额?"}
+    B -- 否 --> R1["拒绝"]
+    B -- 是 --> C["同事务:CAS PAID→REFUNDING<br/>+ 建退款 CREATED,活跃退款唯一守卫"]
+    C --> D["调网关退款<br/>用成功快照的渠道/账号/原单号"]
+    D -- 明确拒绝 --> F["FAILED + 订单回退 PAID"]
+    D -- "错误/超时,结果未知" --> P["PROCESSING<br/>绝不判失败"]
+    D -- 受理 --> P
+    P --> Q["退款查单 worker<br/>CREATED 滞留超 2 分钟也会被恢复接管"]
+    Q -- 成功 --> S["REFUNDED + kind=2 流水<br/>+ order.refunded 事件"]
+    Q -- 网关明确失败 --> F
+    Q -- 连续不存在×6 --> F
+    Q -- 金额不符 --> X["退款 ABNORMAL + 订单 REFUND_EXCEPTION<br/>告警,人工处置"]
+```
+
+订单/支付尝试/退款的**状态机全图**见 [DESIGN.md](./DESIGN.md) §9/§10/§15(权威规格,`internal/models/transition.go` 的转移表与之逐条对应并被测试矩阵钉住)。
 
 ---
 
