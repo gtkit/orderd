@@ -1,0 +1,19 @@
+version: v2
+# 接入方契约专用模板:REST 反向代理 + OpenAPI 文档【只对 OrderService 契约文件生成】。
+# AdminService(admin.proto)是运维契约,绝不进 REST/OpenAPI 面(DESIGN 评审 D1/D2)——
+# openapiv2 的 allow_merge 会把 admin.proto 的 service tag/文件注释并进 swagger,故必须用
+# --path 限定输入:
+#   cd proto && buf generate --template buf.gen.gateway.yaml --path order/v1/order.proto --path order/v1/events.proto
+plugins:
+  # REST 反向代理(standalone=true:生成独立包并 import pb 消息,而非同包)。
+  - remote: buf.build/grpc-ecosystem/gateway
+    out: ../internal/gateway
+    opt:
+      - paths=source_relative
+      - standalone=true
+  # OpenAPI v2(交付 PHP 等非 gRPC 接入方),合并为单文件 docs/openapi/order.swagger.json
+  - remote: buf.build/grpc-ecosystem/openapiv2
+    out: ../docs/openapi
+    opt:
+      - allow_merge=true
+      - merge_file_name=order

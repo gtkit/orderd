@@ -259,3 +259,104 @@ func countEvents(h *harness, eventType string) int {
 	}
 	return n
 }
+
+// TestPendingOrderCap 单用户未付订单数上限:达限拒(零副作用)、未达限放行、
+// 幂等复用不受限、0=不限、非 PENDING 不计数。
+func TestPendingOrderCap(t *testing.T) {
+	newCapped := func(maxN int) *harness {
+		h := newHarness(false)
+		h.order = newOrderWithCap(h, maxN)
+		return h
+	}
+	t.Run("达限拒且零副作用", func(t *testing.T) {
+		h := newCapped(2)
+		for range 2 {
+			if _, err := h.order.CreateOrder(bg, baseCreate()); err != nil {
+				t.Fatalf("前置下单失败: %v", err)
+			}
+		}
+		h.gateway.mu.Lock()
+		prepBefore := h.gateway.lastPrepare
+		h.gateway.mu.Unlock()
+		_, err := h.order.CreateOrder(bg, baseCreate())
+		if !errors.Is(err, models.ErrTooManyPendingOrders) {
+			t.Fatalf("达限应拒,实际: %v", err)
+		}
+		n, _ := h.mem.Reader().Orders().CountPendingByUser(bg, "app1", 42)
+		if n != 2 {
+			t.Fatalf("拒绝后不得新增订单: %d", n)
+		}
+		h.gateway.mu.Lock()
+		defer h.gateway.mu.Unlock()
+		if h.gateway.lastPrepare != prepBefore {
+			t.Fatal("拒绝路径不得调网关")
+		}
+	})
+	t.Run("幂等复用不受限", func(t *testing.T) {
+		h := newCapped(1)
+		in := baseCreate()
+		in.IdempotencyKey = "idem-cap"
+		first, err := h.order.CreateOrder(bg, in)
+		if err != nil {
+			t.Fatalf("首单失败: %v", err)
+		}
+		again, err := h.order.CreateOrder(bg, in) // 已达限 1,但命中复用
+		if err != nil || !again.Reused || again.OrderNo != first.OrderNo {
+			t.Fatalf("复用不应被上限拒: %+v err=%v", again, err)
+		}
+	})
+	t.Run("零为不限", func(t *testing.T) {
+		h := newCapped(0)
+		for i := range 7 {
+			if _, err := h.order.CreateOrder(bg, baseCreate()); err != nil {
+				t.Fatalf("第 %d 单失败: %v", i, err)
+			}
+		}
+	})
+	t.Run("非PENDING不计数", func(t *testing.T) {
+		h := newCapped(1)
+		orderNo, _ := h.createAndPay(t, "") // PAID,不占限额
+		_ = orderNo
+		if _, err := h.order.CreateOrder(bg, baseCreate()); err != nil {
+			t.Fatalf("已支付订单不应计入上限: %v", err)
+		}
+	})
+}
+
+// TestGetOrderLookup 按订单号/业务单号回查:双键恰一、跨租户、越权、token 可回查。
+func TestGetOrderLookup(t *testing.T) {
+	h := newHarness(false)
+	in := baseCreate()
+	in.ClientOrderNo = "biz-lookup"
+	out, err := h.order.CreateOrder(bg, in)
+	if err != nil {
+		t.Fatalf("下单失败: %v", err)
+	}
+	// 按业务单号。
+	o, err := h.order.GetOrder(bg, "app1", 42, "", "biz-lookup")
+	if err != nil || o.OrderNo != out.OrderNo || o.OrderToken != out.OrderToken {
+		t.Fatalf("按业务单号回查失败: %+v err=%v", o, err)
+	}
+	// 按订单号。
+	if _, err := h.order.GetOrder(bg, "app1", 42, out.OrderNo, ""); err != nil {
+		t.Fatalf("按订单号回查失败: %v", err)
+	}
+	// 双键都填/都空。
+	if _, err := h.order.GetOrder(bg, "app1", 42, out.OrderNo, "biz-lookup"); err == nil {
+		t.Fatal("双键都填应拒")
+	}
+	if _, err := h.order.GetOrder(bg, "app1", 42, "", ""); err == nil {
+		t.Fatal("双键都空应拒")
+	}
+	// 跨租户等同不存在;越权归属拒绝。
+	if _, err := h.order.GetOrder(bg, "app2", 42, out.OrderNo, ""); !errors.Is(err, models.ErrOrderNotFound) {
+		t.Fatalf("跨租户应 NotFound,实际: %v", err)
+	}
+	if _, err := h.order.GetOrder(bg, "app1", 999, out.OrderNo, ""); !errors.Is(err, models.ErrOrderNotOwned) {
+		t.Fatalf("越权应拒,实际: %v", err)
+	}
+	// 恢复的 token 可继续走 GetOrderStatus。
+	if _, err := h.order.GetOrderStatus(bg, "app1", o.OrderToken, 42); err != nil {
+		t.Fatalf("回查 token 应可用: %v", err)
+	}
+}

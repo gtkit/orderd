@@ -27,6 +27,8 @@ func toStatus(err error) error {
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, models.ErrActiveAttemptExists), errors.Is(err, models.ErrActiveRefundExists):
 		return status.Error(codes.Aborted, err.Error())
+	case errors.Is(err, models.ErrTooManyPendingOrders):
+		return status.Error(codes.ResourceExhausted, err.Error())
 	case errors.Is(err, models.ErrRefundNotAllowed):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, models.ErrInvalidAmount), errors.Is(err, models.ErrAmountPolicy):

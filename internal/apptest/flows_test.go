@@ -163,6 +163,11 @@ func TestConfirmPayAccountMismatch(t *testing.T) {
 	if o.Status != models.OrderPending {
 		t.Fatalf("账号不符不应结算,实际: %v", o.Status)
 	}
+	for _, tx := range h.mem.Txns() {
+		if tx.Anomaly && tx.AnomalyKind != models.AnomalyKindAccountChannelMismatch {
+			t.Fatalf("异常流水应落成因 account_channel_mismatch: %+v", tx)
+		}
+	}
 }
 
 // TestConfirmPayCrossOrderTxnReuse 评审 P0:交易号被另一订单占用 → 禁止结算本订单。
@@ -251,6 +256,11 @@ func TestConfirmPaySuccessSecondRealPayment(t *testing.T) {
 	for _, tx := range txns {
 		if tx.Anomaly {
 			anomalies++
+			if tx.AnomalyKind != models.AnomalyKindSecondRealPayment {
+				t.Fatalf("异常流水应落成因 second_real_payment: %+v", tx)
+			}
+		} else if tx.AnomalyKind != "" {
+			t.Fatalf("正常流水成因应为空: %+v", tx)
 		}
 	}
 	if anomalies != 1 {
@@ -279,8 +289,8 @@ func TestConfirmPaySuccessAmountMismatch(t *testing.T) {
 	if o.Status != models.OrderPending {
 		t.Fatalf("金额不符不应改订单状态,实际: %v", o.Status)
 	}
-	if len(h.mem.Txns()) != 1 || !h.mem.Txns()[0].Anomaly {
-		t.Fatalf("应落 1 条 anomaly 流水: %+v", h.mem.Txns())
+	if len(h.mem.Txns()) != 1 || !h.mem.Txns()[0].Anomaly || h.mem.Txns()[0].AnomalyKind != models.AnomalyKindAmountMismatch {
+		t.Fatalf("应落 1 条成因 amount_mismatch 的 anomaly 流水: %+v", h.mem.Txns())
 	}
 }
 

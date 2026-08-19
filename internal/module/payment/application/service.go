@@ -275,10 +275,10 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 
 		// 通知路由到的渠道/账号必须与该尝试冻结的一致;不一致=错误路由/映射 → anomaly 落库不结算。
 		if in.Channel != attempt.Channel || in.PayAccountID != attempt.PayAccountID {
-			if err := s.insertTxn(ctx, r, o, in, attempt, true); err != nil {
+			if err := s.insertAnomalyTxn(ctx, r, o, in, attempt, models.AnomalyKindAccountChannelMismatch); err != nil {
 				return err
 			}
-			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: "account_channel_mismatch"}
+			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindAccountChannelMismatch}
 			return nil
 		}
 
@@ -309,7 +309,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		// 不改订单(评审 #4)。准入用 CanSettlePayment 而非状态机全表:REFUNDING→PAID 是
 		// 退款失败回退专用边,支付确认借道会把退款中订单错误拉回 PAID(覆盖快照+二次发事件)。
 		if !models.CanSettlePayment(o.Status) {
-			if err := s.insertTxn(ctx, r, o, in, attempt, true); err != nil {
+			if err := s.insertAnomalyTxn(ctx, r, o, in, attempt, models.AnomalyKindSecondRealPayment); err != nil {
 				return err
 			}
 			if attempt.Status.Active() {
@@ -318,16 +318,16 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 					return err
 				}
 			}
-			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: "second_real_payment"}
+			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindSecondRealPayment}
 			return nil
 		}
 
 		// 3) 金额/币种不符的真实交易:落 anomaly 流水,不改订单。
 		if mismatch {
-			if err := s.insertTxn(ctx, r, o, in, attempt, true); err != nil {
+			if err := s.insertAnomalyTxn(ctx, r, o, in, attempt, models.AnomalyKindAmountMismatch); err != nil {
 				return err
 			}
-			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: "amount_mismatch"}
+			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindAmountMismatch}
 			return nil
 		}
 
@@ -487,12 +487,13 @@ func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo stri
 }
 
 // payTxn 由权威订单 o + 通知 in + 胜出尝试 attempt 组装一条支付流水。
-func payTxn(o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, anomaly bool) *models.PaymentTransaction {
+// anomalyKind:异常成因(models.AnomalyKind*),正常流水传空串——处置方式因成因而异,必须随流水落库。
+func payTxn(o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, anomaly bool, anomalyKind string) *models.PaymentTransaction {
 	t := &models.PaymentTransaction{
 		AppID: o.AppID, OrderNo: o.OrderNo, PayAccountID: in.PayAccountID,
 		Channel: in.Channel, Kind: models.TxnPay, OutTradeNo: in.OutTradeNo,
 		TransactionID: in.TransactionID, Amount: in.Amount, Currency: sqlutil.OrDefault(in.Currency, "CNY"),
-		Anomaly: anomaly, PaidAt: sqlutil.Time(in.PaidAt), NotifyDigest: in.NotifyDigest,
+		Anomaly: anomaly, AnomalyKind: anomalyKind, PaidAt: sqlutil.Time(in.PaidAt), NotifyDigest: in.NotifyDigest,
 	}
 	if attempt != nil {
 		t.PaymentAttemptID = sqlutil.Int64(int64(attempt.ID))
@@ -500,9 +501,9 @@ func payTxn(o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, an
 	return t
 }
 
-// insertTxn 插入(通常为 anomaly)流水;命中唯一键视为已记录,忽略(异常事实已在库)。
-func (s *Service) insertTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, anomaly bool) error {
-	if err := r.Transactions().Insert(ctx, payTxn(o, in, attempt, anomaly)); err != nil && !errors.Is(err, store.ErrDuplicate) {
+// insertAnomalyTxn 插入异常流水(anomaly=1,携带成因);命中唯一键视为已记录,忽略(异常事实已在库)。
+func (s *Service) insertAnomalyTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, anomalyKind string) error {
+	if err := r.Transactions().Insert(ctx, payTxn(o, in, attempt, true, anomalyKind)); err != nil && !errors.Is(err, store.ErrDuplicate) {
 		return err
 	}
 	return nil
@@ -518,7 +519,7 @@ const (
 
 // insertWinningTxn 结算前插入正常流水;命中唯一键时重读比对,区分"并发同笔"与"跨订单冲突"(评审 P0)。
 func (s *Service) insertWinningTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt) (txnInsertResult, error) {
-	err := r.Transactions().Insert(ctx, payTxn(o, in, attempt, false))
+	err := r.Transactions().Insert(ctx, payTxn(o, in, attempt, false, ""))
 	if err == nil {
 		return txnInserted, nil
 	}

@@ -57,6 +57,49 @@
       }
     },
     "/v1/orders": {
+      "get": {
+        "summary": "按订单号/业务单号回查(镜像失步兜底,恢复 token)。",
+        "operationId": "OrderService_GetOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "orderNo",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "clientOrderNo",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "userId",
+            "description": "归属校验(实际取 token)",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "int64"
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      },
       "post": {
         "summary": "REST 与 gRPC 同源:身份/权限统一走 authorization 头(JWT),REST 不在 path/query 暴露鉴权信息。\n写操作 POST + body:\"*\"(整体映射);只读用 GET(字段落 query/path)。",
         "operationId": "OrderService_CreateOrder",
@@ -351,7 +394,7 @@
         "CLOSE_REASON_USER_CANCEL"
       ],
       "default": "CLOSE_REASON_UNSPECIFIED",
-      "title": "- CLOSE_REASON_TIMEOUT: 支付超时\n - CLOSE_REASON_SUPERSEDED: 被新单取代\n - CLOSE_REASON_SYSTEM: 系统关闭\n - CLOSE_REASON_USER_CANCEL: 用户主动取消(存在已提交网关的支付尝试,经关单确认后 CLOSED)"
+      "description": "- CLOSE_REASON_TIMEOUT: 支付超时\n - CLOSE_REASON_SUPERSEDED: 被新单取代\n - CLOSE_REASON_SYSTEM: 系统关闭\n - CLOSE_REASON_USER_CANCEL: 用户主动取消(存在已提交网关的支付尝试,经关单确认后 CLOSED)"
     },
     "v1CreateOrderRequest": {
       "type": "object",
@@ -446,6 +489,56 @@
           "title": "序列化的 EventEnvelope(见 events.proto)"
         }
       }
+    },
+    "v1GetOrderResponse": {
+      "type": "object",
+      "properties": {
+        "orderNo": {
+          "type": "string"
+        },
+        "clientOrderNo": {
+          "type": "string"
+        },
+        "orderToken": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1OrderStatus"
+        },
+        "statusText": {
+          "type": "string"
+        },
+        "closeReason": {
+          "$ref": "#/definitions/v1CloseReason"
+        },
+        "amount": {
+          "$ref": "#/definitions/v1Money"
+        },
+        "tradeNo": {
+          "type": "string"
+        },
+        "paidAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "refundedAmount": {
+          "type": "string",
+          "format": "int64"
+        },
+        "aggregateVersion": {
+          "type": "string",
+          "format": "int64"
+        },
+        "metadata": {
+          "type": "string",
+          "format": "byte"
+        },
+        "expireAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "title": "GetOrderResponse 含镜像恢复所需全量:单号关联 + order_token(仅经同租户+同用户+order:read 校验后下发;\nwebhook 事件不含 token 的约束不变)。"
     },
     "v1GetOrderStatusResponse": {
       "type": "object",

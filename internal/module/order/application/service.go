@@ -27,6 +27,9 @@ type Deps struct {
 	NewToken   func() (string, error)
 	NewEventID func() (string, error)
 	OrderTTL   time.Duration
+	// MaxPendingPerUser 单用户 PENDING 订单数上限(<=0 不限)。近似防刷阈值,非资金不变量:
+	// 计数与插入非原子,并发窗口内可短暂超出。
+	MaxPendingPerUser int
 }
 
 // Service 订单应用服务。
@@ -128,6 +131,16 @@ func (s *Service) CreateOrder(ctx context.Context, in CreateInput) (CreateOutcom
 	}
 
 	insertErr := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		// 单用户未付订单数上限(近似,事务内计数使窗口最小;超限在网关调用之前拒绝,零副作用)。
+		if s.d.MaxPendingPerUser > 0 {
+			n, err := r.Orders().CountPendingByUser(ctx, in.AppID, in.UserID)
+			if err != nil {
+				return err
+			}
+			if n >= s.d.MaxPendingPerUser {
+				return fmt.Errorf("%w: 已有 %d 笔待支付订单(上限 %d)", models.ErrTooManyPendingOrders, n, s.d.MaxPendingPerUser)
+			}
+		}
 		return r.Orders().Insert(ctx, o)
 	})
 	if insertErr != nil {
@@ -375,6 +388,39 @@ func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (mo
 		return nil
 	})
 	return result, err
+}
+
+// GetOrder 按订单号或业务单号回查(镜像失步兜底,恢复 token);恰一个键由 transport 校验,
+// 此处再守。租户不符等同不存在,归属不符拒绝(与 GetOrderStatus 一致)。
+func (s *Service) GetOrder(ctx context.Context, appID string, userID int64, orderNo, clientOrderNo string) (*models.Order, error) {
+	if (orderNo == "") == (clientOrderNo == "") {
+		return nil, fmt.Errorf("%w: order_no 与 client_order_no 须恰好提供一个", models.ErrIllegalTransition)
+	}
+	var (
+		o   *models.Order
+		err error
+	)
+	if orderNo != "" {
+		o, err = s.d.Store.Reader().Orders().GetByOrderNo(ctx, appID, orderNo, false)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, models.ErrOrderNotFound
+			}
+			return nil, err
+		}
+	} else {
+		o, err = s.d.Store.Reader().Orders().FindByClientOrderNo(ctx, appID, clientOrderNo)
+		if err != nil {
+			return nil, err
+		}
+		if o == nil {
+			return nil, models.ErrOrderNotFound
+		}
+	}
+	if o.UserID != userID {
+		return nil, models.ErrOrderNotOwned
+	}
+	return o, nil
 }
 
 // GetOrderStatus 按 order_token 查订单(前端反馈 + 对账兜底);校验租户 + 归属(评审 P1)。

@@ -24,6 +24,7 @@ type data struct {
 	outbox   []models.EventOutbox
 	logs     []models.OrderLog
 	diffs    []models.ReconcileDiff
+	audits   []models.OpsAuditLog
 	seq      uint64
 }
 
@@ -48,6 +49,7 @@ func (d *data) clone() *data {
 		outbox:   append([]models.EventOutbox(nil), d.outbox...),
 		logs:     append([]models.OrderLog(nil), d.logs...),
 		diffs:    append([]models.ReconcileDiff(nil), d.diffs...),
+		audits:   append([]models.OpsAuditLog(nil), d.audits...),
 		seq:      d.seq,
 	}
 	maps.Copy(n.orders, d.orders)
@@ -100,3 +102,4 @@ func (r *repos) Events() store.EventRepo             { return eventRepo{r.m} }
 func (r *repos) Outbox() store.OutboxRepo            { return outboxRepo{r.m} }
 func (r *repos) Reconcile() store.ReconcileRepo      { return reconcileRepo{r.m} }
 func (r *repos) Logs() store.LogRepo                 { return logRepo{r.m} }
+func (r *repos) OpsAudit() store.OpsAuditRepo        { return opsAuditRepo{r.m} }

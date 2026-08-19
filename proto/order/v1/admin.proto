@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+// AdminService 是 orderd 的【运维契约】,与接入方契约 OrderService 完全隔离(DESIGN 评审 D1/D2):
+//   · 方法不加 google.api.http 注解、服务端不注册 gateway handler——只在 gRPC 端口可达,
+//     :8080 的接入方 REST 与渠道回调面不新增任何运维路由;
+//   · 权限独立(ops:reconcile / event:requeue / ops:txn:read),不进接入方 token 模板;
+//   · 覆盖三类异常的处置出口:对账差异处置、Outbox 死信重放、资金异常流水查询。
+// 列表统一自增 id 游标分页:cursor 空=从头,limit 0=默认 50、上限 200;结果按 id 升序,
+// next_cursor 为本页末条 id,不足一页时为空。
+package order.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/gtkit/orderd/pb/order/v1;orderv1";
+
+// =====================================================================
+// 枚举
+// =====================================================================
+
+// DiffHandleStatus 对账差异处置状态(proto 值相对 DB +1 偏移,内部映射)。
+enum DiffHandleStatus {
+  DIFF_HANDLE_STATUS_UNSPECIFIED = 0;
+  DIFF_HANDLE_STATUS_PENDING     = 1; // 待处理(DB 0)
+  DIFF_HANDLE_STATUS_PROCESSING  = 2; // 处理中(DB 1)
+  DIFF_HANDLE_STATUS_RESOLVED    = 3; // 已解决(终态,DB 2)
+  DIFF_HANDLE_STATUS_IGNORED     = 4; // 已忽略(终态,须留备注,DB 3)
+}
+
+// ReconcileDiffType 对账差异类型(proto 值 = DB 值)。
+enum ReconcileDiffType {
+  RECONCILE_DIFF_TYPE_UNSPECIFIED = 0;
+  RECONCILE_DIFF_TYPE_SURPLUS     = 1; // 长款:渠道有本地无
+  RECONCILE_DIFF_TYPE_SHORT       = 2; // 短款:本地有渠道无
+  RECONCILE_DIFF_TYPE_AMOUNT      = 3; // 金额不一致
+  RECONCILE_DIFF_TYPE_STATUS      = 4; // 状态不一致
+}
+
+// =====================================================================
+// 对账差异
+// =====================================================================
+
+message ListReconcileDiffsRequest {
+  DiffHandleStatus handle_status = 1 [(buf.validate.field).enum.defined_only = true]; // UNSPECIFIED=不过滤
+  ReconcileDiffType diff_type    = 2 [(buf.validate.field).enum.defined_only = true]; // UNSPECIFIED=不过滤
+  string app_id         = 3 [(buf.validate.field).string.max_len = 32];  // 空=全域(含跨租户共享账号的空 app_id 记录)
+  string channel        = 4 [(buf.validate.field).string.max_len = 32];
+  string pay_account_id = 5 [(buf.validate.field).string.max_len = 64];
+  // 账单日期区间(YYYY-MM-DD,闭区间;空=不过滤;经所属对账批次判定)。
+  string bill_date_from = 6 [(buf.validate.field).string = {pattern: "^$|^\\d{4}-\\d{2}-\\d{2}$"}];
+  string bill_date_to   = 7 [(buf.validate.field).string = {pattern: "^$|^\\d{4}-\\d{2}-\\d{2}$"}];
+  string cursor         = 8 [(buf.validate.field).string.max_len = 20];
+  int32 limit           = 9 [(buf.validate.field).int32 = {gte: 0, lte: 200}];
+}
+
+message ReconcileDiffRecord {
+  uint64 id             = 1;
+  uint64 batch_id       = 2;
+  string app_id         = 3;
+  string channel        = 4;
+  string pay_account_id = 5;
+  ReconcileDiffType diff_type = 6;
+  string order_no       = 7;
+  string transaction_id = 8;
+  string out_trade_no   = 9;
+  int64 gateway_amount  = 10; // 渠道金额(分)
+  int64 local_amount    = 11; // 本地金额(分)
+  string detail         = 12;
+  DiffHandleStatus handle_status = 13;
+  string handled_by     = 14;
+  google.protobuf.Timestamp handled_at = 15;
+  string handle_remark  = 16;
+  google.protobuf.Timestamp created_at = 17;
+}
+
+message ListReconcileDiffsResponse {
+  repeated ReconcileDiffRecord diffs = 1;
+  string next_cursor = 2; // 空=已到末尾
+}
+
+message HandleReconcileDiffRequest {
+  uint64 id = 1 [(buf.validate.field).uint64.gt = 0];
+  // 目标状态:处理中/已解决/已忽略(不接受回置待处理);已忽略必须带非空 remark。
+  DiffHandleStatus target = 2 [(buf.validate.field).enum = {in: [2, 3, 4]}];
+  // 处置备注(已忽略必填;处置人取自 token,不在请求中)。
+  string remark = 3 [(buf.validate.field).string.max_len = 512];
+}
+
+message HandleReconcileDiffResponse {
+  DiffHandleStatus handle_status = 1; // 处置后的状态
+}
+
+// =====================================================================
+// Outbox 死信
+// =====================================================================
+
+message ListDeadLettersRequest {
+  string app_id     = 1 [(buf.validate.field).string.max_len = 32];
+  string event_type = 2 [(buf.validate.field).string.max_len = 32];
+  string order_no   = 3 [(buf.validate.field).string.max_len = 64];
+  string cursor     = 4 [(buf.validate.field).string.max_len = 20];
+  int32 limit       = 5 [(buf.validate.field).int32 = {gte: 0, lte: 200}];
+}
+
+// DeadLetterRecord 不含 payload 原文:事件体经 ListOrderEvents 获取,运维清单不承载业务数据。
+message DeadLetterRecord {
+  string event_id          = 1;
+  string app_id            = 2;
+  string order_no          = 3;
+  string event_type        = 4;
+  int64 aggregate_version  = 5;
+  int32 attempts           = 6;
+  string last_error        = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message ListDeadLettersResponse {
+  repeated DeadLetterRecord dead_letters = 1;
+  string next_cursor = 2;
+}
+
+message RequeueDeadLetterRequest {
+  string event_id = 1 [(buf.validate.field).string = {min_len: 1, max_len: 36}];
+}
+
+message RequeueDeadLetterResponse {
+  string event_id = 1;
+  // 重放时的已尝试次数(不重置):一次重放 = 一次投递机会,再失败立即回死信。
+  int32 attempts = 2;
+}
+
+// =====================================================================
+// 资金异常流水
+// =====================================================================
+
+message ListAnomalyTxnsRequest {
+  string app_id         = 1 [(buf.validate.field).string.max_len = 32];
+  string pay_account_id = 2 [(buf.validate.field).string.max_len = 64];
+  // 发生时间窗(paid_at,闭区间;未设置=不过滤)。
+  google.protobuf.Timestamp paid_from = 3;
+  google.protobuf.Timestamp paid_to   = 4;
+  string cursor = 5 [(buf.validate.field).string.max_len = 20];
+  int32 limit   = 6 [(buf.validate.field).int32 = {gte: 0, lte: 200}];
+}
+
+message AnomalyTxnRecord {
+  uint64 id             = 1;
+  string app_id         = 2;
+  string order_no       = 3;
+  string pay_account_id = 4;
+  string channel        = 5;
+  string out_trade_no   = 6;
+  string transaction_id = 7;
+  int64 amount          = 8; // 金额(分)
+  string currency       = 9;
+  // 成因:second_real_payment / amount_mismatch / account_channel_mismatch;
+  // 空串=成因未落库的历史行(anomaly_kind 列上线前写入)。
+  string anomaly_kind = 10;
+  google.protobuf.Timestamp paid_at    = 11;
+  google.protobuf.Timestamp created_at = 12;
+}
+
+message ListAnomalyTxnsResponse {
+  repeated AnomalyTxnRecord txns = 1;
+  string next_cursor = 2;
+}
+
+// =====================================================================
+// 服务
+// =====================================================================
+
+// AdminService 运维出口(仅 gRPC;方法级权限见各方法注释,未登记方法一律拒绝)。
+service AdminService {
+  // 对账差异清单(权限 ops:reconcile)。
+  rpc ListReconcileDiffs(ListReconcileDiffsRequest) returns (ListReconcileDiffsResponse);
+  // 对账差异处置(权限 ops:reconcile):锁行 CAS,终态/同态拒绝;已忽略必须留备注;写审计。
+  rpc HandleReconcileDiff(HandleReconcileDiffRequest) returns (HandleReconcileDiffResponse);
+  // 死信清单(权限 event:requeue)。
+  rpc ListDeadLetters(ListDeadLettersRequest) returns (ListDeadLettersResponse);
+  // 人工重放单条死信(权限 event:requeue):仅 Dead 可重放,attempts 不重置;写审计。
+  rpc RequeueDeadLetter(RequeueDeadLetterRequest) returns (RequeueDeadLetterResponse);
+  // 资金异常流水清单(权限 ops:txn:read)。
+  rpc ListAnomalyTxns(ListAnomalyTxnsRequest) returns (ListAnomalyTxnsResponse);
+}

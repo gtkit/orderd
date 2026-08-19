@@ -171,6 +171,23 @@ func newHarness(refundEnabled bool) *harness {
 	return &harness{mem: mem, order: ord, payment: pay, refund: ref, gateway: gw, alerter: alerter}
 }
 
+// newOrderWithCap 用指定未付单上限重建 order 服务(其余依赖沿用 harness)。
+func newOrderWithCap(h *harness, maxN int) *orderapp.Service {
+	var n int64
+	var mu sync.Mutex
+	next := func() int64 { mu.Lock(); defer mu.Unlock(); n++; return n }
+	clock := func() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) }
+	return orderapp.New(orderapp.Deps{
+		Store: h.mem, Payment: h.payment, Pricing: fakePricing{},
+		Amounts:  fakeAmounts{models.AmountBounds{MinPayable: 1, MaxPayable: 1_000_000, AllowedBusiness: map[string]bool{"vip": true}}},
+		Accounts: fakeAccounts{}, Clock: clock,
+		NewOrderNo:        func() string { return fmt.Sprintf("OD-cap-%d", next()) },
+		NewToken:          func() (string, error) { return fmt.Sprintf("tok-cap-%d", next()), nil },
+		NewEventID:        func() (string, error) { return fmt.Sprintf("evt-cap-%d", next()), nil },
+		MaxPendingPerUser: maxN,
+	})
+}
+
 // baseCreate 返回一份合法下单入参。
 func baseCreate() orderapp.CreateInput {
 	return orderapp.CreateInput{

@@ -210,3 +210,46 @@ func TestLoadBadDuration(t *testing.T) {
 		t.Fatalf("非法时长应报错: %v", err)
 	}
 }
+
+// TestLoadAlertSection alert 段四态:未配置维持仅日志;合法;非法 provider;缺 url;缺 provider。
+func TestLoadAlertSection(t *testing.T) {
+	setSecrets(t)
+	// 未配置:Provider 为空(仅日志),正常启动。
+	c, err := Load(writeTemp(t, validYAML))
+	if err != nil || c.Alert.Provider != "" {
+		t.Fatalf("未配置 alert 应为空且不报错: %+v err=%v", c.Alert, err)
+	}
+	// 合法。
+	c, err = Load(writeTemp(t, validYAML+"alert:\n  provider: dingtalk\n  webhook_url: \"https://oapi.dingtalk.com/robot/send?access_token=x\"\n  secret: \"s\"\n"))
+	if err != nil || c.Alert.Provider != "dingtalk" || c.Alert.Secret != "s" {
+		t.Fatalf("合法 alert 段应加载: %+v err=%v", c.Alert, err)
+	}
+	// 非法 provider。
+	if _, err = Load(writeTemp(t, validYAML+"alert:\n  provider: slack\n  webhook_url: \"https://x\"\n")); err == nil {
+		t.Fatal("非法 provider 应 fail-fast")
+	}
+	// 填 provider 缺 url。
+	if _, err = Load(writeTemp(t, validYAML+"alert:\n  provider: feishu\n")); err == nil {
+		t.Fatal("缺 webhook_url 应 fail-fast")
+	}
+	// 填 url 缺 provider。
+	if _, err = Load(writeTemp(t, validYAML+"alert:\n  webhook_url: \"https://x\"\n")); err == nil {
+		t.Fatal("缺 provider 应 fail-fast")
+	}
+}
+
+// TestLoadMaxPendingPerUser order.maxpendingperuser 三态:未配置→5、显式 0→不限、负值拒。
+func TestLoadMaxPendingPerUser(t *testing.T) {
+	setSecrets(t)
+	c, err := Load(writeTemp(t, validYAML))
+	if err != nil || c.MaxPendingPerUser != 5 {
+		t.Fatalf("未配置应默认 5: %d err=%v", c.MaxPendingPerUser, err)
+	}
+	c, err = Load(writeTemp(t, strings.Replace(validYAML, "order:\n  ttl: \"20m\"", "order:\n  ttl: \"20m\"\n  maxpendingperuser: 0", 1)))
+	if err != nil || c.MaxPendingPerUser != 0 {
+		t.Fatalf("显式 0 应不限: %d err=%v", c.MaxPendingPerUser, err)
+	}
+	if _, err = Load(writeTemp(t, strings.Replace(validYAML, "order:\n  ttl: \"20m\"", "order:\n  ttl: \"20m\"\n  maxpendingperuser: -1", 1))); err == nil {
+		t.Fatal("负值应拒")
+	}
+}

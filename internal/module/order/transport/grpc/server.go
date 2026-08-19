@@ -105,6 +105,35 @@ func (s *Server) GetOrderStatus(ctx context.Context, req *orderv1.GetOrderStatus
 	return resp, nil
 }
 
+// GetOrder 按订单号/业务单号回查(镜像失步兜底)。
+func (s *Server) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*orderv1.GetOrderResponse, error) {
+	if err := s.validate(req); err != nil {
+		return nil, err
+	}
+	c, err := authFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	o, err := s.d.Order.GetOrder(ctx, c.AppID, c.UserID, req.OrderNo, req.ClientOrderNo)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	resp := &orderv1.GetOrderResponse{
+		OrderNo: o.OrderNo, ClientOrderNo: o.ClientOrderNo.String, OrderToken: o.OrderToken,
+		Status: o.Status.Proto(), StatusText: o.Status.Text(), CloseReason: o.CloseReason.Proto(),
+		Amount:           &orderv1.Money{Original: o.OriginalPrice, Discount: o.DiscountAmount, Payable: o.PayAmount, Currency: currencyProto(o.Currency)},
+		TradeNo:          o.TradeNo,
+		RefundedAmount:   o.RefundedAmount,
+		AggregateVersion: o.AggregateVersion,
+		Metadata:         o.Metadata,
+		ExpireAt:         timestamppb.New(o.ExpireAt),
+	}
+	if o.PaidAt.Valid {
+		resp.PaidAt = timestamppb.New(o.PaidAt.Time)
+	}
+	return resp, nil
+}
+
 // CancelOrder 取消订单。
 func (s *Server) CancelOrder(ctx context.Context, req *orderv1.CancelOrderRequest) (*orderv1.CancelOrderResponse, error) {
 	if err := s.validate(req); err != nil {

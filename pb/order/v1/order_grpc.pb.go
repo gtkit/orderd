@@ -28,6 +28,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	OrderService_CreateOrder_FullMethodName     = "/order.v1.OrderService/CreateOrder"
 	OrderService_GetOrderStatus_FullMethodName  = "/order.v1.OrderService/GetOrderStatus"
+	OrderService_GetOrder_FullMethodName        = "/order.v1.OrderService/GetOrder"
 	OrderService_CancelOrder_FullMethodName     = "/order.v1.OrderService/CancelOrder"
 	OrderService_PreparePayment_FullMethodName  = "/order.v1.OrderService/PreparePayment"
 	OrderService_RefundOrder_FullMethodName     = "/order.v1.OrderService/RefundOrder"
@@ -43,6 +44,8 @@ type OrderServiceClient interface {
 	// 写操作 POST + body:"*"(整体映射);只读用 GET(字段落 query/path)。
 	CreateOrder(ctx context.Context, in *CreateOrderRequest, opts ...grpc.CallOption) (*CreateOrderResponse, error)
 	GetOrderStatus(ctx context.Context, in *GetOrderStatusRequest, opts ...grpc.CallOption) (*GetOrderStatusResponse, error)
+	// 按订单号/业务单号回查(镜像失步兜底,恢复 token)。
+	GetOrder(ctx context.Context, in *GetOrderRequest, opts ...grpc.CallOption) (*GetOrderResponse, error)
 	CancelOrder(ctx context.Context, in *CancelOrderRequest, opts ...grpc.CallOption) (*CancelOrderResponse, error)
 	// 一单多支付尝试入口:换渠道 / 重新调起支付(§8/§9)。
 	PreparePayment(ctx context.Context, in *PreparePaymentRequest, opts ...grpc.CallOption) (*PreparePaymentResponse, error)
@@ -74,6 +77,16 @@ func (c *orderServiceClient) GetOrderStatus(ctx context.Context, in *GetOrderSta
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetOrderStatusResponse)
 	err := c.cc.Invoke(ctx, OrderService_GetOrderStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *orderServiceClient) GetOrder(ctx context.Context, in *GetOrderRequest, opts ...grpc.CallOption) (*GetOrderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetOrderResponse)
+	err := c.cc.Invoke(ctx, OrderService_GetOrder_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +151,8 @@ type OrderServiceServer interface {
 	// 写操作 POST + body:"*"(整体映射);只读用 GET(字段落 query/path)。
 	CreateOrder(context.Context, *CreateOrderRequest) (*CreateOrderResponse, error)
 	GetOrderStatus(context.Context, *GetOrderStatusRequest) (*GetOrderStatusResponse, error)
+	// 按订单号/业务单号回查(镜像失步兜底,恢复 token)。
+	GetOrder(context.Context, *GetOrderRequest) (*GetOrderResponse, error)
 	CancelOrder(context.Context, *CancelOrderRequest) (*CancelOrderResponse, error)
 	// 一单多支付尝试入口:换渠道 / 重新调起支付(§8/§9)。
 	PreparePayment(context.Context, *PreparePaymentRequest) (*PreparePaymentResponse, error)
@@ -160,6 +175,9 @@ func (UnimplementedOrderServiceServer) CreateOrder(context.Context, *CreateOrder
 }
 func (UnimplementedOrderServiceServer) GetOrderStatus(context.Context, *GetOrderStatusRequest) (*GetOrderStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetOrderStatus not implemented")
+}
+func (UnimplementedOrderServiceServer) GetOrder(context.Context, *GetOrderRequest) (*GetOrderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetOrder not implemented")
 }
 func (UnimplementedOrderServiceServer) CancelOrder(context.Context, *CancelOrderRequest) (*CancelOrderResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CancelOrder not implemented")
@@ -229,6 +247,24 @@ func _OrderService_GetOrderStatus_Handler(srv interface{}, ctx context.Context, 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OrderServiceServer).GetOrderStatus(ctx, req.(*GetOrderStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OrderService_GetOrder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetOrderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OrderServiceServer).GetOrder(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OrderService_GetOrder_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OrderServiceServer).GetOrder(ctx, req.(*GetOrderRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -337,6 +373,10 @@ var OrderService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetOrderStatus",
 			Handler:    _OrderService_GetOrderStatus_Handler,
+		},
+		{
+			MethodName: "GetOrder",
+			Handler:    _OrderService_GetOrder_Handler,
 		},
 		{
 			MethodName: "CancelOrder",

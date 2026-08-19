@@ -42,9 +42,51 @@ type Repos interface {
 	Outbox() OutboxRepo
 	Reconcile() ReconcileRepo
 	Logs() LogRepo
+	OpsAudit() OpsAuditRepo
 }
 
-// ReconcileRepo 对账批次与差异仓储(对账 worker 用,DESIGN §14)。
+// OpsAuditRepo 运维动作审计仓储(只插不改;端口不暴露更新/删除)。
+type OpsAuditRepo interface {
+	// Insert 追加一条审计;写入必须与被审计动作同事务(由调用方保证)。
+	Insert(ctx context.Context, l *models.OpsAuditLog) error
+	// ListByTarget 按被操作对象游标查询(自增 id 升序,id > afterID,≤ limit 条)。
+	ListByTarget(ctx context.Context, targetType, targetID string, afterID uint64, limit int) ([]models.OpsAuditLog, error)
+}
+
+// DiffFilter 对账差异清单过滤(零值字段不过滤)。
+type DiffFilter struct {
+	HandleStatus *models.DiffHandleStatus // nil=不过滤(注意 0 是"待处理",必须用指针区分)
+	DiffType     *models.DiffType
+	AppID        string
+	Channel      string
+	PayAccountID string
+	// 账单日期区间(闭区间,零值不过滤;经所属批次的 bill_date 判定)。
+	BillDateFrom, BillDateTo time.Time
+}
+
+// DeadFilter 死信清单过滤(零值字段不过滤)。
+type DeadFilter struct {
+	AppID     string
+	EventType string
+	OrderNo   string
+}
+
+// AnomalyFilter 资金异常流水过滤(零值字段不过滤)。
+type AnomalyFilter struct {
+	AppID        string
+	PayAccountID string
+	// paid_at 时间窗(闭区间,零值不过滤)。
+	PaidFrom, PaidTo time.Time
+}
+
+// DeadRequeueCond 死信兜底重放的筛选条件(全部同时满足)。
+type DeadRequeueCond struct {
+	UpdatedBefore time.Time // 冷却:updated_at 早于此
+	AttemptsBelow int32     // 次数上限:attempts < 此值(MaxAttempts+MaxAutoRequeues)
+	CreatedAfter  time.Time // 存活上限:created_at 晚于此
+}
+
+// ReconcileRepo 对账批次与差异仓储(对账 worker + AdminService 处置用,DESIGN §14)。
 type ReconcileRepo interface {
 	// CreateBatch 建批次;命中 uk(channel,pay_account_id,bill_date) 或 batch_no → ErrDuplicate(防重)。
 	CreateBatch(ctx context.Context, b *models.ReconcileBatch) error
@@ -53,6 +95,12 @@ type ReconcileRepo interface {
 	UpdateBatch(ctx context.Context, b *models.ReconcileBatch) error
 	// InsertDiff 写差异;同批次同交易同类型幂等(命中唯一键返回 ErrDuplicate)。
 	InsertDiff(ctx context.Context, d *models.ReconcileDiff) error
+	// ListDiffs 差异清单(自增 id 升序游标,id > afterID,≤ limit 条)。
+	ListDiffs(ctx context.Context, f DiffFilter, afterID uint64, limit int) ([]models.ReconcileDiff, error)
+	// GetDiff 按 id 取差异;不存在返回 ErrNotFound。forUpdate=true 行锁(处置 CAS 用)。
+	GetDiff(ctx context.Context, id uint64, forUpdate bool) (*models.ReconcileDiff, error)
+	// UpdateDiffHandling 写处置四字段;remark 为空串时保留原备注(只推进状态/人/时间)。
+	UpdateDiffHandling(ctx context.Context, id uint64, status models.DiffHandleStatus, handledBy string, handledAt time.Time, remark string) error
 }
 
 // OutboxRepo 发件箱投递仓储(投递 worker 用,DESIGN §12)。
@@ -65,9 +113,21 @@ type OutboxRepo interface {
 	// Reschedule 投递失败重排:attempts 递增、设下次投递时间、清租约、记错误。
 	Reschedule(ctx context.Context, id uint64, nextAttemptAt time.Time, attempts int32, lastErr string) error
 	// MarkDead 超过最大次数转死信(不自动再投,需人工/定时重放)。
-	MarkDead(ctx context.Context, id uint64, lastErr string) error
-	// Requeue 死信重放:置回 Pending 并设下次投递时间。
+	// attempts 为含本次失败的最终尝试次数:必须落库,使 attempts 成为跨"重放→失败→回死信"
+	// 循环的单调计数器——兜底重放的次数上限(attempts < MaxAttempts+MaxAutoRequeues)依赖它,
+	// 不落库则自动重放永不达上限(只剩存活时长兜底)。
+	MarkDead(ctx context.Context, id uint64, attempts int32, lastErr string) error
+	// Requeue 死信重放:置回 Pending 并设下次投递时间(清 last_error 与租约;attempts 不重置——
+	// 一次重放 = 一次投递机会,再失败立即回死信)。
 	Requeue(ctx context.Context, id uint64, nextAttemptAt time.Time) error
+	// ListDead 死信清单(status=Dead,自增 id 升序游标)。
+	ListDead(ctx context.Context, f DeadFilter, afterID uint64, limit int) ([]models.EventOutbox, error)
+	// GetByEventID 按事件 ID 取记录;不存在返回 ErrNotFound。forUpdate=true 行锁(人工重放 CAS 用)。
+	GetByEventID(ctx context.Context, eventID string, forUpdate bool) (*models.EventOutbox, error)
+	// ClaimDeadForRequeue 兜底重放认领:status=Dead 且满足 cond 的记录,行锁返回
+	// (MySQL 用 FOR UPDATE SKIP LOCKED)。必须在事务内调用,并在同一事务内完成
+	// Requeue + 审计——行锁保持到提交,即多副本互斥,无需租约字段。
+	ClaimDeadForRequeue(ctx context.Context, cond DeadRequeueCond, limit int) ([]*models.EventOutbox, error)
 }
 
 // OrderRepo 订单仓储。forUpdate=true 表示 SELECT ... FOR UPDATE 锁行(仅事务内有意义)。
@@ -79,6 +139,10 @@ type OrderRepo interface {
 	FindByIdempotencyKey(ctx context.Context, appID, key string) (*models.Order, error)
 	// ListExpiredPending 列出已过期的待支付订单(status=PENDING 且 expire_at<now),供超时关单 worker。
 	ListExpiredPending(ctx context.Context, now time.Time, limit int) ([]*models.Order, error)
+	// CountPendingByUser 统计同 (app_id, user_id) 的 PENDING 订单数(下单防刷上限用,近似语义)。
+	CountPendingByUser(ctx context.Context, appID string, userID int64) (int, error)
+	// FindByClientOrderNo 按业务单号查(uk_app_client_order 唯一);未命中返回 (nil, nil)。
+	FindByClientOrderNo(ctx context.Context, appID, clientOrderNo string) (*models.Order, error)
 	Update(ctx context.Context, o *models.Order) error
 }
 
@@ -128,6 +192,8 @@ type TransactionRepo interface {
 	GetByTxnID(ctx context.Context, channel, payAccountID, txnID string) (*models.PaymentTransaction, error)
 	// ListByAccountDate 列出某账号某日(按 paid_at 归属)的流水,供对账比对。
 	ListByAccountDate(ctx context.Context, channel, payAccountID string, billDate time.Time) ([]*models.PaymentTransaction, error)
+	// ListAnomalies 资金异常流水清单(anomaly=1,自增 id 升序游标)。
+	ListAnomalies(ctx context.Context, f AnomalyFilter, afterID uint64, limit int) ([]models.PaymentTransaction, error)
 }
 
 // EventRepo 事件历史 + 发件箱(同事务双写,DESIGN §11)。

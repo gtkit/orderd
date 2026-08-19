@@ -211,3 +211,61 @@ func TestRefundQueryNotExistThreshold(t *testing.T) {
 		})
 	}
 }
+
+// TestRefundAmountMismatchGoesAbnormal 反证 refund-abnormal-terminal:退款成功金额与退款单
+// 不符 → 同事务落人工终态(退款 ABNORMAL + 订单 REFUND_EXCEPTION),告警一次,无流水无事件;
+// 重复确认幂等;再次发起退款被拒(旧实现停 PROCESSING + 返回 error,本测试失败)。
+func TestRefundAmountMismatchGoesAbnormal(t *testing.T) {
+	h := newHarness(true)
+	orderNo, token := h.createAndPay(t, "")
+	out, err := h.refund.RefundOrder(bg, refundapp.RefundInput{AppID: "app1", OrderNo: orderNo, RefundAmount: 90, OutRefundNo: "r1"})
+	if err != nil {
+		t.Fatalf("退款受理失败: %v", err)
+	}
+	h.gateway.mu.Lock()
+	h.gateway.refundQuery = paygateway.RefundQueryResult{
+		State: paygateway.RefundQuerySucceeded, GatewayRefundID: "gwr", Amount: 50, // ≠90
+	}
+	h.gateway.refundQuerySet = true
+	h.gateway.mu.Unlock()
+
+	rf, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+	if err := h.refund.QueryRefund(bg, rf); err != nil {
+		t.Fatalf("金额不符已终态处置,不应返回错误: %v", err)
+	}
+	got, _ := h.mem.Reader().Refunds().GetByRefundNo(bg, out.RefundNo)
+	if got.Status != models.RefundAbnormal || !got.LastError.Valid {
+		t.Fatalf("退款应 ABNORMAL 且记 last_error,实际: %+v", got)
+	}
+	o, _ := h.order.GetOrderStatus(bg, "app1", token, 42)
+	if o.Status != models.OrderRefundException {
+		t.Fatalf("订单应 REFUND_EXCEPTION,实际: %v", o.Status)
+	}
+	if o.RefundedAmount != 0 {
+		t.Fatalf("不得累计已退金额: %d", o.RefundedAmount)
+	}
+	if n := h.alerter.count("refund_amount_mismatch"); n != 1 {
+		t.Fatalf("应告警恰一次,实际 %d", n)
+	}
+	if txns := refundTxns(h, out.RefundNo); len(txns) != 0 {
+		t.Fatalf("金额不符不得写退款流水: %+v", txns)
+	}
+	if n := countEvents(h, models.EventTypeRefunded); n != 0 {
+		t.Fatalf("金额不符不得发 refunded 事件: %d", n)
+	}
+	// 重复的金额不符确认:幂等,不重复告警。
+	if err := h.refund.ConfirmRefundSuccess(bg, "app1", out.RefundNo, "gwr", 50, time.Now()); err != nil {
+		t.Fatalf("重复确认应幂等: %v", err)
+	}
+	if n := h.alerter.count("refund_amount_mismatch"); n != 1 {
+		t.Fatalf("重复确认不得再告警,实际 %d", n)
+	}
+	// 人工确认前阻断再次退款(订单 REFUND_EXCEPTION → 非已支付被拒)。
+	if _, err := h.refund.RefundOrder(bg, refundapp.RefundInput{AppID: "app1", OrderNo: orderNo, RefundAmount: 90, OutRefundNo: "r2"}); !errors.Is(err, models.ErrRefundNotAllowed) {
+		t.Fatalf("REFUND_EXCEPTION 订单应拒绝再次退款,实际: %v", err)
+	}
+	o2, _ := h.order.GetOrderStatus(bg, "app1", token, 42)
+	if o2.Status != models.OrderRefundException {
+		t.Fatalf("订单应保持 REFUND_EXCEPTION,实际: %v", o2.Status)
+	}
+}

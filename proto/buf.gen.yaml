@@ -1,6 +1,10 @@
 version: v2
 # 生成物落仓库根 pb/order/v1(buf 在 proto/ 下执行:`cd proto && buf generate`),
 # 与 go_package=github.com/gtkit/orderd/pb/order/v1 对齐。protovalidate 是运行时校验(读内嵌 option),无 codegen。
+#
+# 本模板只生成消息类型 + gRPC 桩(全部契约文件,含运维契约 admin.proto)。
+# REST 反向代理与 OpenAPI 文档只属于接入方契约,用 buf.gen.gateway.yaml 单独生成:
+#   buf generate --template buf.gen.gateway.yaml --path order/v1/order.proto --path order/v1/events.proto
 plugins:
   # 消息类型
   - remote: buf.build/protocolbuffers/go
@@ -10,16 +14,3 @@ plugins:
   - remote: buf.build/grpc/go
     out: ../pb
     opt: paths=source_relative
-  # REST 反向代理(standalone=true:生成独立包并 import pb 消息,而非同包)。
-  # 落 ../internal/gateway(仅服务端编译),使契约模块 pb 不带 grpc-gateway 依赖。
-  - remote: buf.build/grpc-ecosystem/gateway
-    out: ../internal/gateway
-    opt:
-      - paths=source_relative
-      - standalone=true
-  # OpenAPI v2(交付 PHP 等非 gRPC 接入方),合并为单文件 docs/openapi/order.swagger.json
-  - remote: buf.build/grpc-ecosystem/openapiv2
-    out: ../docs/openapi
-    opt:
-      - allow_merge=true
-      - merge_file_name=order

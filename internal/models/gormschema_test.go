@@ -32,8 +32,8 @@ var ddlColumns = map[string]map[string]bool{
 	),
 	"payment_transactions": set(
 		"id", "app_id", "order_no", "payment_attempt_id", "refund_no", "pay_account_id", "channel",
-		"kind", "out_trade_no", "transaction_id", "amount", "currency", "anomaly", "paid_at",
-		"notify_digest", "created_at",
+		"kind", "out_trade_no", "transaction_id", "amount", "currency", "anomaly", "anomaly_kind",
+		"paid_at", "notify_digest", "created_at",
 	),
 	"order_logs": set(
 		"id", "order_id", "order_no", "from_status", "to_status", "operator", "remark", "created_at",
@@ -62,6 +62,9 @@ var ddlColumns = map[string]map[string]bool{
 	"app_endpoints": set(
 		"app_id", "webhook_url", "key_id", "hmac_secret_ref", "prev_key_id", "prev_hmac_secret_ref",
 		"max_concurrency", "enabled", "created_at", "updated_at",
+	),
+	"ops_audit_logs": set(
+		"id", "actor", "action", "target_type", "target_id", "detail", "created_at",
 	),
 }
 
@@ -94,6 +97,7 @@ func TestGormSchemaMappingMatchesDDL(t *testing.T) {
 		{&ReconcileDiff{}, "reconcile_diffs"},
 		{&AppPayAccount{}, "app_pay_accounts"},
 		{&AppEndpoint{}, "app_endpoints"},
+		{&OpsAuditLog{}, "ops_audit_logs"},
 	}
 	namer := schema.NamingStrategy{}
 	cache := &sync.Map{}

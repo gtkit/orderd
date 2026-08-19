@@ -15,3 +15,4 @@ func (ReconcileBatch) TableName() string     { return "reconcile_batches" }
 func (ReconcileDiff) TableName() string      { return "reconcile_diffs" }
 func (AppPayAccount) TableName() string      { return "app_pay_accounts" }
 func (AppEndpoint) TableName() string        { return "app_endpoints" }
+func (OpsAuditLog) TableName() string        { return "ops_audit_logs" }

@@ -41,6 +41,8 @@ type Config struct {
 	RefundEnabled bool          // 退款开关(V1=false)
 	OrderTTL      time.Duration // 订单支付截止
 	AttemptTTL    time.Duration // 单次支付尝试截止
+	// MaxPendingPerUser 单用户 PENDING 订单数上限(近似防刷;未配置默认 5,显式 0=不限)。
+	MaxPendingPerUser int
 
 	// Outbox 投递 worker。
 	WorkerID          string            // 副本实例标识(租约持有者)
@@ -52,6 +54,9 @@ type Config struct {
 	ReconcileEnabled  bool
 	ReconcileInterval time.Duration
 
+	// 死信兜底重放 worker(outbox.deadletter 段;默认关闭,上线观察后再开)。
+	DeadLetter DeadLetterConfig
+
 	// 鉴权(JWT):kid→密钥(轮换)+ issuer/audience。密钥走 env 覆盖;必填,禁止无鉴权启动。
 	JWTKeys     map[string][]byte
 	JWTIssuer   string
@@ -59,6 +64,10 @@ type Config struct {
 
 	// 定价可信边界:默认 fail-closed(拒绝采信客户端金额),须显式开启才信任调用方。
 	PricingTrustCaller bool
+
+	// 告警送达通道(alert 段)。未配置 provider 时仅日志告警;webhook_url 含 token 属敏感,
+	// 只存在于 git 忽略+挂载注入的 env.yml(与 pay 段同纪律),禁入库/git/日志。
+	Alert AlertConfig
 
 	// 支付渠道凭据与路由。字段与 go-pay 的 alipay/wechat Config 对齐(path/内容双形态、证书/公钥模式),
 	// 外加 orderd 路由/运营字段。敏感项(私钥/APIv3 密钥/证书内容)只应存在于【git 忽略 + 挂载注入】的
@@ -87,6 +96,22 @@ type RedisConfig struct {
 	Password string
 	DBs      []int
 	Prefix   string
+}
+
+// AlertConfig 告警送达通道(alert 段):dingtalk/feishu/generic 群机器人或自建网关。
+type AlertConfig struct {
+	Provider   string // dingtalk / feishu / generic;空=未启用(仅日志)
+	WebhookURL string // 机器人/网关地址(敏感)
+	Secret     string // 可选:钉钉加签/飞书签名密钥(敏感)
+}
+
+// DeadLetterConfig 死信兜底重放(outbox.deadletter 段)。
+type DeadLetterConfig struct {
+	Enabled         bool
+	Interval        time.Duration // 轮询间隔(默认 1h)
+	Cooldown        time.Duration // 转死信后的冷却(默认 1h)
+	MaxAutoRequeues int           // 自动重放追加次数上限(默认 3)
+	MaxLifetime     time.Duration // 存活上限(默认 168h)
 }
 
 // PayConfig 支付渠道配置(pay 段)。
@@ -187,8 +212,9 @@ type fileConfig struct {
 		ID string `yaml:"id"`
 	} `yaml:"worker"`
 	Order struct {
-		TTL        string `yaml:"ttl"`
-		AttemptTTL string `yaml:"attemptttl"`
+		TTL               string `yaml:"ttl"`
+		AttemptTTL        string `yaml:"attemptttl"`
+		MaxPendingPerUser *int   `yaml:"maxpendingperuser"` // nil=未配置(默认 5),显式 0=不限
 	} `yaml:"order"`
 	Refund struct {
 		Enabled bool `yaml:"enabled"`
@@ -204,6 +230,20 @@ type fileConfig struct {
 	Pricing struct {
 		TrustCaller bool `yaml:"trustcaller"`
 	} `yaml:"pricing"`
+	Alert struct {
+		Provider   string `yaml:"provider"`
+		WebhookURL string `yaml:"webhook_url"`
+		Secret     string `yaml:"secret"`
+	} `yaml:"alert"`
+	Outbox struct {
+		Deadletter struct {
+			Enabled         bool   `yaml:"enabled"`
+			Interval        string `yaml:"interval"`
+			Cooldown        string `yaml:"cooldown"`
+			MaxAutoRequeues int    `yaml:"max_auto_requeues"`
+			MaxLifetime     string `yaml:"max_lifetime"`
+		} `yaml:"deadletter"`
+	} `yaml:"outbox"`
 	Auth struct {
 		Issuer   string `yaml:"issuer"`
 		Audience string `yaml:"audience"`
@@ -281,6 +321,7 @@ func Load(path string) (Config, error) {
 		JWTIssuer:          fc.Auth.Issuer,
 		JWTAudience:        fc.Auth.Audience,
 		PricingTrustCaller: fc.Pricing.TrustCaller,
+		Alert:              AlertConfig{Provider: fc.Alert.Provider, WebhookURL: fc.Alert.WebhookURL, Secret: fc.Alert.Secret},
 	}
 	c.WorkerID = orDefault(fc.Worker.ID, fmt.Sprintf("worker-%d", c.MachineID))
 
@@ -290,7 +331,25 @@ func Load(path string) (Config, error) {
 	if c.AttemptTTL, err = parseDur(fc.Order.AttemptTTL, 15*time.Minute, "order.attemptttl"); err != nil {
 		return Config{}, err
 	}
+	c.MaxPendingPerUser = 5 // 默认上限
+	if fc.Order.MaxPendingPerUser != nil {
+		if *fc.Order.MaxPendingPerUser < 0 {
+			return Config{}, fmt.Errorf("config: order.maxpendingperuser 不可为负")
+		}
+		c.MaxPendingPerUser = *fc.Order.MaxPendingPerUser
+	}
 	if c.ReconcileInterval, err = parseDur(fc.Reconcile.Interval, 24*time.Hour, "reconcile.interval"); err != nil {
+		return Config{}, err
+	}
+	c.DeadLetter.Enabled = fc.Outbox.Deadletter.Enabled
+	c.DeadLetter.MaxAutoRequeues = fc.Outbox.Deadletter.MaxAutoRequeues
+	if c.DeadLetter.Interval, err = parseDur(fc.Outbox.Deadletter.Interval, time.Hour, "outbox.deadletter.interval"); err != nil {
+		return Config{}, err
+	}
+	if c.DeadLetter.Cooldown, err = parseDur(fc.Outbox.Deadletter.Cooldown, time.Hour, "outbox.deadletter.cooldown"); err != nil {
+		return Config{}, err
+	}
+	if c.DeadLetter.MaxLifetime, err = parseDur(fc.Outbox.Deadletter.MaxLifetime, 7*24*time.Hour, "outbox.deadletter.max_lifetime"); err != nil {
 		return Config{}, err
 	}
 
@@ -354,6 +413,18 @@ func Load(path string) (Config, error) {
 	}
 	if len(c.JWTKeys) == 0 {
 		return Config{}, fmt.Errorf("config: 需 env ORDERD_JWT_KEYS(至少一把 kid=secret;禁止无鉴权启动)")
+	}
+	// alert 段:填了任一项就必须完整可用(fail-fast,防"配置写了但静默失效")。
+	switch c.Alert.Provider {
+	case "", "dingtalk", "feishu", "generic":
+	default:
+		return Config{}, fmt.Errorf("config: alert.provider %q 非法(可选 dingtalk/feishu/generic)", c.Alert.Provider)
+	}
+	if c.Alert.Provider != "" && c.Alert.WebhookURL == "" {
+		return Config{}, fmt.Errorf("config: alert.provider 已设,alert.webhook_url 必填")
+	}
+	if c.Alert.Provider == "" && c.Alert.WebhookURL != "" {
+		return Config{}, fmt.Errorf("config: alert.webhook_url 已设,alert.provider 必填(dingtalk/feishu/generic)")
 	}
 	return c, nil
 }

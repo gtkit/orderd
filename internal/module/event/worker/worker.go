@@ -112,7 +112,7 @@ func (d *Delivery) deliverOne(ctx context.Context, ob *models.EventOutbox) (bool
 	attempts := ob.Attempts + 1
 	if attempts >= d.cfg.MaxAttempts {
 		markErr := d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-			return r.Outbox().MarkDead(ctx, ob.ID, sendErr.Error())
+			return r.Outbox().MarkDead(ctx, ob.ID, attempts, sendErr.Error())
 		})
 		d.alerter.Anomaly(ctx, "outbox_dead_letter", map[string]any{
 			"event_id": ob.EventID, "app_id": ob.AppID, "order_no": ob.OrderNo,
@@ -150,11 +150,12 @@ func (d *Delivery) backoff(attempts int32) time.Duration {
 
 // Set 是可启动的后台 worker 集合(任一为 nil 则不启动)。
 type Set struct {
-	Delivery    *Delivery
-	Query       *QueryWorker
-	RefundQuery *RefundQueryWorker
-	Timeout     *TimeoutWorker
-	Reconcile   *ReconcileWorker
+	Delivery          *Delivery
+	Query             *QueryWorker
+	RefundQuery       *RefundQueryWorker
+	Timeout           *TimeoutWorker
+	Reconcile         *ReconcileWorker
+	DeadLetterRequeue *DeadLetterRequeueWorker
 }
 
 // Workers 聚合后台 worker 的启停(供 bootstrap)。
@@ -199,6 +200,12 @@ func (w *Workers) Start(ctx context.Context) {
 	if s.Reconcile != nil {
 		w.spawn(runCtx, s.Reconcile.interval, "对账", func(c context.Context) error {
 			_, err := s.Reconcile.RunOnce(c)
+			return err
+		})
+	}
+	if s.DeadLetterRequeue != nil {
+		w.spawn(runCtx, s.DeadLetterRequeue.cfg.Interval, "死信兜底重放", func(c context.Context) error {
+			_, err := s.DeadLetterRequeue.RunOnce(c)
 			return err
 		})
 	}

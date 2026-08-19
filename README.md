@@ -73,7 +73,7 @@ make setup-db
 export ORDERD_JWT_KEYS='dev1=dev-secret-change-me-32bytes-xx'
 # MySQL 口令写在 env.yml 的 database.password;如需覆盖(生产密钥注入)再 export ORDERD_MYSQL_PASSWORD
 go run ./cmd/server --config config/env/env.yml
-# gRPC :9090   HTTP :8080(/healthz + 支付回调 + REST 网关 /v1/*)
+# gRPC :9090   HTTP :8080(/healthz + /metrics + 支付回调 + REST 网关 /v1/*)
 
 # 4) 下单联调(带 JWT 的 gRPC 客户端示例)
 go run ./examples/createorder
@@ -158,7 +158,9 @@ JWT 载荷(claims):
 | `iss` / `aud` / `exp` | 与 `ORDERD_JWT_*` 一致;exp 必填 |
 | JWT header `kid` | 选密钥(轮换) |
 
-方法级权限(缺失 → `PermissionDenied`;无/错 token → `Unauthenticated`):
+方法级权限(缺失 → `PermissionDenied`;无/错 token → `Unauthenticated`;未登记方法一律拒绝):
+
+**OrderService(接入方契约)**
 
 | 方法 | 所需权限 |
 |---|---|
@@ -169,7 +171,34 @@ JWT 载荷(claims):
 | `GetRefund` | `refund:read` |
 | `ListOrderEvents` | `event:read` |
 
+**AdminService(运维契约)**
+
+| 方法 | 所需权限 |
+|---|---|
+| `ListReconcileDiffs` / `HandleReconcileDiff` | `ops:reconcile` |
+| `ListDeadLetters` / `RequeueDeadLetter` | `event:requeue` |
+| `ListAnomalyTxns` | `ops:txn:read` |
+
+运维权限不进接入方 token 模板,发放与 `refund:execute` 同级审批。
+
 签发示例见 [`examples/createorder/main.go`](./examples/createorder/main.go)。
+
+### AdminService(运维出口)
+
+三类异常的处置闭环,定义在 `proto/order/v1/admin.proto`,**只在 gRPC(:9090)可达**——方法不带
+`google.api.http` 注解、服务端不注册 gateway handler,`:8080` 的接入方 REST 与渠道回调面没有任何
+运维路由(运维查询会返回跨订单资金数据,不与外部可达面同网;运维侧用 grpcurl 或内部 admin BFF 调用):
+
+- **对账差异**:`ListReconcileDiffs`(按处置状态/差异类型/租户/账号/账期过滤,id 游标分页,limit 默认 50 上限 200)
+  + `HandleReconcileDiff`(0待处理→1处理中→2已解决/3已忽略;终态与同态拒绝;已忽略必须留备注;
+  处置人取自 token;并发处置锁行串行化,败方得 FailedPrecondition);
+- **Outbox 死信**:`ListDeadLetters`(不含 payload 原文,事件体经 `ListOrderEvents` 获取)+
+  `RequeueDeadLetter`(仅 Dead 可重放,`attempts` 不重置——一次重放 = 一次投递机会,再失败立即回死信);
+  另有**定时兜底重放 worker**(`outbox.deadletter.*` 配置,默认关闭):冷却 + 次数上限 + 存活上限三条件
+  齐备才自动重放,认领 SKIP LOCKED 与 system 审计同事务;
+- **资金异常流水**:`ListAnomalyTxns`(anomaly=1,含成因 `anomaly_kind`:
+  `second_real_payment`/`amount_mismatch`/`account_channel_mismatch`;列上线前的历史行成因为空串);
+- **审计**:每次处置/重放写一条 `ops_audit_logs`(actor/action/target/detail,与动作同事务,只插不改)。
 
 ---
 
@@ -274,6 +303,12 @@ SDK 行为(资金安全):`OnPaid` 必填(缺失 panic);资金事件(paid/refunde
 
 `GET /healthz` → `200 ok`。
 
+`GET /metrics` → Prometheus 积压类指标(scrape 时对 DB 聚合,全索引覆盖 + 5s 超时;采集失败只缺该指标并递增 `orderd_metrics_scrape_errors_total`,不 5xx):
+`orderd_outbox_backlog{status=pending|dead}`、`orderd_outbox_oldest_pending_age_seconds`、
+`orderd_attempts_converging{status=unknown|closing}`、`orderd_attempts_stuck_requesting`、
+`orderd_refunds_in_flight{status=created|processing}`、`orderd_orders_expired_pending`、
+`orderd_anomaly_txns_total`。指标不含敏感数据;`/metrics` 的来源限制由部署入口层(防火墙/网关)承担。
+
 ---
 
 ## 支付宝接入与沙箱联调
@@ -327,7 +362,7 @@ ORDERD_TEST_MYSQL_DSN='root@tcp(127.0.0.1:3306)/orderd_it?parseTime=true' make t
 
 ## 现状:已接 / 未接
 
-**已接并验证**:下单/幂等/金额权威、支付准备与多尝试、支付成功核心事务(§7 CAS/唯一成功/第二笔真实付款落库告警)、取消(§8)、超时关单、退款闭环 + 退款查单、事件双写 + Outbox 投递(SSRF/HMAC)、支付查单、对账逻辑、JWT 鉴权 + 方法级权限、跨租户隔离、**支付宝(gtkit/go-pay,沙箱)**、**持久化 gtkit/ormx + gorm(store.Store 工作单元,真实 MySQL 集成回归)**、**gRPC + REST(grpc-gateway)+ OpenAPI 同源**。
+**已接并验证**:下单/幂等/金额权威、支付准备与多尝试、支付成功核心事务(§7 CAS/唯一成功/第二笔真实付款落库告警)、取消(§8)、超时关单、退款闭环 + 退款查单、事件双写 + Outbox 投递(SSRF/HMAC)、支付查单、对账逻辑、JWT 鉴权 + 方法级权限、跨租户隔离、**支付宝(gtkit/go-pay,沙箱)**、**持久化 gtkit/ormx + gorm(store.Store 工作单元,真实 MySQL 集成回归)**、**gRPC + REST(grpc-gateway)+ OpenAPI 同源**、**异常处置闭环(AdminService:对账差异处置/死信重放/anomaly 流水查询 + ops_audit_logs 审计 + 死信兜底重放 worker)**、**告警送达通道(alert 段:钉钉/飞书/generic webhook,日志保底)**。
 
 **已接代码、待凭据联调**:
 - **微信支付**(下单/回调/退款,APIv3)—— 网关适配 `wechatgw` + 配置 + `/notify/wechat/{route}` 回调 + 装配已完成并单测覆盖;

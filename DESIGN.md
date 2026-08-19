@@ -186,26 +186,47 @@ UNKNOWN → 多次查单 + 退避观察窗口
 
 租约抢占(`locked_by/until` 或 SKIP LOCKED,多副本安全)+ 退避+抖动 + 死信告警 + 死信重放;webhook = `HMAC(timestamp+"."+body)` + `key_id` 轮换 + 时间窗口;SSRF **allowlist**(出口域名/IP 白名单,兼容内部 BFF 私网,而非无条件拒私网)。
 
+死信重放(已实现,AdminService + 兜底 worker):
+- **人工重放** `RequeueDeadLetter`:仅 Dead 可重放,置回 Pending 并立即到期;`attempts` 不重置——
+  **一次重放 = 一次投递机会**,再失败立即回死信并告警(转死信时落最终 attempts,计数器跨重放单调);
+- **定时兜底重放**(配置 `outbox.deadletter.*`,默认关闭):满足冷却(`updated_at` 早于 now-cooldown)、
+  次数上限(`attempts < MaxAttempts+MaxAutoRequeues`)与存活上限(`created_at` 晚于 now-max_lifetime)的
+  死信自动置回 Pending;认领用 FOR UPDATE SKIP LOCKED,与 actor=system 的审计同事务(多副本恰好一次);
+  达任一上限永久停手,人工重放仍可用;
+- 重放使用原 `event_id` 与 payload 原文投递,服务端不做投递去重(至少一次语义,幂等真相源在接入方 inbox)。
+
 ---
 
 ## 13. 授权
 
 方法级权限 + `app_id` 由 token claims 注入(非请求参数):
 
+接入方契约(OrderService):
+
 | 权限 | 方法 | 备注 |
 |---|---|---|
 | order:create/read/cancel | CreateOrder/GetOrderStatus/CancelOrder | GetOrderStatus/CancelOrder 另校验订单所属用户 |
 | refund:execute/read | RefundOrder(V1 不发放)/GetRefund | refund:execute 写审计 |
-| event:read/requeue | ListOrderEvents/死信重放 | requeue 与账号配置变更写审计 |
+| event:read | ListOrderEvents | 游标补投 |
 
-BFF token 只能访问其 claims 允许的 app_id;多租户 admin token 显式选择并校验目标 app_id;token 校验 issuer/audience/expiry + 轮换。
+运维契约(AdminService,仅 gRPC,不挂 REST;权限不进接入方 token 模板,发放与 refund:execute 同级审批):
+
+| 权限 | 方法 | 备注 |
+|---|---|---|
+| ops:reconcile | ListReconcileDiffs/HandleReconcileDiff | 处置写 ops_audit_logs(同事务) |
+| event:requeue | ListDeadLetters/RequeueDeadLetter | 重放写 ops_audit_logs(同事务) |
+| ops:txn:read | ListAnomalyTxns | anomaly 流水查询(含 anomaly_kind 成因) |
+
+BFF token 只能访问其 claims 允许的 app_id;token 校验 issuer/audience/expiry + 轮换。
+AdminService 列表的 app_id 为可选查询过滤(空=全域,含跨租户共享账号的空 app_id 记录),不按 token
+二次裁剪——访问控制落在运维权限发放边界;每次写动作入 `ops_audit_logs`(actor 取自 token,不可伪造)。
 
 ---
 
 ## 14. 生产能力(V1 上线前必须)
 
 - DB 备份 + **恢复演练**、迁移回滚;
-- **支付渠道账单对账**:每日 CLI/worker 拉取渠道账单 → `reconcile_batches`(批次唯一 + 防重)→ 差异写 `reconcile_diffs`(长款/短款/金额不一致)→ 告警 + 人工处理入口(不能只写清单无实现);
+- **支付渠道账单对账**:每日 CLI/worker 拉取渠道账单 → `reconcile_batches`(批次唯一 + 防重)→ 差异写 `reconcile_diffs`(长款/短款/金额不一致)→ 告警 + 人工处理入口(已实现:AdminService 差异清单/处置,状态机 0待处理→1处理中→2已解决/3已忽略,终态不可改、已忽略必留备注、处置人取自 token、并发锁行串行化、处置与审计同事务);
 - 告警:Outbox 死信 / 最老积压时间 / 支付失败率 / 已支付事件未投递(**不是** "PAID 未 Delivered"——orderd 无 Delivered、不发权益)。
 - 后续增强:跨地域灾备、自动长短款处理、复杂报表。
 

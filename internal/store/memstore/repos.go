@@ -1,8 +1,10 @@
 package memstore
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
+	"slices"
 	"time"
 
 	"github.com/gtkit/orderd/internal/models"
@@ -86,6 +88,30 @@ func (r orderRepo) ListExpiredPending(_ context.Context, now time.Time, limit in
 		}
 	}
 	return out, nil
+}
+
+func (r orderRepo) CountPendingByUser(_ context.Context, appID string, userID int64) (int, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	n := 0
+	for _, e := range r.m.d.orders {
+		if e.AppID == appID && e.UserID == userID && e.Status == models.OrderPending {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (r orderRepo) FindByClientOrderNo(_ context.Context, appID, clientOrderNo string) (*models.Order, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	for _, e := range r.m.d.orders {
+		if e.AppID == appID && e.ClientOrderNo.Valid && e.ClientOrderNo.String == clientOrderNo {
+			cp := e
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }
 
 func (r orderRepo) Update(_ context.Context, o *models.Order) error {
@@ -380,6 +406,35 @@ func (r txnRepo) Insert(_ context.Context, t *models.PaymentTransaction) error {
 	return nil
 }
 
+func (r txnRepo) ListAnomalies(_ context.Context, f store.AnomalyFilter, afterID uint64, limit int) ([]models.PaymentTransaction, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	var all []models.PaymentTransaction
+	for _, t := range r.m.d.txns {
+		if !t.Anomaly || t.ID <= afterID {
+			continue
+		}
+		if f.AppID != "" && t.AppID != f.AppID {
+			continue
+		}
+		if f.PayAccountID != "" && t.PayAccountID != f.PayAccountID {
+			continue
+		}
+		if !f.PaidFrom.IsZero() && (!t.PaidAt.Valid || t.PaidAt.Time.Before(f.PaidFrom)) {
+			continue
+		}
+		if !f.PaidTo.IsZero() && (!t.PaidAt.Valid || t.PaidAt.Time.After(f.PaidTo)) {
+			continue
+		}
+		all = append(all, t)
+	}
+	slices.SortFunc(all, func(a, b models.PaymentTransaction) int { return cmp.Compare(a.ID, b.ID) })
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
 func (r txnRepo) ListByAccountDate(_ context.Context, channel, payAccountID string, billDate time.Time) ([]*models.PaymentTransaction, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
@@ -460,6 +515,12 @@ func (r eventRepo) InsertOutbox(_ context.Context, o *models.EventOutbox) error 
 	}
 	d.seq++
 	o.ID = d.seq
+	if o.CreatedAt.IsZero() {
+		o.CreatedAt = time.Now() // 对齐 DDL DEFAULT CURRENT_TIMESTAMP(死信兜底条件依赖)
+	}
+	if o.UpdatedAt.IsZero() {
+		o.UpdatedAt = o.CreatedAt
+	}
 	d.outbox = append(d.outbox, *o)
 	return nil
 }
@@ -498,6 +559,7 @@ func (r outboxRepo) mutate(id uint64, f func(*models.EventOutbox)) error {
 	for i := range r.m.d.outbox {
 		if r.m.d.outbox[i].ID == id {
 			f(&r.m.d.outbox[i])
+			r.m.d.outbox[i].UpdatedAt = time.Now() // 对齐 DDL ON UPDATE CURRENT_TIMESTAMP
 			return nil
 		}
 	}
@@ -522,9 +584,10 @@ func (r outboxRepo) Reschedule(_ context.Context, id uint64, nextAttemptAt time.
 	})
 }
 
-func (r outboxRepo) MarkDead(_ context.Context, id uint64, lastErr string) error {
+func (r outboxRepo) MarkDead(_ context.Context, id uint64, attempts int32, lastErr string) error {
 	return r.mutate(id, func(o *models.EventOutbox) {
 		o.Status = models.OutboxDead
+		o.Attempts = attempts
 		o.LastError = sql.NullString{String: lastErr, Valid: lastErr != ""}
 		o.LockedBy = ""
 		o.LockedUntil = sql.NullTime{}
@@ -539,6 +602,63 @@ func (r outboxRepo) Requeue(_ context.Context, id uint64, nextAttemptAt time.Tim
 		o.LockedBy = ""
 		o.LockedUntil = sql.NullTime{}
 	})
+}
+
+func (r outboxRepo) ListDead(_ context.Context, f store.DeadFilter, afterID uint64, limit int) ([]models.EventOutbox, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	out := make([]models.EventOutbox, 0, limit)
+	for _, o := range r.m.d.outbox {
+		if o.Status != models.OutboxDead || o.ID <= afterID {
+			continue
+		}
+		if f.AppID != "" && o.AppID != f.AppID {
+			continue
+		}
+		if f.EventType != "" && o.EventType != f.EventType {
+			continue
+		}
+		if f.OrderNo != "" && o.OrderNo != f.OrderNo {
+			continue
+		}
+		out = append(out, o)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (r outboxRepo) GetByEventID(_ context.Context, eventID string, _ bool) (*models.EventOutbox, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	for _, o := range r.m.d.outbox {
+		if o.EventID == eventID {
+			cp := o
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+func (r outboxRepo) ClaimDeadForRequeue(_ context.Context, cond store.DeadRequeueCond, limit int) ([]*models.EventOutbox, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	var out []*models.EventOutbox
+	for _, o := range r.m.d.outbox {
+		if o.Status != models.OutboxDead ||
+			o.UpdatedAt.After(cond.UpdatedBefore) ||
+			o.Attempts >= cond.AttemptsBelow ||
+			o.CreatedAt.Before(cond.CreatedAfter) {
+			continue
+		}
+		cp := o
+		out = append(out, &cp)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // ---- reconcile ----
@@ -596,6 +716,81 @@ func (r reconcileRepo) InsertDiff(_ context.Context, d *models.ReconcileDiff) er
 	d.ID = r.m.d.seq
 	r.m.d.diffs = append(r.m.d.diffs, *d)
 	return nil
+}
+
+func (r reconcileRepo) ListDiffs(_ context.Context, f store.DiffFilter, afterID uint64, limit int) ([]models.ReconcileDiff, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	out := make([]models.ReconcileDiff, 0, limit)
+	for _, e := range r.m.d.diffs {
+		if e.ID <= afterID {
+			continue
+		}
+		if f.HandleStatus != nil && e.HandleStatus != *f.HandleStatus {
+			continue
+		}
+		if f.DiffType != nil && e.DiffType != *f.DiffType {
+			continue
+		}
+		if f.AppID != "" && e.AppID != f.AppID {
+			continue
+		}
+		if f.Channel != "" && e.Channel != f.Channel {
+			continue
+		}
+		if f.PayAccountID != "" && e.PayAccountID != f.PayAccountID {
+			continue
+		}
+		if !f.BillDateFrom.IsZero() || !f.BillDateTo.IsZero() {
+			b, ok := r.m.d.batches[e.BatchID]
+			if !ok {
+				continue
+			}
+			if !f.BillDateFrom.IsZero() && b.BillDate.Before(f.BillDateFrom) {
+				continue
+			}
+			if !f.BillDateTo.IsZero() && b.BillDate.After(f.BillDateTo) {
+				continue
+			}
+		}
+		out = append(out, e)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (r reconcileRepo) GetDiff(_ context.Context, id uint64, _ bool) (*models.ReconcileDiff, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	for _, e := range r.m.d.diffs {
+		if e.ID == id {
+			cp := e
+			return &cp, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+func (r reconcileRepo) UpdateDiffHandling(_ context.Context, id uint64, status models.DiffHandleStatus, handledBy string, handledAt time.Time, remark string) error {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	for i := range r.m.d.diffs {
+		if r.m.d.diffs[i].ID != id {
+			continue
+		}
+		d := &r.m.d.diffs[i]
+		d.HandleStatus = status
+		d.HandledBy = handledBy
+		d.HandledAt = sql.NullTime{Time: handledAt, Valid: true}
+		if remark != "" { // 空备注保留原值(与 gormstore 语义一致)
+			d.HandleRemark = remark
+		}
+		d.UpdatedAt = time.Now()
+		return nil
+	}
+	return store.ErrNotFound
 }
 
 func sameDay(a, b time.Time) bool {
@@ -660,4 +855,43 @@ func (m *Mem) Attempts(orderNo string) []models.PaymentAttempt {
 		}
 	}
 	return out
+}
+
+// ---- ops_audit_logs(只插不改)----
+
+type opsAuditRepo struct{ m *Mem }
+
+func (r opsAuditRepo) Insert(_ context.Context, l *models.OpsAuditLog) error {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	r.m.d.seq++
+	l.ID = r.m.d.seq
+	if l.CreatedAt.IsZero() {
+		l.CreatedAt = time.Now()
+	}
+	r.m.d.audits = append(r.m.d.audits, *l)
+	return nil
+}
+
+func (r opsAuditRepo) ListByTarget(_ context.Context, targetType, targetID string, afterID uint64, limit int) ([]models.OpsAuditLog, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	out := make([]models.OpsAuditLog, 0, limit)
+	for _, l := range r.m.d.audits {
+		if l.TargetType != targetType || l.TargetID != targetID || l.ID <= afterID {
+			continue
+		}
+		out = append(out, l)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// Audits 返回审计记录副本(测试用)。
+func (m *Mem) Audits() []models.OpsAuditLog {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]models.OpsAuditLog(nil), m.d.audits...)
 }

@@ -7,8 +7,11 @@ import (
 	"time"
 
 	"github.com/gtkit/logger"
+	"github.com/gtkit/orderd/internal/appmeta"
 	"github.com/gtkit/orderd/internal/models"
 	"github.com/gtkit/orderd/internal/module/event/worker"
+	opsapp "github.com/gtkit/orderd/internal/module/ops/application"
+	opsgrpc "github.com/gtkit/orderd/internal/module/ops/transport/grpc"
 	orderapp "github.com/gtkit/orderd/internal/module/order/application"
 	ordergrpc "github.com/gtkit/orderd/internal/module/order/transport/grpc"
 	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
@@ -25,11 +28,17 @@ import (
 	"github.com/gtkit/orderd/internal/pkg/webhook"
 	"github.com/gtkit/orderd/internal/platform/config"
 	"github.com/gtkit/orderd/internal/platform/data"
+	"github.com/gtkit/orderd/internal/platform/metrics"
 	"github.com/gtkit/orderd/internal/platform/policy"
 	"github.com/gtkit/orderd/internal/repository/gormstore"
+	"github.com/gtkit/orderd/internal/shared/alert"
+	"github.com/gtkit/orderd/internal/shared/alert/hook"
 	billstub "github.com/gtkit/orderd/internal/shared/bill/stub"
 	"github.com/gtkit/orderd/internal/shared/secret"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+	"net/http"
 )
 
 // App 是装配完成的应用(供 bootstrap 编排生命周期)。
@@ -37,13 +46,23 @@ type App struct {
 	Cfg         config.Config
 	Store       *gormstore.Store
 	GRPC        *ordergrpc.Server
+	AdminGRPC   *opsgrpc.Server // 运维契约:仅注册到 gRPC server,不挂 REST 网关
 	Interceptor grpc.UnaryServerInterceptor
 	HTTP        *httpcb.Handler
 	Workers     *worker.Workers
+	Metrics     http.Handler  // GET /metrics(积压类 gauge,scrape 时聚合)
+	alertHook   *hook.Alerter // 可为 nil(未配置告警通道)
 }
 
-// Close 释放资源。
-func (a *App) Close() error { return a.Store.Close() }
+// Close 释放资源:先 flush 告警队列(有限预算),再关连接池。
+func (a *App) Close() error {
+	if a.alertHook != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		a.alertHook.Close(ctx)
+		cancel()
+	}
+	return a.Store.Close()
+}
 
 // Build 依配置装配全部组件。ctx 供 ormx 启动期连通性探测(fail-fast)。
 func Build(ctx context.Context, cfg config.Config) (*App, error) {
@@ -57,7 +76,22 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	accounts := gormstore.NewAccountResolver(st.DB())
-	alerter := loggerAlerter{}
+	// 告警:日志永远写(审计保底);配置了 alert 段再叠加 webhook 尽力送达。
+	var (
+		alerter   alert.Alerter = loggerAlerter{}
+		alertHook *hook.Alerter
+	)
+	if cfg.Alert.Provider != "" {
+		h, herr := hook.New(hook.Config{
+			Provider: cfg.Alert.Provider, WebhookURL: cfg.Alert.WebhookURL, Secret: cfg.Alert.Secret,
+			Service: appmeta.ServiceName, Env: cfg.Env,
+		})
+		if herr != nil {
+			return nil, herr
+		}
+		alertHook = h
+		alerter = multiAlerter{loggerAlerter{}, h}
+	}
 	clock := time.Now
 
 	// 网关路由:按渠道分派到 alipaygw / wechatgw(各自启用时),未启用渠道兜底到 stub。
@@ -109,13 +143,17 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		Store: st, Payment: pay, Pricing: pricing,
 		Amounts: policy.DefaultAmountPolicy(), Accounts: accounts, Clock: clock,
 		NewOrderNo: gen.OrderNo, NewToken: func() (string, error) { return idgen.SecureToken(32) },
-		NewEventID: idgen.UUIDv4, OrderTTL: cfg.OrderTTL,
+		NewEventID: idgen.UUIDv4, OrderTTL: cfg.OrderTTL, MaxPendingPerUser: cfg.MaxPendingPerUser,
 	})
 	ref := refundapp.New(refundapp.Deps{
 		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
 		NewRefundNo: gen.RefundNo, NewEventID: idgen.UUIDv4, Enabled: cfg.RefundEnabled,
 	})
 	grpcSrv, err := ordergrpc.New(ordergrpc.Deps{Order: ord, Refund: ref, Store: st})
+	if err != nil {
+		return nil, err
+	}
+	adminSrv, err := opsgrpc.New(opsapp.New(opsapp.Deps{Store: st, Clock: clock}))
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +180,15 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 	if cfg.RefundEnabled { // 退款关闭时无 PROCESSING 退款,查单 worker 无需运行
 		set.RefundQuery = worker.NewRefundQueryWorker(st, ref, alerter, worker.RefundQueryConfig{WorkerID: cfg.WorkerID}, clock)
 	}
+	// 死信兜底重放 worker:默认关闭(上线观察死信量级与端点健康后再开)。
+	// MaxAttempts 与投递 worker 的死信阈值同源(worker.Config 默认 8,此处不另配)。
+	if cfg.DeadLetter.Enabled {
+		set.DeadLetterRequeue = worker.NewDeadLetterRequeueWorker(st, worker.DeadLetterRequeueConfig{
+			Enabled:  true,
+			Interval: cfg.DeadLetter.Interval, Cooldown: cfg.DeadLetter.Cooldown,
+			MaxAutoRequeues: int32(cfg.DeadLetter.MaxAutoRequeues), MaxLifetime: cfg.DeadLetter.MaxLifetime,
+		}, clock)
+	}
 	// 对账 worker:需真实渠道账单源;V1 默认关闭(ReconcileEnabled=false → 不启动)。
 	if cfg.ReconcileEnabled {
 		reconcileSvc := reconcileapp.New(reconcileapp.Deps{
@@ -150,7 +197,24 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		set.Reconcile = worker.NewReconcileWorker(reconcileSvc, accounts, cfg.ReconcileInterval, clock)
 	}
 
-	return &App{Cfg: cfg, Store: st, GRPC: grpcSrv, Interceptor: interceptor, HTTP: httpcb.New(aliRouter, wcRouter, pay), Workers: worker.New(set)}, nil
+	// 积压指标:自建 Registry(只含本服务指标,不带默认 go/process 噪声之外的业务面)。
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(metrics.NewBacklogCollector(st.DB()))
+
+	return &App{
+		Cfg: cfg, Store: st, GRPC: grpcSrv, AdminGRPC: adminSrv, Interceptor: interceptor,
+		HTTP: httpcb.New(aliRouter, wcRouter, pay), Workers: worker.New(set),
+		Metrics: promhttp.HandlerFor(reg, promhttp.HandlerOpts{}), alertHook: alertHook,
+	}, nil
+}
+
+// multiAlerter 顺序广播到多个告警出口(装配层组合:日志保底 + webhook 尽力送达)。
+type multiAlerter []alert.Alerter
+
+func (m multiAlerter) Anomaly(ctx context.Context, kind string, fields map[string]any) {
+	for _, a := range m {
+		a.Anomaly(ctx, kind, fields)
+	}
 }
 
 // channelRouter 按渠道分派:alipay/wechat → 各自真实路由,未启用渠道 → 兜底(stub)。

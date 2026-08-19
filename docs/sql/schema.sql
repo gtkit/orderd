@@ -345,6 +345,7 @@ CREATE TABLE payment_transactions (
     amount             BIGINT       NOT NULL COMMENT '金额(分)',
     currency           VARCHAR(8)   CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'CNY' COMMENT '币种',
     anomaly            TINYINT      NOT NULL DEFAULT 0 COMMENT '0正常 1资金异常(第二笔真实付款/金额账号不符,待人工)',
+    anomaly_kind       VARCHAR(32)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '异常成因(second_real_payment/amount_mismatch/account_channel_mismatch;空=成因未落库的历史行)',
     paid_at            DATETIME(3)  NULL COMMENT '发生时间',
     notify_digest      VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '通知来源标记(alipay-notify/wechat-notify/query)',
     created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '入账时间',
@@ -469,4 +470,23 @@ CREATE TABLE reconcile_diffs (
     CONSTRAINT chk_diff_type CHECK (diff_type IN (1, 2, 3, 4))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对账差异(人工处理审计)';
 
+
+-- ============================================================
+-- from: 20260818000001_create_ops_audit_logs.sql
+-- ============================================================
+--
+-- ops_audit_logs:运维动作审计,【只插不改】。覆盖死信人工/自动重放、对账差异处置;
+-- 写入与被审计动作同一事务。不写在 event_outbox 上(投递任务可清理,审计不可随之丢失)。
+CREATE TABLE ops_audit_logs (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    actor       VARCHAR(96) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '动作发起者(app_id:user_id,自动动作为 system)',
+    action      VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '动作标识(dead_letter_requeue/reconcile_diff_handle)',
+    target_type VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '被操作对象类型(event_outbox/reconcile_diff)',
+    target_id   VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '被操作对象标识(event_id/差异id)',
+    detail      VARCHAR(1024) NOT NULL DEFAULT '' COMMENT '动作细节(状态前后值/重放前尝试次数等,可复盘)',
+    created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) COMMENT '写入时间(服务端)',
+    PRIMARY KEY (id),
+    KEY idx_target (target_type, target_id),
+    KEY idx_action_time (action, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='运维动作审计(只插不改)';
 

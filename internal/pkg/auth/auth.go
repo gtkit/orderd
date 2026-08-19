@@ -45,3 +45,17 @@ func (c Claims) Permissions() []string {
 type Verifier interface {
 	Verify(ctx context.Context, token string) (Claims, error)
 }
+
+// claimsKey 是 context 中已校验 Claims 的键(拦截器写入,各 transport 读取)。
+type claimsKey struct{}
+
+// ContextWithClaims 把已校验身份放入 context(鉴权拦截器与测试用)。
+func ContextWithClaims(ctx context.Context, c Claims) context.Context {
+	return context.WithValue(ctx, claimsKey{}, c)
+}
+
+// ClaimsFromContext 读取拦截器注入的已校验身份;不存在返回 ok=false。
+func ClaimsFromContext(ctx context.Context) (Claims, bool) {
+	c, ok := ctx.Value(claimsKey{}).(Claims)
+	return c, ok
+}

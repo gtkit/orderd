@@ -235,21 +235,45 @@ func (s *Service) failRefund(appID, orderNo, refundNo, reason string) {
 // ConfirmRefundSuccess 退款成功单事务(与支付成功同等级,评审 #7):
 // 网关确认退款成功 → 退款 SUCCEEDED + 订单 REFUNDING→REFUNDED + 累计已退 + 不可变退款流水
 // (流水回指 refund_no)+ order.refunded 事件。
+// 金额不符 → 同事务落人工终态(退款 ABNORMAL + 订单 REFUND_EXCEPTION),事务外告警,返回成功。
 func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gatewayRefundID string, amount int64, at time.Time) error {
-	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+	var (
+		mismatch              bool
+		wantAmount, gotAmount int64
+		orderNo               string
+	)
+	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo)
 		if err != nil {
 			return err
 		}
-		if rf.Status == models.RefundSucceeded {
-			return nil // 幂等
+		if rf.Status == models.RefundSucceeded || rf.Status == models.RefundAbnormal {
+			return nil // 幂等:成功与人工终态都不重复处置、不重复告警
 		}
-		// 校验成功金额与退款单金额一致(评审 P1):不一致=资金异常,不结算,告警。
+		// 校验成功金额与退款单金额一致(评审 P1):不一致=资金异常,同事务落人工终态——
+		// 退款 ABNORMAL(活跃守卫内,人工确认前阻断再次退款)+ 订单 REFUNDING→REFUND_EXCEPTION。
+		// 留在 PROCESSING 会被退款查单 worker 无限轮询;告警在事务提交后发出(不在持锁期间做外部 IO)。
 		if amount != rf.RefundAmount {
-			s.d.Alerter.Anomaly(ctx, "refund_amount_mismatch", map[string]any{
-				"refund_no": refundNo, "expected": rf.RefundAmount, "got": amount,
-			})
-			return fmt.Errorf("%w: 退款成功金额 %d 与退款单金额 %d 不符", models.ErrPaymentAnomaly, amount, rf.RefundAmount)
+			mismatch, wantAmount, gotAmount, orderNo = true, rf.RefundAmount, amount, rf.OrderNo
+			rf.Status = models.RefundAbnormal
+			rf.LastError = sqlutil.Str(fmt.Sprintf("退款成功金额 %d 与退款单金额 %d 不符", amount, rf.RefundAmount))
+			if err := r.Refunds().Update(ctx, rf); err != nil {
+				return err
+			}
+			o, err := r.Orders().GetByOrderNo(ctx, appID, rf.OrderNo, true)
+			if err != nil {
+				return err
+			}
+			if o.Status == models.OrderRefunding {
+				prev := o.Status
+				o.Status = models.OrderRefundException
+				o.AggregateVersion++
+				if err := r.Orders().Update(ctx, o); err != nil {
+					return err
+				}
+				return eventapp.WriteLog(ctx, r, o, prev, "system", "退款金额不符,转人工")
+			}
+			return nil // 订单已离开 REFUNDING:只落退款终态,不动订单
 		}
 		o, err := r.Orders().GetByOrderNo(ctx, appID, rf.OrderNo, true)
 		if err != nil {
@@ -292,6 +316,15 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, appID, refundNo, gat
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if mismatch {
+		s.d.Alerter.Anomaly(ctx, "refund_amount_mismatch", map[string]any{
+			"refund_no": refundNo, "order_no": orderNo, "expected": wantAmount, "got": gotAmount,
+		})
+	}
+	return nil
 }
 
 // GetRefund 按 refund_no 或 out_refund_no 查退款;多租户查询始终校验 app_id(评审 P1)。

@@ -76,6 +76,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 		grpc.ChainUnaryInterceptor(chain...),
 	)
 	orderv1.RegisterOrderServiceServer(gs, app.GRPC)
+	// AdminService 只注册到 gRPC(:9090),绝不挂 grpc-gateway——运维契约与接入方 REST/回调面隔离。
+	orderv1.RegisterAdminServiceServer(gs, app.AdminGRPC)
 	go func() {
 		logger.Infow("gRPC 启动", "addr", cfg.GRPCAddr)
 		if serr := gs.Serve(lis); serr != nil && !errors.Is(serr, grpc.ErrServerStopped) {
@@ -95,6 +97,8 @@ func Run(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	mux.Handle("/v1/", gwMux)
+	// 积压指标(纯计数/年龄,无敏感数据);来源限制属入口层(防火墙/网关)职责。
+	mux.Handle("GET /metrics", app.Metrics)
 
 	hs := &http.Server{Addr: cfg.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {

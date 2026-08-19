@@ -67,6 +67,29 @@ func (r orderRepo) ListExpiredPending(ctx context.Context, now time.Time, limit 
 	return out, nil
 }
 
+func (r orderRepo) CountPendingByUser(ctx context.Context, appID string, userID int64) (int, error) {
+	var n int64
+	// idx_app_user_status 精确覆盖。
+	err := dbOf(ctx, r.base).Model(&models.Order{}).
+		Where("app_id = ? AND user_id = ? AND status = ?", appID, userID, models.OrderPending).Count(&n).Error
+	if err != nil {
+		return 0, fmt.Errorf("gormstore: count pending by user: %w", err)
+	}
+	return int(n), nil
+}
+
+func (r orderRepo) FindByClientOrderNo(ctx context.Context, appID, clientOrderNo string) (*models.Order, error) {
+	var o models.Order
+	err := dbOf(ctx, r.base).Where("app_id = ? AND client_order_no = ?", appID, clientOrderNo).Take(&o).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gormstore: find order by client_order_no: %w", err)
+	}
+	return &o, nil
+}
+
 func (r orderRepo) Update(ctx context.Context, o *models.Order) error {
 	// 精确更新资金主链关心的列(与旧 raw UPDATE 列集一致);Select 强制含零值列。
 	err := dbOf(ctx, r.base).Model(&models.Order{}).Where("id = ?", o.ID).
@@ -301,6 +324,27 @@ func (r txnRepo) GetByTxnID(ctx context.Context, channel, payAccountID, txnID st
 		return nil, fmt.Errorf("gormstore: get txn by id: %w", err)
 	}
 	return &t, nil
+}
+
+func (r txnRepo) ListAnomalies(ctx context.Context, f store.AnomalyFilter, afterID uint64, limit int) ([]models.PaymentTransaction, error) {
+	q := dbOf(ctx, r.base).Where("anomaly = ? AND id > ?", true, afterID)
+	if f.AppID != "" {
+		q = q.Where("app_id = ?", f.AppID)
+	}
+	if f.PayAccountID != "" {
+		q = q.Where("pay_account_id = ?", f.PayAccountID)
+	}
+	if !f.PaidFrom.IsZero() {
+		q = q.Where("paid_at >= ?", f.PaidFrom)
+	}
+	if !f.PaidTo.IsZero() {
+		q = q.Where("paid_at <= ?", f.PaidTo)
+	}
+	var out []models.PaymentTransaction
+	if err := q.Order("id").Limit(limit).Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("gormstore: list anomaly txns: %w", err)
+	}
+	return out, nil
 }
 
 func (r txnRepo) ListByAccountDate(ctx context.Context, channel, payAccountID string, billDate time.Time) ([]*models.PaymentTransaction, error) {

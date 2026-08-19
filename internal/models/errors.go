@@ -23,6 +23,8 @@ var (
 	ErrOrderNotOwned = errors.New("订单归属不符")
 	// ErrOrderNotPending 订单不处于 PENDING(取消/建尝试的前置)。
 	ErrOrderNotPending = errors.New("订单非待支付")
+	// ErrTooManyPendingOrders 单用户未付订单数达到上限(近似防刷阈值,非资金不变量)。
+	ErrTooManyPendingOrders = errors.New("待支付订单数已达上限")
 	// ErrActiveAttemptExists 已存在活跃支付尝试(建新尝试冲突)。
 	ErrActiveAttemptExists = errors.New("已存在活跃支付尝试")
 	// ErrRefundNotAllowed 退款未授权(V1 双重关闭)或订单状态不允许退款。

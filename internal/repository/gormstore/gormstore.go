@@ -70,6 +70,7 @@ func (r *repos) Events() store.EventRepo             { return eventRepo{r.base} 
 func (r *repos) Outbox() store.OutboxRepo            { return outboxRepo{r.base} }
 func (r *repos) Reconcile() store.ReconcileRepo      { return reconcileRepo{r.base} }
 func (r *repos) Logs() store.LogRepo                 { return logRepo{r.base} }
+func (r *repos) OpsAudit() store.OpsAuditRepo        { return opsAuditRepo{r.base} }
 
 // dbOf 取 ctx 事务或回退 base(所有数据访问统一经此,不绕过事务上下文)。
 func dbOf(ctx context.Context, base *gorm.DB) *gorm.DB { return dbtx.DB(ctx, base) }

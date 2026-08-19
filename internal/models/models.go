@@ -132,6 +132,13 @@ const (
 	TxnRefund TxnKind = 2
 )
 
+// 资金异常成因(payment_transactions.anomaly_kind;空串=成因未落库的历史行)。
+const (
+	AnomalyKindSecondRealPayment      = "second_real_payment"      // 第二笔真实付款(订单不可再结算)
+	AnomalyKindAmountMismatch         = "amount_mismatch"          // 金额/币种与订单快照不符
+	AnomalyKindAccountChannelMismatch = "account_channel_mismatch" // 通知路由账号/渠道与尝试冻结不符
+)
+
 // PaymentTransaction 不可变财务流水(payment_transactions)。
 type PaymentTransaction struct {
 	ID               uint64
@@ -147,6 +154,7 @@ type PaymentTransaction struct {
 	Amount           int64
 	Currency         string
 	Anomaly          bool
+	AnomalyKind      string
 	PaidAt           sql.NullTime
 	NotifyDigest     string
 	CreatedAt        time.Time
@@ -247,6 +255,37 @@ const (
 	DiffStatus  DiffType = 4 // 状态不一致
 )
 
+// DiffHandleStatus 对账差异处置状态(DB 值,与建表注释一致;proto = DB + 1)。
+type DiffHandleStatus int8
+
+const (
+	DiffHandlePending    DiffHandleStatus = 0 // 待处理
+	DiffHandleProcessing DiffHandleStatus = 1 // 处理中
+	DiffHandleResolved   DiffHandleStatus = 2 // 已解决(终态)
+	DiffHandleIgnored    DiffHandleStatus = 3 // 已忽略(终态,须留备注)
+)
+
+// Terminal 报告该处置状态是否为终态(终态不可再改)。
+func (s DiffHandleStatus) Terminal() bool {
+	return s == DiffHandleResolved || s == DiffHandleIgnored
+}
+
+// CanDiffHandleTransit 报告差异处置能否从 from 迁移到 to:
+// 0→1/2/3、1→2/3;终态与同态一律拒绝(避免覆盖他人备注)。
+func CanDiffHandleTransit(from, to DiffHandleStatus) bool {
+	if from == to || from.Terminal() {
+		return false
+	}
+	switch from {
+	case DiffHandlePending:
+		return to == DiffHandleProcessing || to == DiffHandleResolved || to == DiffHandleIgnored
+	case DiffHandleProcessing:
+		return to == DiffHandleResolved || to == DiffHandleIgnored
+	default:
+		return false
+	}
+}
+
 // ReconcileDiff 对账差异(reconcile_diffs)。
 type ReconcileDiff struct {
 	ID            uint64
@@ -261,12 +300,33 @@ type ReconcileDiff struct {
 	GatewayAmount int64
 	LocalAmount   int64
 	Detail        string
-	HandleStatus  int8
+	HandleStatus  DiffHandleStatus
 	HandledBy     string
 	HandledAt     sql.NullTime
 	HandleRemark  string
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+}
+
+// 运维审计动作/对象标识(ops_audit_logs)。
+const (
+	OpsActionDeadLetterRequeue   = "dead_letter_requeue"
+	OpsActionReconcileDiffHandle = "reconcile_diff_handle"
+	OpsTargetEventOutbox         = "event_outbox"
+	OpsTargetReconcileDiff       = "reconcile_diff"
+	// OpsActorSystem 自动动作(兜底重放 worker)的发起者标识。
+	OpsActorSystem = "system"
+)
+
+// OpsAuditLog 运维动作审计(ops_audit_logs,只插不改)。
+type OpsAuditLog struct {
+	ID         uint64
+	Actor      string // app_id:user_id 或 system
+	Action     string
+	TargetType string
+	TargetID   string
+	Detail     string
+	CreatedAt  time.Time
 }
 
 // AppPayAccount 多租户支付账号(app_pay_accounts)。

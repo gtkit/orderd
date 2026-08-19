@@ -220,3 +220,28 @@ func TestRefundQueryStallAlertEdgeTriggered(t *testing.T) {
 		})
 	}
 }
+
+// TestRefundQueryWorkerAmountMismatchConverges 反证:金额不符经查单收敛为 ABNORMAL 终态,
+// 后续轮次不再认领(旧实现停 PROCESSING 无限轮询,本测试失败)。
+func TestRefundQueryWorkerAmountMismatchConverges(t *testing.T) {
+	mem := memstore.New()
+	seedRefund(t, mem, "OD-mm", "RF-mm", 0) // RefundAmount=90
+	rw := buildRefundQueryWorker(mem, paygateway.RefundQueryResult{
+		State: paygateway.RefundQuerySucceeded, GatewayRefundID: "gwr", Amount: 50,
+	}, nopAlerter{})
+	if got, err := rw.RunOnce(bg); err != nil || got != 1 {
+		t.Fatalf("RunOnce: got=%d err=%v", got, err)
+	}
+	rf, _ := mem.Reader().Refunds().GetByRefundNo(bg, "RF-mm")
+	if rf.Status != models.RefundAbnormal {
+		t.Fatalf("金额不符应收敛 ABNORMAL,实际: %v", rf.Status)
+	}
+	o, _ := mem.Reader().Orders().GetByOrderNo(bg, "app1", "OD-mm", false)
+	if o.Status != models.OrderRefundException {
+		t.Fatalf("订单应 REFUND_EXCEPTION,实际: %v", o.Status)
+	}
+	// 终态后不再认领(收敛,不再无限轮询)。
+	if got, err := rw.RunOnce(bg); err != nil || got != 0 {
+		t.Fatalf("终态后不应再认领: got=%d err=%v", got, err)
+	}
+}

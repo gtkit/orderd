@@ -94,3 +94,35 @@ func TestInterceptorBadToken(t *testing.T) {
 		t.Fatalf("非法 token 应 Unauthenticated,实际: %v", err)
 	}
 }
+
+// TestInterceptorAdminPermissionMatrix AdminService 鉴权矩阵(评审 10.3):
+// 无 token → Unauthenticated;接入方权限调 admin → PermissionDenied;
+// 持 ops:reconcile 调 RequeueDeadLetter(需 event:requeue)→ PermissionDenied;对应权限放行。
+func TestInterceptorAdminPermissionMatrix(t *testing.T) {
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		method string
+		want   codes.Code
+	}{
+		{"无token", context.Background(), "/order.v1.AdminService/ListReconcileDiffs", codes.Unauthenticated},
+		{"接入方权限调admin", bearerCtx(itToken([]string{"order:create", "order:read", "refund:execute"})),
+			"/order.v1.AdminService/ListReconcileDiffs", codes.PermissionDenied},
+		{"持错运维权限", bearerCtx(itToken([]string{"ops:reconcile"})),
+			"/order.v1.AdminService/RequeueDeadLetter", codes.PermissionDenied},
+		{"ops:reconcile放行差异处置", bearerCtx(itToken([]string{"ops:reconcile"})),
+			"/order.v1.AdminService/HandleReconcileDiff", codes.OK},
+		{"event:requeue放行死信重放", bearerCtx(itToken([]string{"event:requeue"})),
+			"/order.v1.AdminService/RequeueDeadLetter", codes.OK},
+		{"ops:txn:read放行异常流水", bearerCtx(itToken([]string{"ops:txn:read"})),
+			"/order.v1.AdminService/ListAnomalyTxns", codes.OK},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := runInterceptor(t, tc.ctx, tc.method)
+			if status.Code(err) != tc.want {
+				t.Fatalf("期望 %v,实际 %v", tc.want, err)
+			}
+		})
+	}
+}

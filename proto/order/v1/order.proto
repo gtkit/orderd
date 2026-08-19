@@ -148,6 +148,37 @@ message GetOrderStatusResponse {
   bytes       metadata     = 9;
 }
 
+// GetOrder 按订单号或业务单号回查(接入方镜像失步兜底):order_no / client_order_no 恰一个非空。
+// 租户与归属取自 token;跨租户等同不存在,越权归属拒绝(与 GetOrderStatus 语义一致)。
+message GetOrderRequest {
+  option (buf.validate.message).cel = {
+    id: "get_order.exactly_one_key"
+    message: "order_no 与 client_order_no 必须恰好提供一个"
+    expression: "(this.order_no != '') != (this.client_order_no != '')"
+  };
+  string order_no        = 1 [(buf.validate.field).string.max_len = 64];
+  string client_order_no = 2 [(buf.validate.field).string.max_len = 64];
+  int64  user_id         = 3 [(buf.validate.field).int64.gt = 0]; // 归属校验(实际取 token)
+}
+
+// GetOrderResponse 含镜像恢复所需全量:单号关联 + order_token(仅经同租户+同用户+order:read 校验后下发;
+// webhook 事件不含 token 的约束不变)。
+message GetOrderResponse {
+  string order_no        = 1;
+  string client_order_no = 2;
+  string order_token     = 3;
+  OrderStatus status     = 4;
+  string      status_text  = 5;
+  CloseReason close_reason = 6;
+  Money       amount     = 7;
+  string      trade_no   = 8;
+  google.protobuf.Timestamp paid_at   = 9;
+  int64       refunded_amount   = 10;
+  int64       aggregate_version = 11;
+  bytes       metadata   = 12;
+  google.protobuf.Timestamp expire_at = 13;
+}
+
 // ListOrderEvents 游标批量拉取事件,供接入方大规模漏事件对账(单笔轮询兜不住)。
 message ListOrderEventsRequest {
   // 单调游标:服务端基于 DB 自增序列或 (created_at, id) 编码,不用 UUID event_id 排序。
@@ -254,6 +285,10 @@ service OrderService {
   }
   rpc GetOrderStatus(GetOrderStatusRequest) returns (GetOrderStatusResponse) {
     option (google.api.http) = {get: "/v1/orders/status"};
+  }
+  // 按订单号/业务单号回查(镜像失步兜底,恢复 token)。
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse) {
+    option (google.api.http) = {get: "/v1/orders"};
   }
   rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse) {
     option (google.api.http) = {

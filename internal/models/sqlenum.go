@@ -50,3 +50,10 @@ func (s *BatchStatus) Scan(v any) error            { n, err := scanInt(v); *s = 
 
 func (d DiffType) Value() (driver.Value, error) { return int64(d), nil }
 func (d *DiffType) Scan(v any) error            { n, err := scanInt(v); *d = DiffType(n); return err }
+
+func (s DiffHandleStatus) Value() (driver.Value, error) { return int64(s), nil }
+func (s *DiffHandleStatus) Scan(v any) error {
+	n, err := scanInt(v)
+	*s = DiffHandleStatus(n)
+	return err
+}
