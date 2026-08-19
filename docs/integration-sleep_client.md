@@ -133,6 +133,7 @@ message MembershipBenefit {
 | **服务间 JWT 签发** | 用 orderd 约定的 HS256 + kid,claims 带 `app_id`/`user_id`/`perms`(order:create/read/cancel、refund:execute/read、event:read)、iss/aud/exp |
 | **事件消费 handler** | 用 `orderevents.NewHandler`(OnPaid/OnRefunded/OnClosed);在**同一业务事务**里 `INSERT inbox_events` 去重 + 按 (order_no, aggregate_version) 单调 + 发权益/落账单 + 推进本地镜像,提交后才回 2xx |
 | **`inbox_events` 表** | 按 `sdk/orderevents/inbox_schema.sql` 建在 **sleep 业务库** |
+| **通知 outbox + 通知 worker** | 支付成功后的公众号/短信/邮件**不在事件消费事务里同步发**:消费 `order.paid` 时把「待发通知」与开会员**同事务**写进 sleep 本地 `notify_outbox`,提交后即回 2xx;由独立 worker 异步发送并按渠道退避重试(见本节末「通知异步化」) |
 | **状态回填(可选兜底)** | 定时/按需 `GetOrderStatus` 补拉,纠正漏事件的本地镜像 + 触发 SSE;镜像丢失 order_token 时用 `GetOrder(client_order_no)` 回查恢复 |
 
 发权益 handler 骨架(把原 `DeliveryService.AfterPaid` 挪进来):
@@ -148,12 +149,65 @@ h := orderevents.NewHandler(orderevents.Config{
       var b membershipv1.MembershipBenefit
       proto.Unmarshal(e.Metadata, &b)                   // 权益从 metadata 还原
       // 关联本地镜像(e.OrderNo=orderd order_no;或用 client_order_no 关联 sleep OrderNo)
-      return finalizePaidOrder(dbCtx, e, &b)            // 发 VIP + 落账单 + 置 Delivered
+      if err := finalizePaidOrder(dbCtx, e, &b); err != nil { // 发 VIP + 落账单 + 置 Delivered
+        return err
+      }
+      // 通知不在此同步发:与开会员【同事务】落「待发通知」,实际发送交给独立 worker(见「通知异步化」)。
+      return enqueueNotify(dbCtx, e, &b)                // 每渠道各写一条 pending 到 notify_outbox
     })
   },
 })
 mux.Handle("/webhooks/order", h)
 ```
+
+#### 通知异步化(第二级 outbox)
+
+支付成功后的用户触达(微信公众号模板消息、短信、邮件)与「开会员」是两种性质:开会员是**用户付费必须拿到的交付**,要求可靠 + 幂等 + 与交付标记同事务;通知是**可失败、可重试、可延迟的触达**,一次没发出去补发即可。二者必须解耦——否则慢/会失败的外部网关调用会拖住事件 2xx 应答(触发 orderd 重投),甚至连累会员发放回滚。
+
+做法是在 sleep 业务库再加一级 outbox,与 orderd→sleep 的事件投递同构:
+
+1. **入队与开会员同事务**:消费 `order.paid` 时,`enqueueNotify` 给每个渠道各写一条 `pending` 到 `notify_outbox`,和开会员/落账单在**同一事务**提交。保证「开了会员就一定有待发通知,不丢」;事务未提交则整体回滚,orderd 重投后重来(inbox 去重挡住重复开会员)。
+2. **独立 worker 异步发送**:通知 worker 扫 `notify_outbox` 里到期的 `pending`/`failed`,按渠道分派到对应发送器,成功置 `sent`,失败退避重试(`attempts++` + 抬 `next_attempt_at`),超过阈值转 `dead` 并告警。发送失败**只重试,不回滚会员、不影响事件应答**。
+3. **渠道隔离**:公众号/短信/邮件各自独立记录与重试,一个渠道网关故障不连累其它。
+4. **发送幂等**:事件 at-least-once + worker 重试都可能重复触发,须按 `(order_no, channel)` 唯一约束去重;外部网关支持幂等号时带上 `notify_outbox.id`,避免用户收到重复短信。
+
+`notify_outbox` 建在 **sleep 业务库**(与 `inbox_events` 同库,才能与开会员同事务):
+
+```sql
+CREATE TABLE notify_outbox (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  order_no        VARCHAR(64)  NOT NULL COMMENT 'orderd order_no,关联本地镜像',
+  channel         VARCHAR(16)  NOT NULL COMMENT 'wechat_mp / sms / email',
+  payload         JSON         NOT NULL COMMENT '渲染发送所需最小数据(模板号/收件人/变量),禁写密钥',
+  status          TINYINT      NOT NULL DEFAULT 0 COMMENT '0 pending 1 sent 2 failed 3 dead',
+  attempts        INT          NOT NULL DEFAULT 0,
+  next_attempt_at DATETIME(3)  NOT NULL,
+  last_error      VARCHAR(512) NOT NULL DEFAULT '',
+  created_at      DATETIME(3)  NOT NULL,
+  sent_at         DATETIME(3)  NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_order_channel (order_no, channel),   -- 同单同渠道只发一次(幂等)
+  KEY idx_due (status, next_attempt_at)              -- worker 认领到期待发
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='支付成功后的用户触达发件箱';
+```
+
+通知 worker 骨架(与 orderd 的 outbox worker 同构:认领到期 → 发送 → 成功置 sent / 失败退避 / 超阈转 dead):
+
+```go
+for _, n := range store.ClaimDueNotify(ctx, now, batch) { // WHERE status IN(pending,failed) AND next_attempt_at<=now
+    err := senders[n.Channel].Send(ctx, n)                // 公众号/短信/邮件各自实现,带 n.ID 作幂等号
+    switch {
+    case err == nil:
+        store.MarkSent(ctx, n.ID)                          // status=sent
+    case n.Attempts+1 >= maxAttempts:
+        store.MarkDead(ctx, n.ID, err)                     // status=dead + 告警(转人工补发)
+    default:
+        store.Reschedule(ctx, n.ID, backoff(n.Attempts), err) // attempts++,抬 next_attempt_at
+    }
+}
+```
+
+要点:通知 worker 与事件消费**完全隔离**——它的慢和失败永远碰不到 orderd 的事件应答与 sleep 的会员发放,即「慢/会失败的外部调用隔离在最外层,绝不倒灌回资金与交付」原则的落地。
 
 ---
 
@@ -183,7 +237,8 @@ APP → sleep.CreateOrder(productID)
 **支付成功 → 发权益**
 ```
 渠道 → orderd /notify/alipay/{route} → 验签 → §7 入账 → 发 order.paid(带 metadata=权益)
-     → sleep /webhooks/order: 验签 → inbox 去重 → 发 VIP + 落账单 + 镜像 Paid→Delivered → 2xx
+     → sleep /webhooks/order: 验签 → inbox 去重 → 发 VIP + 落账单 + 镜像 Paid→Delivered + 落待发通知(同事务) → 2xx
+     → sleep 通知 worker: 异步发公众号/短信/邮件,按渠道退避重试(失败只重试,不回滚会员)
 ```
 
 **退款(审批后执行)**
@@ -282,6 +337,7 @@ sleep(BFF)签发、orderd 验签,双方必须一致:
 - **退款双写**:审批态(sleep)与执行态(orderd)分离,终态靠事件对齐,避免两边各写一半。
 - **微信缺口**:P0 未补微信前,微信单不能迁,否则丢单。
 - **双库一致性**:orderd 资金权威、sleep 会员权威,以事件 + 对账收敛,不做跨库分布式事务。
+- **通知重复/失败**:通知走 sleep 第二级 outbox(§3.3),入队与开会员同事务(不丢),发送按 `(order_no, channel)` 幂等去重、失败退避重试;绝不同步阻塞事件 2xx,也绝不因通知失败回滚会员。
 
 ---
 
