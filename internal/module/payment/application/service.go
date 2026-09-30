@@ -8,11 +8,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/gtkit/logger"
 	"github.com/gtkit/orderd/internal/models"
 	eventapp "github.com/gtkit/orderd/internal/module/event/application"
+	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
 	"github.com/gtkit/orderd/internal/paygateway"
 	"github.com/gtkit/orderd/internal/pkg/sqlutil"
 	"github.com/gtkit/orderd/internal/shared/account"
@@ -37,6 +39,15 @@ type Deps struct {
 	GatewayTimeout time.Duration // 单次网关调用强制超时(评审 P1)
 	// Obs 关键路径埋点端口(nil → Nop,行为不变)。
 	Obs obs.FlowObserver
+	// LateRefundApps 已关闭订单收到付款时自动退款(不恢复订单)的 app;LateRefunder 执行退款。
+	// 列表为空时 LateRefunder 可为 nil。
+	LateRefundApps map[string]bool
+	LateRefunder   LateRefunder
+}
+
+// LateRefunder 迟到付款自动退款端口(refund 服务实现:按异常流水退款,out_refund_no 幂等)。
+type LateRefunder interface {
+	RefundAnomalyTxn(ctx context.Context, in refundapp.AnomalyRefundInput) (refundapp.RefundOutcome, error)
 }
 
 // Service 支付应用服务。
@@ -378,6 +389,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		res          ConfirmResult
 		alertOrderNo string
 		prevReason   models.CloseReason
+		lateTxnID    uint64 // 非零:事务提交后对该 paid_after_closed 流水发起自动退款
 	)
 	err = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		// 权威身份由 out_trade_no 唯一派生(评审 P0):不信任回调传入的 order_no/app_id。
@@ -421,6 +433,10 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 			if err := settleAttempt(ctx, r, attempt); err != nil {
 				return err
 			}
+			// 迟到付款退款流水的重复通知:再次触发自动退款(退款号幂等),覆盖"提交后、退款前进程崩溃"。
+			if dup.AnomalyKind == models.AnomalyKindPaidAfterClosed && s.d.LateRefundApps[o.AppID] {
+				lateTxnID = dup.ID
+			}
 			res = ConfirmResult{Outcome: "duplicate"}
 			return nil
 		}
@@ -454,7 +470,32 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 			return nil
 		}
 
-		// 4) 正常胜出:落流水(冲突重读比对,评审 P0)+ 尝试 PAID + 关其它活跃 + 订单 CAS→PAID + 快照 + 事件。
+		// 4) 已关闭订单 + app 启用迟到付款退款:接受资金事实但不恢复订单(接入方收到 order.closed 后可能已
+		// 释放资源)——落 paid_after_closed 流水、尝试收敛 PAID,订单保持 CLOSED 不发 order.paid;提交后自动退款。
+		// CLOSING 仍走正常结算:接入方尚未收到 order.closed。
+		if o.Status == models.OrderClosed && s.d.LateRefundApps[o.AppID] {
+			t := payTxn(o.AppID, o.OrderNo, in, attempt, true, models.AnomalyKindPaidAfterClosed)
+			if err := r.Transactions().Insert(ctx, t); errors.Is(err, store.ErrDuplicate) {
+				// 并发同笔通知:第 1 步的快照读看不到另一路刚提交的流水,插入才撞唯一键。
+				// 先提交的一路已在事务后触发自动退款,本路按重复处理。
+				res = ConfirmResult{Outcome: "duplicate"}
+				return nil
+			} else if err != nil {
+				return err
+			}
+			// 订单 CLOSED 时其尝试通常已 CLOSED(非活跃,settleAttempt 不处理):按渠道事实显式置 PAID(CLOSED→PAID 合法)。
+			if attempt.Status != models.AttemptPaid {
+				attempt.Status = models.AttemptPaid
+				if err := r.Attempts().Update(ctx, attempt); err != nil {
+					return err
+				}
+			}
+			lateTxnID = t.ID
+			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindPaidAfterClosed}
+			return nil
+		}
+
+		// 5) 正常胜出:落流水(冲突重读比对,评审 P0)+ 尝试 PAID + 关其它活跃 + 订单 CAS→PAID + 快照 + 事件。
 		ins, err := insertWinningTxn(ctx, r, o, in, attempt)
 		if err != nil {
 			return err
@@ -526,7 +567,26 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		})
 	}
 	s.d.Obs.ConfirmOutcome(outcome) // 事务外纯内存计数
+	if lateTxnID != 0 {
+		s.refundLatePayment(ctx, lateTxnID, alertOrderNo)
+	}
 	return res, nil
+}
+
+// refundLatePayment 对 paid_after_closed 流水发起自动退款(事务外;退款号 late-<流水id> 保证重复触发幂等)。
+// 失败只告警:流水已落库,运维可经 RefundAnomalyTxn 手动退款;不影响本次回调的应答。
+func (s *Service) refundLatePayment(ctx context.Context, txnID uint64, orderNo string) {
+	out, err := s.d.LateRefunder.RefundAnomalyTxn(ctx, refundapp.AnomalyRefundInput{
+		TxnID: txnID, OutRefundNo: "late-" + strconv.FormatUint(txnID, 10),
+		Reason: "订单已关闭后付款,自动退款", Actor: models.OpsActorSystem,
+	})
+	if err != nil {
+		s.d.Alerter.Anomaly(ctx, "late_payment_refund_failed", map[string]any{
+			"txn_id": txnID, "order_no": orderNo, "err": err.Error(),
+		})
+		return
+	}
+	logger.Infow("迟到付款已发起自动退款", "txn_id", txnID, "order_no", orderNo, "refund_no", out.RefundNo, "status", out.Status, "reused", out.Reused)
 }
 
 // ---------------------------------------------------------------------

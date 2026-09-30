@@ -156,7 +156,8 @@ message AnomalyTxnRecord {
   string transaction_id = 7;
   int64 amount          = 8; // 金额(分)
   string currency       = 9;
-  // 成因:second_real_payment / amount_mismatch / account_channel_mismatch / unknown_out_trade_no;
+  // 成因:second_real_payment / amount_mismatch / account_channel_mismatch / unknown_out_trade_no /
+  // paid_after_closed(启用迟到付款退款策略的 app 在订单关闭后收到的付款,已自动发起退款);
   // 空串=成因未落库的历史行(anomaly_kind 列上线前写入)。
   string anomaly_kind = 10;
   google.protobuf.Timestamp paid_at    = 11;

@@ -43,6 +43,8 @@ type Config struct {
 	AttemptTTL    time.Duration // 单次支付尝试截止
 	// MaxPendingPerUser 单用户 PENDING 订单数上限(近似防刷;未配置默认 5,显式 0=不限)。
 	MaxPendingPerUser int
+	// LatePaymentRefundApps 已关闭订单收到付款时自动退款(不恢复订单)的 app;其余 app 结算为 PAID。
+	LatePaymentRefundApps []string
 
 	// Outbox 投递 worker。
 	WorkerID          string            // 副本实例标识(租约持有者)
@@ -213,9 +215,10 @@ type fileConfig struct {
 		ID string `yaml:"id"`
 	} `yaml:"worker"`
 	Order struct {
-		TTL               string `yaml:"ttl"`
-		AttemptTTL        string `yaml:"attemptttl"`
-		MaxPendingPerUser *int   `yaml:"maxpendingperuser"` // nil=未配置(默认 5),显式 0=不限
+		TTL                   string   `yaml:"ttl"`
+		AttemptTTL            string   `yaml:"attemptttl"`
+		MaxPendingPerUser     *int     `yaml:"maxpendingperuser"` // nil=未配置(默认 5),显式 0=不限
+		LatePaymentRefundApps []string `yaml:"latepaymentrefundapps"`
 	} `yaml:"order"`
 	Refund struct {
 		Enabled bool `yaml:"enabled"`
@@ -342,6 +345,11 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("config: order.maxpendingperuser 不可为负")
 		}
 		c.MaxPendingPerUser = *fc.Order.MaxPendingPerUser
+	}
+	c.LatePaymentRefundApps = fc.Order.LatePaymentRefundApps
+	if len(c.LatePaymentRefundApps) > 0 && !c.RefundEnabled {
+		// 自动退款依赖退款查单 worker(仅 refund.enabled 时运行)收敛,关闭时退款会永久停在 PROCESSING。
+		return Config{}, fmt.Errorf("config: order.latepaymentrefundapps 非空需 refund.enabled=true")
 	}
 	if c.ReconcileInterval, err = parseDur(fc.Reconcile.Interval, 24*time.Hour, "reconcile.interval"); err != nil {
 		return Config{}, err

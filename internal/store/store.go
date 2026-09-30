@@ -137,12 +137,15 @@ type OrderRepo interface {
 	GetByToken(ctx context.Context, token string) (*models.Order, error)
 	// FindByIdempotencyKey 未命中返回 (nil, nil),便于"存在即复用"分支。
 	FindByIdempotencyKey(ctx context.Context, appID, key string) (*models.Order, error)
-	// ListExpiredPending 列出已过期的待支付订单(status=PENDING 且 expire_at<now),供超时关单 worker。
-	ListExpiredPending(ctx context.Context, now time.Time, limit int) ([]*models.Order, error)
+	// ClaimExpiredPending 认领一笔已过期的待支付订单(status=PENDING 且 expire_at<now,id 不在 exclude 中,
+	// 按 expire_at 最早优先),行锁返回;被其它事务锁住的行跳过(MySQL FOR UPDATE SKIP LOCKED)。
+	// 必须在事务内调用并在同一事务内完成关单。无可认领返回 (nil, nil)。
+	ClaimExpiredPending(ctx context.Context, now time.Time, exclude []uint64) (*models.Order, error)
 	// ListStalledClosing 列出 CLOSING 且 updated_at 早于 before 的订单(滞留兜底 watchdog)。
 	ListStalledClosing(ctx context.Context, before time.Time, limit int) ([]*models.Order, error)
-	// CountPendingByUser 统计同 (app_id, user_id) 的 PENDING 订单数(下单防刷上限用,近似语义)。
-	CountPendingByUser(ctx context.Context, appID string, userID int64) (int, error)
+	// CountPendingByUser 统计同 (app_id, user_id) 未过期(expire_at>now)的 PENDING 订单数
+	// (下单防刷上限用,近似语义;已过期待关单的订单不占名额)。
+	CountPendingByUser(ctx context.Context, appID string, userID int64, now time.Time) (int, error)
 	// FindByClientOrderNo 按业务单号查(uk_app_client_order 唯一);未命中返回 (nil, nil)。
 	FindByClientOrderNo(ctx context.Context, appID, clientOrderNo string) (*models.Order, error)
 	Update(ctx context.Context, o *models.Order) error

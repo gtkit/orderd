@@ -26,20 +26,38 @@ import (
 // 放宽发送上限到 16MB 作为兜底,应用层仍应按累计字节数二次截断分页。
 const maxSendMsgSize = 16 << 20
 
+// shutdownBudget HTTP 与 gRPC 关停共用的预算(低于 k8s 默认 30s 宽限期,为 worker 停止留余量)。
+const shutdownBudget = 20 * time.Second
+
+// requestIDHeader 请求标识的 gRPC metadata 键(与 interceptor.RequestIDUnary 一致)。
+const requestIDHeader = "x-request-id"
+
 // newRESTGateway 构造 grpc-gateway REST 反向代理,经本地 gRPC 回环拨号(复用拦截器/校验)。
-// 默认 header matcher 会把 Authorization 前缀化为 grpcgateway-authorization,鉴权拦截器读不到,
-// 故显式把 authorization 透传为同名 metadata;其余头沿用默认 matcher。
+// 默认入站 matcher 会把 Authorization 前缀化为 grpcgateway-authorization(鉴权拦截器读不到),
+// 并丢弃 X-Request-Id(非 HTTP 永久头),故二者显式透传为同名 metadata;默认出站 matcher 会把
+// x-request-id 回写成 Grpc-Metadata-X-Request-Id,故单独映射回标准 X-Request-Id。其余头沿用默认规则。
 func newRESTGateway(ctx context.Context, grpcAddr string) (*runtime.ServeMux, error) {
 	dialAddr := grpcAddr
 	if host, port, serr := net.SplitHostPort(dialAddr); serr == nil && (host == "" || host == "0.0.0.0" || host == "::") {
 		dialAddr = net.JoinHostPort("127.0.0.1", port)
 	}
-	gwMux := runtime.NewServeMux(runtime.WithIncomingHeaderMatcher(func(key string) (string, bool) {
-		if strings.EqualFold(key, "authorization") {
-			return "authorization", true
-		}
-		return runtime.DefaultHeaderMatcher(key)
-	}))
+	gwMux := runtime.NewServeMux(
+		runtime.WithIncomingHeaderMatcher(func(key string) (string, bool) {
+			switch {
+			case strings.EqualFold(key, "authorization"):
+				return "authorization", true
+			case strings.EqualFold(key, requestIDHeader):
+				return requestIDHeader, true
+			}
+			return runtime.DefaultHeaderMatcher(key)
+		}),
+		runtime.WithOutgoingHeaderMatcher(func(key string) (string, bool) {
+			if key == requestIDHeader {
+				return "X-Request-Id", true
+			}
+			return runtime.MetadataHeaderPrefix + key, true
+		}),
+	)
 	if err := orderv1gw.RegisterOrderServiceHandlerFromEndpoint(ctx, gwMux, dialAddr,
 		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}); err != nil {
 		return nil, err
@@ -122,11 +140,26 @@ func Run(ctx context.Context, cfg config.Config) error {
 	logger.Info("收到关闭信号,开始优雅关闭")
 
 	app.Workers.Stop()
-	gs.GracefulStop()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 先 HTTP 后 gRPC:REST 经回环转发到 gRPC,反序会让关停窗口内的 REST 请求打到已停止的 gRPC(503)。
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
 	defer cancel()
 	if serr := hs.Shutdown(shutdownCtx); serr != nil {
 		logger.Errorw("HTTP 关闭超时", "err", serr)
+	}
+	logger.Info("HTTP 已关闭")
+	stopped := make(chan struct{})
+	go func() {
+		gs.GracefulStop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		logger.Info("gRPC 已优雅停止")
+	case <-shutdownCtx.Done():
+		// 卡住的 RPC 不能让进程无法退出:预算耗尽强停(Stop 会让挂起的 GracefulStop 返回)。
+		logger.Warn("gRPC 优雅停止超出关停预算,强制停止")
+		gs.Stop()
+		<-stopped
 	}
 	logger.Info("orderd 已退出")
 	return nil

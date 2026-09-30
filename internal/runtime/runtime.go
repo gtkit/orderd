@@ -135,9 +135,18 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 	reg.MustRegister(metrics.NewBacklogCollector(st.DB()))
 	flow := metrics.NewFlowMetrics(reg)
 
+	ref := refundapp.New(refundapp.Deps{
+		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
+		NewRefundNo: gen.RefundNo, NewEventID: idgen.UUIDv4, Enabled: cfg.RefundEnabled,
+	})
+	lateRefundApps := make(map[string]bool, len(cfg.LatePaymentRefundApps))
+	for _, a := range cfg.LatePaymentRefundApps {
+		lateRefundApps[a] = true
+	}
 	pay := paymentapp.New(paymentapp.Deps{
 		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
 		NewEventID: idgen.UUIDv4, OutTradeNo: gen.OutTradeNo, AttemptTTL: cfg.AttemptTTL, Obs: flow,
+		LateRefundApps: lateRefundApps, LateRefunder: ref,
 	})
 	// 定价:默认 fail-closed;仅显式开启(BFF 经严格服务身份)才采信调用方金额(评审 P1)。
 	var pricing models.PricingAuthority = policy.DenyAllPricing{}
@@ -156,10 +165,6 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		NewOrderNo: gen.OrderNo, NewToken: func() (string, error) { return idgen.SecureToken(32) },
 		NewEventID: idgen.UUIDv4, OrderTTL: cfg.OrderTTL, MaxPendingPerUser: cfg.MaxPendingPerUser,
 		Alerter: alerter, Obs: flow,
-	})
-	ref := refundapp.New(refundapp.Deps{
-		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
-		NewRefundNo: gen.RefundNo, NewEventID: idgen.UUIDv4, Enabled: cfg.RefundEnabled,
 	})
 	grpcSrv, err := ordergrpc.New(ordergrpc.Deps{Order: ord, Refund: ref, Store: st})
 	if err != nil {

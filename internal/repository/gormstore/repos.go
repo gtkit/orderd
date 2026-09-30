@@ -57,14 +57,21 @@ func (r orderRepo) FindByIdempotencyKey(ctx context.Context, appID, key string) 
 	return &o, nil
 }
 
-func (r orderRepo) ListExpiredPending(ctx context.Context, now time.Time, limit int) ([]*models.Order, error) {
-	var out []*models.Order
-	// status=0(PENDING)且已过期。
-	err := dbOf(ctx, r.base).Where("status = ? AND expire_at < ?", models.OrderPending, now).Limit(limit).Find(&out).Error
-	if err != nil {
-		return nil, fmt.Errorf("gormstore: list expired pending: %w", err)
+func (r orderRepo) ClaimExpiredPending(ctx context.Context, now time.Time, exclude []uint64) (*models.Order, error) {
+	// idx_status_expire(status, expire_at) 有序范围扫描;SKIP LOCKED 让多副本各取不同行。
+	q := skipLocked(dbOf(ctx, r.base)).Where("status = ? AND expire_at < ?", models.OrderPending, now)
+	if len(exclude) > 0 {
+		q = q.Where("id NOT IN ?", exclude)
 	}
-	return out, nil
+	var o models.Order
+	err := q.Order("expire_at").Limit(1).Take(&o).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gormstore: claim expired pending: %w", err)
+	}
+	return &o, nil
 }
 
 func (r orderRepo) ListStalledClosing(ctx context.Context, before time.Time, limit int) ([]*models.Order, error) {
@@ -77,11 +84,11 @@ func (r orderRepo) ListStalledClosing(ctx context.Context, before time.Time, lim
 	return out, nil
 }
 
-func (r orderRepo) CountPendingByUser(ctx context.Context, appID string, userID int64) (int, error) {
+func (r orderRepo) CountPendingByUser(ctx context.Context, appID string, userID int64, now time.Time) (int, error) {
 	var n int64
-	// idx_app_user_status 精确覆盖。
+	// idx_app_user_status 定位单用户 PENDING 行(行数受上限约束),再过滤 expire_at。
 	err := dbOf(ctx, r.base).Model(&models.Order{}).
-		Where("app_id = ? AND user_id = ? AND status = ?", appID, userID, models.OrderPending).Count(&n).Error
+		Where("app_id = ? AND user_id = ? AND status = ? AND expire_at > ?", appID, userID, models.OrderPending, now).Count(&n).Error
 	if err != nil {
 		return 0, fmt.Errorf("gormstore: count pending by user: %w", err)
 	}

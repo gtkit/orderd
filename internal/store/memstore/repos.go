@@ -81,20 +81,20 @@ func (r orderRepo) FindByIdempotencyKey(_ context.Context, appID, key string) (*
 	return nil, nil
 }
 
-func (r orderRepo) ListExpiredPending(_ context.Context, now time.Time, limit int) ([]*models.Order, error) {
+func (r orderRepo) ClaimExpiredPending(_ context.Context, now time.Time, exclude []uint64) (*models.Order, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
-	var out []*models.Order
+	var best *models.Order
 	for _, e := range r.m.d.orders {
-		if e.Status == models.OrderPending && e.ExpireAt.Before(now) {
+		if e.Status != models.OrderPending || !e.ExpireAt.Before(now) || slices.Contains(exclude, e.ID) {
+			continue
+		}
+		if best == nil || e.ExpireAt.Before(best.ExpireAt) {
 			cp := e
-			out = append(out, &cp)
-			if len(out) >= limit {
-				break
-			}
+			best = &cp
 		}
 	}
-	return out, nil
+	return best, nil
 }
 
 func (r orderRepo) ListStalledClosing(_ context.Context, before time.Time, limit int) ([]*models.Order, error) {
@@ -113,12 +113,12 @@ func (r orderRepo) ListStalledClosing(_ context.Context, before time.Time, limit
 	return out, nil
 }
 
-func (r orderRepo) CountPendingByUser(_ context.Context, appID string, userID int64) (int, error) {
+func (r orderRepo) CountPendingByUser(_ context.Context, appID string, userID int64, now time.Time) (int, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	n := 0
 	for _, e := range r.m.d.orders {
-		if e.AppID == appID && e.UserID == userID && e.Status == models.OrderPending {
+		if e.AppID == appID && e.UserID == userID && e.Status == models.OrderPending && e.ExpireAt.After(now) {
 			n++
 		}
 	}

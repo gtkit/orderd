@@ -290,7 +290,11 @@ JWT 载荷(claims):
 ### CancelOrder — 用户取消待支付订单
 从未提交网关 → `CANCELLED`;有已提交历史 → `CLOSING`,提交后 orderd 立即向渠道尽力关单一次,再由查单 worker 按渠道查单结果确认 `CLOSED` 并发 `order.closed`。
 `CLOSING` 表示"渠道侧可能仍可支付":预下单/扫码模式下用户尚未扫码时渠道查不到交易,订单会保持 `CLOSING` 直到商户单截止(`order.attemptttl`)后才落 `CLOSED`;期间用户若扫旧码付款,订单转 `PAID` 并发 `order.paid`。
-`CLOSED` 表示渠道已确认不可再支付。已 `CLOSED` 的订单再收到真实付款仍会结算为 `PAID`(资金已入账,不能丢弃),同时清空 `close_reason`、指标 `orderd_pay_confirm_total{outcome="paid_after_closed"}` 计数并发出 `paid_after_closed` 告警——该情形应当罕见,出现即需排查关单收敛。
+`CLOSED` 表示渠道已确认不可再支付。已 `CLOSED` 的订单再收到真实付款,按 app 配置二选一:
+- **默认:结算为 `PAID`**(资金已入账,权益仍可发放),同时清空 `close_reason`、指标 `orderd_pay_confirm_total{outcome="paid_after_closed"}` 计数并发出 `paid_after_closed` 告警;
+- **app 在 `order.latepaymentrefundapps` 中:自动退款、不恢复订单**(适合收到 `order.closed` 后会释放库存/名额的接入方)。订单保持 `CLOSED`、不发 `order.paid`;付款落 `paid_after_closed` 异常流水(`ListAnomalyTxns` 可查),并以退款号 `late-<流水id>` 自动发起按流水退款,由退款查单 worker 收敛;自动退款失败告警 `late_payment_refund_failed`,运维可对该流水手动 `RefundAnomalyTxn`。配置非空要求 `refund.enabled=true`,否则启动失败。
+
+`CLOSING` 期间(接入方尚未收到 `order.closed`)的付款两种配置下都结算为 `PAID`。该情形应当罕见,出现即需排查关单收敛。
 
 ### RefundOrder / GetRefund — 退款(V1 授权关闭)
 `RefundOrder`:`order_no`、`refund_amount`(V1=全额)、`reason`、`out_refund_no`(幂等键)。需 `refund:execute` + `ORDERD_REFUND_ENABLED=true`。

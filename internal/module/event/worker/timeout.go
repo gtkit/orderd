@@ -19,6 +19,8 @@ type TimeoutConfig struct {
 	RequestingStuckAfter time.Duration
 	// StalledClosingAfter:CLOSING 停留超过此时长且无活跃尝试 → 兜底落定 CLOSED(默认 30m)。
 	StalledClosingAfter time.Duration
+	// ExpireCloseBudget:每轮超时关单的时间预算(默认 20s,小于 PollInterval,轮次不重叠)。
+	ExpireCloseBudget time.Duration
 }
 
 func (c *TimeoutConfig) withDefaults() {
@@ -37,10 +39,13 @@ func (c *TimeoutConfig) withDefaults() {
 	if c.StalledClosingAfter == 0 {
 		c.StalledClosingAfter = 30 * time.Minute
 	}
+	if c.ExpireCloseBudget == 0 {
+		c.ExpireCloseBudget = 20 * time.Second
+	}
 }
 
 // TimeoutWorker 兜底扫描(评审 P0):过期 PENDING 订单关单、卡死 REQUESTING 尝试转 UNKNOWN。
-// 多副本安全靠行锁 + 状态复核(幂等),无需租约。
+// 超时关单按行认领(FOR UPDATE SKIP LOCKED),多副本各取不同订单;其余两轮靠行锁 + 状态复核(幂等)。
 type TimeoutWorker struct {
 	store   store.Store
 	order   *orderapp.Service
@@ -63,14 +68,22 @@ func (w *TimeoutWorker) RunOnce(ctx context.Context) (int, error) {
 	now := w.clock()
 	n := 0
 
-	orders, err := w.store.Reader().Orders().ListExpiredPending(ctx, now, w.cfg.BatchSize)
-	if err != nil {
-		return n, err
-	}
-	for _, o := range orders {
-		if _, cerr := w.order.CloseIfExpired(ctx, o.AppID, o.OrderNo); cerr != nil {
-			logger.Warnw("超时关单失败", "order_no", o.OrderNo, "err", cerr)
+	// 第一轮:认领式超时关单,持续到无可认领 / 时间预算用尽 / ctx 取消。预算按真实流逝时间计(不用注入时钟)。
+	// 本轮失败的订单加入排除集合:按 expire_at 排序时它总排在最前,不排除会反复卡住后续订单。
+	started := time.Now()
+	var failed []uint64
+	for ctx.Err() == nil && time.Since(started) < w.cfg.ExpireCloseBudget {
+		res, cerr := w.order.CloseNextExpired(ctx, failed)
+		if cerr != nil {
+			if res.OrderID == 0 {
+				return n, cerr // 认领本身失败(DB 不可用等):本轮终止
+			}
+			logger.Warnw("超时关单失败", "order_no", res.OrderNo, "err", cerr)
+			failed = append(failed, res.OrderID)
 			continue
+		}
+		if res.OrderID == 0 {
+			break
 		}
 		n++
 	}

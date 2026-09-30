@@ -139,6 +139,7 @@ const (
 	AnomalyKindAmountMismatch         = "amount_mismatch"          // 金额/币种与订单快照不符
 	AnomalyKindAccountChannelMismatch = "account_channel_mismatch" // 通知路由账号/渠道与尝试冻结不符
 	AnomalyKindUnknownOutTradeNo      = "unknown_out_trade_no"     // 商户单号无法绑定任何尝试(order_no 为空,app_id 取路由账号归属)
+	AnomalyKindPaidAfterClosed        = "paid_after_closed"        // 已关闭订单收到付款且 app 启用迟到付款退款策略(自动退款)
 )
 
 // PaymentTransaction 不可变财务流水(payment_transactions)。

@@ -224,7 +224,8 @@ func TestExpireAfterAttemptsConfirmedClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("改过期时间失败: %v", err)
 	}
-	st, err := h.order.CloseIfExpired(bg, "app1", out.OrderNo)
+	cl, err := h.order.CloseNextExpired(bg, nil)
+	st := cl.Status
 	if err != nil {
 		t.Fatalf("超时关单失败: %v", err)
 	}
@@ -283,7 +284,7 @@ func TestPendingOrderCap(t *testing.T) {
 		if !errors.Is(err, models.ErrTooManyPendingOrders) {
 			t.Fatalf("达限应拒,实际: %v", err)
 		}
-		n, _ := h.mem.Reader().Orders().CountPendingByUser(bg, "app1", 42)
+		n, _ := h.mem.Reader().Orders().CountPendingByUser(bg, "app1", 42, hclock)
 		if n != 2 {
 			t.Fatalf("拒绝后不得新增订单: %d", n)
 		}
@@ -374,7 +375,7 @@ func TestAmountPolicyQueryFailureRejects(t *testing.T) {
 	if _, err := h.order.CreateOrder(bg, baseCreate()); !errors.Is(err, models.ErrAmountPolicy) {
 		t.Fatalf("策略查询失败应拒单(ErrAmountPolicy),实际: %v", err)
 	}
-	if n, _ := h.mem.Reader().Orders().CountPendingByUser(bg, "app1", 42); n != 0 {
+	if n, _ := h.mem.Reader().Orders().CountPendingByUser(bg, "app1", 42, hclock); n != 0 {
 		t.Fatalf("拒单后不得有订单: %d", n)
 	}
 }

@@ -350,7 +350,8 @@ func TestAmountMismatchReleasesSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("改过期失败: %v", err)
 	}
-	st, err := h.order.CloseIfExpired(bg, "app1", out.OrderNo)
+	cl, err := h.order.CloseNextExpired(bg, nil)
+	st := cl.Status
 	if err != nil || st != models.OrderClosed {
 		t.Fatalf("到期应直接落定 CLOSED,实际 st=%v err=%v", st, err)
 	}

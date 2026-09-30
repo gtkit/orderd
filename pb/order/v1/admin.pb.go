@@ -1013,7 +1013,8 @@ type AnomalyTxnRecord struct {
 	TransactionId string                 `protobuf:"bytes,7,opt,name=transaction_id,json=transactionId,proto3" json:"transaction_id,omitempty"`
 	Amount        int64                  `protobuf:"varint,8,opt,name=amount,proto3" json:"amount,omitempty"` // 金额(分)
 	Currency      string                 `protobuf:"bytes,9,opt,name=currency,proto3" json:"currency,omitempty"`
-	// 成因:second_real_payment / amount_mismatch / account_channel_mismatch / unknown_out_trade_no;
+	// 成因:second_real_payment / amount_mismatch / account_channel_mismatch / unknown_out_trade_no /
+	// paid_after_closed(启用迟到付款退款策略的 app 在订单关闭后收到的付款,已自动发起退款);
 	// 空串=成因未落库的历史行(anomaly_kind 列上线前写入)。
 	AnomalyKind   string                 `protobuf:"bytes,10,opt,name=anomaly_kind,json=anomalyKind,proto3" json:"anomaly_kind,omitempty"`
 	PaidAt        *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=paid_at,json=paidAt,proto3" json:"paid_at,omitempty"`

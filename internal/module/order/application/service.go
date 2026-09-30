@@ -145,7 +145,7 @@ func (s *Service) CreateOrder(ctx context.Context, in CreateInput) (CreateOutcom
 	insertErr := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		// 单用户未付订单数上限(近似,事务内计数使窗口最小;超限在网关调用之前拒绝,零副作用)。
 		if s.d.MaxPendingPerUser > 0 {
-			n, err := r.Orders().CountPendingByUser(ctx, in.AppID, in.UserID)
+			n, err := r.Orders().CountPendingByUser(ctx, in.AppID, in.UserID, now)
 			if err != nil {
 				return err
 			}
@@ -332,22 +332,27 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 	return result, err
 }
 
-// CloseIfExpired 超时关单(超时 watchdog 调用,DESIGN §15):过期 PENDING → CLOSING(TIMEOUT);
-// 无活跃尝试(从未提交网关,或全部尝试已被网关确认终态)→ 同事务 CLOSING→CLOSED + order.closed;
-// 仍有活跃已提交尝试才留 CLOSING,由查单 worker 确认。尝试截止不晚于订单截止,订单到期时其
-// 全部尝试在渠道侧也已到期,故此路径不做同步关单。行锁 + 状态复核保证多副本幂等。
-func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (models.OrderStatus, error) {
-	var result models.OrderStatus
+// ExpiredClose 一次超时关单认领的结果;OrderID=0 表示没有可认领的过期订单。
+type ExpiredClose struct {
+	OrderID uint64
+	OrderNo string
+	Status  models.OrderStatus // 关单后状态(CLOSING / CLOSED)
+}
+
+// CloseNextExpired 超时关单(超时 watchdog 调用,DESIGN §15):同一事务内认领一笔已过期 PENDING 订单
+// (FOR UPDATE SKIP LOCKED,多副本各取不同行;exclude 为本轮已失败的订单 id)并关单——
+// → CLOSING(TIMEOUT);无活跃尝试(从未提交网关,或全部尝试已被网关确认终态)→ 同事务 CLOSING→CLOSED
+// + order.closed;仍有活跃已提交尝试才留 CLOSING,由查单 worker 确认。尝试截止不晚于订单截止,订单到期时
+// 其全部尝试在渠道侧也已到期,故此路径不做同步关单。事务失败时返回值仍带已认领订单的 id,供调用方排除。
+func (s *Service) CloseNextExpired(ctx context.Context, exclude []uint64) (ExpiredClose, error) {
+	var res ExpiredClose
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		o, err := r.Orders().GetByOrderNo(ctx, appID, orderNo, true)
-		if err != nil {
+		o, err := r.Orders().ClaimExpiredPending(ctx, s.d.Clock(), exclude)
+		if err != nil || o == nil {
 			return err
 		}
-		result = o.Status
-		if o.Status != models.OrderPending || !o.ExpireAt.Before(s.d.Clock()) {
-			return nil // 已被处理或未真正过期:幂等返回
-		}
-		active, err := r.Attempts().GetActiveByOrder(ctx, orderNo, true)
+		res.OrderID, res.OrderNo = o.ID, o.OrderNo
+		active, err := r.Attempts().GetActiveByOrder(ctx, o.OrderNo, true)
 		if err != nil {
 			return err
 		}
@@ -388,10 +393,10 @@ func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (mo
 				return err
 			}
 		}
-		result = o.Status
+		res.Status = o.Status
 		return nil
 	})
-	return result, err
+	return res, err
 }
 
 // GetOrder 按订单号或业务单号回查(镜像失步兜底,恢复 token);恰一个键由 transport 校验,
