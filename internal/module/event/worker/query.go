@@ -27,6 +27,8 @@ type QueryConfig struct {
 	BaseBackoff    time.Duration
 	MaxBackoff     time.Duration
 	GatewayTimeout time.Duration // 单次网关调用强制超时(评审 P1)
+	// ExpireGrace:CLOSING 尝试查得"渠道无此单"时,商户单截止后再宽限此时长才确认关闭(吸收时钟偏差)。
+	ExpireGrace time.Duration
 }
 
 func (c *QueryConfig) withDefaults() {
@@ -53,6 +55,9 @@ func (c *QueryConfig) withDefaults() {
 	}
 	if c.MaxBackoff == 0 {
 		c.MaxBackoff = 5 * time.Minute
+	}
+	if c.ExpireGrace == 0 {
+		c.ExpireGrace = 2 * time.Minute
 	}
 }
 
@@ -126,10 +131,15 @@ func (q *QueryWorker) handle(ctx context.Context, a *models.PaymentAttempt) {
 	case paygateway.QueryClosed:
 		_ = q.payment.CloseAttemptAndMaybeOrder(ctx, a.OutTradeNo)
 	case paygateway.QueryNotExist:
-		if a.Status == models.AttemptClosing || a.QueryCount+1 >= q.cfg.MaxQueries {
-			// CLOSING 确证不存在,或 UNKNOWN 多次查证仍不存在 → 关闭(§9)。
+		switch {
+		case a.Status == models.AttemptClosing && q.clock().Before(a.ExpireAt.Add(q.cfg.ExpireGrace)):
+			// 预下单/扫码模式下"无此单"只表示用户尚未扫码,二维码在商户单截止前仍可支付:
+			// 此时落 CLOSED 会把"仍可付"误判为"不可付"(随后入账只能走 CLOSED→PAID)。到期前继续观察。
+			q.reschedule(ctx, a)
+		case a.Status == models.AttemptClosing || a.QueryCount+1 >= q.cfg.MaxQueries:
+			// CLOSING 商户单已到期且渠道无单,或 UNKNOWN(客户端未拿到调起参数)多次查证不存在 → 关闭(§9)。
 			_ = q.payment.CloseAttemptAndMaybeOrder(ctx, a.OutTradeNo)
-		} else {
+		default:
 			q.reschedule(ctx, a) // UNKNOWN 未达阈值,继续退避观察
 		}
 	default: // QueryError

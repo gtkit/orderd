@@ -13,6 +13,7 @@ import (
 	paymentapp "github.com/gtkit/orderd/internal/module/payment/application"
 	"github.com/gtkit/orderd/internal/shared/account"
 	"github.com/gtkit/orderd/internal/shared/alert"
+	"github.com/gtkit/orderd/internal/shared/obs"
 	"github.com/gtkit/orderd/internal/store"
 )
 
@@ -33,6 +34,8 @@ type Deps struct {
 	MaxPendingPerUser int
 	// Alerter 高等级告警(CLOSING 滞留兜底触发时上报;nil → Nop)。
 	Alerter alert.Alerter
+	// Obs 关键路径埋点端口(nil → Nop)。
+	Obs obs.FlowObserver
 }
 
 // Service 订单应用服务。
@@ -48,6 +51,9 @@ func New(d Deps) *Service {
 	}
 	if d.Alerter == nil {
 		d.Alerter = alert.Nop{}
+	}
+	if d.Obs == nil {
+		d.Obs = obs.Nop{}
 	}
 	return &Service{d: d}
 }
@@ -218,8 +224,13 @@ func (s *Service) PreparePayment(ctx context.Context, appID string, userID int64
 }
 
 // CancelOrder 用户取消待支付订单(§8,判活与置状态同事务)。
+// 有活跃尝试时,事务提交后事务外尽力向渠道关单一次以缩窄"渠道侧仍可支付"的窗口;
+// 关单结果不改变已提交状态,CLOSING→CLOSED 的落定由查单 worker 按渠道查单结果完成。
 func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID int64) (models.OrderStatus, error) {
-	var result models.OrderStatus
+	var (
+		result  models.OrderStatus
+		closing *models.PaymentAttempt
+	)
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		o, err := r.Orders().GetByOrderNo(ctx, appID, orderNo, true)
 		if err != nil {
@@ -244,13 +255,7 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 		prev := o.Status
 		switch {
 		case !submitted:
-			// 从未提交网关:安全进入 CANCELLED;顺手关闭未提交的活跃尝试(CREATED)。
-			if active != nil {
-				active.Status = models.AttemptClosed
-				if err := r.Attempts().Update(ctx, active); err != nil {
-					return err
-				}
-			}
+			// 从未提交网关(尝试一律以 REQUESTING 起始,故此时必无活跃尝试):安全进入 CANCELLED。
 			o.Status = models.OrderCancelled
 			o.CloseReason = models.CloseUserCancel
 			o.AggregateVersion++
@@ -269,12 +274,13 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 			if err := eventapp.WriteLog(ctx, r, o, prev, "user", "用户取消"); err != nil {
 				return err
 			}
-		case active != nil && active.Status.Active():
+		case active != nil:
 			// 存在活跃的已提交尝试:转 CLOSING(user_cancel),由查单 worker 网关确认后才 CLOSED。
 			active.Status = models.AttemptClosing
 			if err := r.Attempts().Update(ctx, active); err != nil {
 				return err
 			}
+			closing = active
 			o.Status = models.OrderClosing
 			o.CloseReason = models.CloseUserCancel
 			o.AggregateVersion++
@@ -320,13 +326,16 @@ func (s *Service) CancelOrder(ctx context.Context, appID, orderNo string, userID
 		result = o.Status
 		return nil
 	})
+	if err == nil && closing != nil {
+		s.d.Payment.CloseAtGateway(ctx, closing)
+	}
 	return result, err
 }
 
 // CloseIfExpired 超时关单(超时 watchdog 调用,DESIGN §15):过期 PENDING → CLOSING(TIMEOUT);
-// 从未提交网关、或曾提交但已无活跃尝试(全部尝试已被网关确认终态)→ 同事务 CLOSING→CLOSED
-// + order.closed;仍有活跃已提交尝试才留 CLOSING,由查单 worker 确认。
-// 行锁 + 状态复核保证多副本幂等。
+// 无活跃尝试(从未提交网关,或全部尝试已被网关确认终态)→ 同事务 CLOSING→CLOSED + order.closed;
+// 仍有活跃已提交尝试才留 CLOSING,由查单 worker 确认。尝试截止不晚于订单截止,订单到期时其
+// 全部尝试在渠道侧也已到期,故此路径不做同步关单。行锁 + 状态复核保证多副本幂等。
 func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (models.OrderStatus, error) {
 	var result models.OrderStatus
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
@@ -338,16 +347,12 @@ func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (mo
 		if o.Status != models.OrderPending || !o.ExpireAt.Before(s.d.Clock()) {
 			return nil // 已被处理或未真正过期:幂等返回
 		}
-		submitted, err := r.Attempts().ExistsSubmitted(ctx, orderNo)
-		if err != nil {
-			return err
-		}
 		active, err := r.Attempts().GetActiveByOrder(ctx, orderNo, true)
 		if err != nil {
 			return err
 		}
 		prev := o.Status
-		if active != nil && active.Status.Active() {
+		if active != nil {
 			active.Status = models.AttemptClosing
 			if err := r.Attempts().Update(ctx, active); err != nil {
 				return err
@@ -362,16 +367,9 @@ func (s *Service) CloseIfExpired(ctx context.Context, appID, orderNo string) (mo
 		if err := eventapp.WriteLog(ctx, r, o, prev, "system", "支付超时"); err != nil {
 			return err
 		}
-		if !submitted || active == nil {
-			// 立即确认关闭:从未提交网关(无网关交互),或曾提交但已无活跃尝试(全部尝试
-			// 均被网关确认终态,无需再求证——不落定则无 worker 认领,订单永久滞留 CLOSING)。
-			// 活跃尝试(CREATED)→CLOSED,订单 CLOSING→CLOSED + closed 事件。
-			if active != nil {
-				active.Status = models.AttemptClosed
-				if err := r.Attempts().Update(ctx, active); err != nil {
-					return err
-				}
-			}
+		if active == nil {
+			// 立即确认关闭:无活跃尝试意味着从未提交网关,或全部尝试均被网关确认终态,无需再求证
+			// ——不落定则无 worker 认领,订单永久滞留 CLOSING。
 			prev2 := o.Status
 			o.Status = models.OrderClosed
 			o.AggregateVersion++
@@ -435,6 +433,7 @@ func (s *Service) GetOrder(ctx context.Context, appID string, userID int64, orde
 // order_closing_stalled(不落定不告警,对单笔订单天然恰好一次)——兜底被触发说明存在
 // 未收敛的生产路径,需排查。
 func (s *Service) CloseStalledClosing(ctx context.Context, appID, orderNo string) (closed bool, err error) {
+	var closingSince time.Time
 	err = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		o, err := r.Orders().GetByOrderNo(ctx, appID, orderNo, true)
 		if err != nil {
@@ -451,6 +450,7 @@ func (s *Service) CloseStalledClosing(ctx context.Context, appID, orderNo string
 			return nil // 仍有活跃尝试:正常收敛属查单 worker,不越权
 		}
 		prev := o.Status
+		closingSince = o.UpdatedAt // CLOSING 期间订单无其它写入,updated_at 即进入 CLOSING 的时刻
 		o.Status = models.OrderClosed
 		o.AggregateVersion++
 		if err := r.Orders().Update(ctx, o); err != nil {
@@ -474,6 +474,7 @@ func (s *Service) CloseStalledClosing(ctx context.Context, appID, orderNo string
 		return false, err
 	}
 	if closed {
+		s.d.Obs.ClosingSettled(obs.ClosingViaWatchdog, max(s.d.Clock().Sub(closingSince).Seconds(), 0))
 		s.d.Alerter.Anomaly(ctx, "order_closing_stalled", map[string]any{
 			"app_id": appID, "order_no": orderNo,
 		})

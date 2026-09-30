@@ -98,7 +98,7 @@ message MembershipBenefit {
 |---|---|
 | `order.paid` | 发 VIP + 落账单 + 本地镜像置 Paid→Delivered(幂等,见 §3.3) |
 | `order.refunded` | 本地镜像置 Refunded,回收/调整权益(按业务) |
-| `order.closed` | 本地镜像置 Closed |
+| `order.closed` | 本地镜像置 Closed(非终态:关闭后迟到付款会再发 `order.paid`,`previous_status=CLOSED`,须照常发权益) |
 
 事件传输、验签(HMAC + key 轮换)、幂等(inbox)全部复用 `sdk/orderevents` + `sdk/orderevents/inbox_schema.sql`。
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gtkit/logger"
 	"github.com/gtkit/orderd/internal/models"
 	eventapp "github.com/gtkit/orderd/internal/module/event/application"
 	"github.com/gtkit/orderd/internal/paygateway"
@@ -19,6 +20,9 @@ import (
 	"github.com/gtkit/orderd/internal/shared/obs"
 	"github.com/gtkit/orderd/internal/store"
 )
+
+// minPayWindow 调起支付要求的最小剩余支付窗口:订单或待复用尝试距截止不足此值时不再向渠道下单。
+const minPayWindow = time.Minute
 
 // Deps 是 payment 服务的依赖。
 type Deps struct {
@@ -76,108 +80,111 @@ type PrepareOutcome struct {
 	Reused    bool
 }
 
-// PreparePayment 为已存在的 PENDING 订单(重新)调起支付。
+// attemptPlan 阶段 A 的决策:已选定可下单的尝试(复用或新建),或指出须先在渠道侧关闭的旧尝试。
+type attemptPlan struct {
+	attemptNo  int32
+	outTradeNo string
+	payAcct    string
+	expireAt   time.Time
+	reused     bool
+	amount     int64
+	subject    string
+	currency   string
+	replace    *models.PaymentAttempt // 非 nil:换渠道 / 旧尝试将到期,须先关闭它再新建
+}
+
+func (p *attemptPlan) take(a *models.PaymentAttempt, reused bool) {
+	p.attemptNo, p.outTradeNo, p.payAcct, p.expireAt, p.reused = a.AttemptNo, a.OutTradeNo, a.PayAccountID, a.ExpireAt, reused
+}
+
+// rejection 调起支付的业务拒绝原因(obs.PrepareReject*),经 %w 挂在领域错误上供出口埋点,
+// 不改变领域错误的 errors.Is 判定;文本附在错误信息末尾便于排查。
+type rejection string
+
+func (r rejection) Error() string { return "(reason=" + string(r) + ")" }
+
+// PreparePayment 为已存在的 PENDING 订单(重新)调起支付;业务拒绝按原因计数。
+func (s *Service) PreparePayment(ctx context.Context, in PrepareInput) (PrepareOutcome, error) {
+	out, err := s.preparePayment(ctx, in)
+	if r, ok := errors.AsType[rejection](err); ok {
+		s.d.Obs.PrepareRejected(string(r))
+	}
+	return out, err
+}
+
+// preparePayment 调起支付主流程。
 //
 // 阶段化(网关调用不在事务内):
 //
-//	A(tx):锁订单确认 PENDING → 决定复用/换渠道/新建尝试 → 尝试置 REQUESTING(标记已提交网关);
+//	A(tx):锁订单确认 PENDING → 按活跃尝试状态决定复用 / 替换 / 新建 → 选定尝试置 REQUESTING;
+//	A2    :须替换旧 READY 尝试时,事务外向渠道关单,再在事务内复核后 CLOSED 旧尝试 + 新建;
 //	B     :调网关下单(不持锁);
 //	C(tx):复核订单仍 PENDING → 尝试置 READY + prepay。
-func (s *Service) PreparePayment(ctx context.Context, in PrepareInput) (PrepareOutcome, error) {
+func (s *Service) preparePayment(ctx context.Context, in PrepareInput) (PrepareOutcome, error) {
 	if !in.PayMethod.Valid() {
 		return PrepareOutcome{}, fmt.Errorf("%w: 支付方式非法", models.ErrIllegalTransition)
 	}
 	channel := in.PayMethod.Channel()
 
 	// --- 阶段 A ---
-	var (
-		attemptNo  int32
-		outTradeNo string
-		payAcct    string
-		reused     bool
-		expireAt   time.Time
-		amount     int64
-		subject    string
-		currency   string
-	)
+	var plan attemptPlan
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		o, err := r.Orders().GetByOrderNo(ctx, in.AppID, in.OrderNo, true)
+		o, err := s.lockPendingOrder(ctx, r, in)
 		if err != nil {
 			return err
 		}
-		if o.UserID != in.UserID {
-			return models.ErrOrderNotOwned
-		}
-		if o.Status != models.OrderPending {
-			return models.ErrOrderNotPending
-		}
 		// 金额/标题/币种来自订单权威快照,传给网关(评审 P0:不可漏传导致 0 金额空标题)。
-		amount, subject, currency = o.PayAmount, o.ProductTitle, sqlutil.OrDefault(o.Currency, "CNY")
+		plan.amount, plan.subject, plan.currency = o.PayAmount, o.ProductTitle, sqlutil.OrDefault(o.Currency, "CNY")
 		active, err := r.Attempts().GetActiveByOrder(ctx, in.OrderNo, true)
 		if err != nil {
 			return err
 		}
-		if active != nil && active.Channel == channel {
-			// 复用当前活跃尝试(同渠道):重新驱动到 REQUESTING 以便再取 prepay。
-			if active.Status == models.AttemptCreated || active.Status == models.AttemptReady || active.Status == models.AttemptUnknown {
-				active.Status = models.AttemptRequesting
-				if err := r.Attempts().Update(ctx, active); err != nil {
-					return err
-				}
-			}
-			attemptNo, outTradeNo, payAcct, expireAt, reused = active.AttemptNo, active.OutTradeNo, active.PayAccountID, active.ExpireAt, true
+		switch {
+		case active == nil:
+			return s.newAttempt(ctx, r, in, channel, o, &plan)
+		case active.Status == models.AttemptClosing:
+			return fmt.Errorf("%w: 活跃尝试关单确认中,待查单收敛后重试%w", models.ErrActiveAttemptExists, rejection(obs.PrepareRejectClosing))
+		case active.Status == models.AttemptReady && (active.Channel != channel || !active.ExpireAt.After(s.d.Clock().Add(minPayWindow))):
+			// 换渠道,或同渠道旧尝试即将到期:不能在渠道侧仍可支付的旧单旁边开新单,先关旧单(事务外)。
+			plan.replace = active
 			return nil
-		}
-		if active != nil {
-			// 换渠道:活跃尝试若已提交网关(结果未知/关单中),不能并发新建 → 等 reconcile 关闭(评审 #5)。
-			if active.Status.SubmittedToGateway() {
-				return fmt.Errorf("%w: 存在已提交网关的活跃尝试,换渠道需待其关闭", models.ErrActiveAttemptExists)
-			}
-			// 未提交(CREATED/READY):可安全关闭以腾出活跃槽。
-			active.Status = models.AttemptClosed
+		case active.Channel != channel:
+			// 异渠道 REQUESTING/UNKNOWN:提交结果未定,不能并发开新单;分别由超时 watchdog / 查单 worker 收敛。
+			return fmt.Errorf("%w: 存在结果未定的活跃尝试,换渠道需待其收敛%w", models.ErrActiveAttemptExists, rejection(obs.PrepareRejectForeignInflight))
+		default:
+			// 同渠道 REQUESTING/READY/UNKNOWN:重新驱动到 REQUESTING 以便再取 prepay
+			// (并发幂等重放共用同一在途商户单号,不拒绝)。
+			active.Status = models.AttemptRequesting
 			if err := r.Attempts().Update(ctx, active); err != nil {
 				return err
 			}
+			plan.take(active, true)
+			return nil
 		}
-		// 解析新渠道账号并新建尝试。
-		acct, err := s.d.Accounts.Resolve(ctx, in.AppID, channel)
-		if err != nil {
-			return err
-		}
-		cnt, err := r.Attempts().CountByOrder(ctx, in.OrderNo)
-		if err != nil {
-			return err
-		}
-		na := &models.PaymentAttempt{
-			AppID: in.AppID, OrderNo: in.OrderNo, AttemptNo: int32(cnt + 1),
-			Channel: channel, PayAccountID: acct.PayAccountID, ConfigVersion: acct.ConfigVersion,
-			OutTradeNo: s.d.OutTradeNo(), Status: models.AttemptRequesting,
-			ExpireAt: s.d.Clock().Add(s.d.AttemptTTL),
-		}
-		if err := r.Attempts().Insert(ctx, na); err != nil {
-			return err
-		}
-		attemptNo, outTradeNo, payAcct, expireAt, reused = na.AttemptNo, na.OutTradeNo, na.PayAccountID, na.ExpireAt, false
-		return nil
 	})
 	if err != nil {
 		return PrepareOutcome{}, err
 	}
+	if plan.replace != nil {
+		if err := s.replaceAttempt(ctx, in, channel, &plan); err != nil {
+			return PrepareOutcome{}, err
+		}
+	}
 
 	// --- 阶段 B:调网关(不持锁,强制超时)---
-	gw, err := s.d.Router.Resolve(channel, payAcct)
+	gw, err := s.d.Router.Resolve(channel, plan.payAcct)
 	if err != nil {
-		s.markAttemptUnknown(outTradeNo)
+		s.markAttemptUnknown(plan.outTradeNo)
 		return PrepareOutcome{}, err
 	}
 	gctx, cancel := context.WithTimeout(ctx, s.gwTimeout())
 	defer cancel()
 	pr, err := gw.Prepare(gctx, paygateway.PrepareInput{
-		Channel: channel, PayAccountID: payAcct, OutTradeNo: outTradeNo,
-		Amount: amount, Subject: subject, Currency: currency, ClientIP: in.ClientIP, ExpireAt: expireAt,
+		Channel: channel, PayAccountID: plan.payAcct, OutTradeNo: plan.outTradeNo,
+		Amount: plan.amount, Subject: plan.subject, Currency: plan.currency, ClientIP: in.ClientIP, ExpireAt: plan.expireAt,
 	})
 	if err != nil {
-		s.markAttemptUnknown(outTradeNo) // 结果未知 → 交由查单 worker
+		s.markAttemptUnknown(plan.outTradeNo) // 结果未知 → 交由查单 worker
 		return PrepareOutcome{}, fmt.Errorf("网关下单失败: %w", err)
 	}
 
@@ -191,7 +198,7 @@ func (s *Service) PreparePayment(ctx context.Context, in PrepareInput) (PrepareO
 			// 期间被取消/关单:不再置就绪,尝试留待 reconcile(评审 #8 取消 vs 建尝试竞态)。
 			return models.ErrOrderNotPending
 		}
-		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, false)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, plan.outTradeNo, false)
 		if err != nil {
 			return err
 		}
@@ -205,7 +212,106 @@ func (s *Service) PreparePayment(ctx context.Context, in PrepareInput) (PrepareO
 	if err != nil {
 		return PrepareOutcome{}, err
 	}
-	return PrepareOutcome{AttemptNo: attemptNo, AppParams: pr.AppParams, Status: models.OrderPending, ExpireAt: expireAt, Reused: reused}, nil
+	return PrepareOutcome{AttemptNo: plan.attemptNo, AppParams: pr.AppParams, Status: models.OrderPending, ExpireAt: plan.expireAt, Reused: plan.reused}, nil
+}
+
+// lockPendingOrder 锁订单并校验归属、PENDING 与剩余支付窗口。
+func (s *Service) lockPendingOrder(ctx context.Context, r store.Repos, in PrepareInput) (*models.Order, error) {
+	o, err := r.Orders().GetByOrderNo(ctx, in.AppID, in.OrderNo, true)
+	if err != nil {
+		return nil, err
+	}
+	if o.UserID != in.UserID {
+		return nil, models.ErrOrderNotOwned
+	}
+	if o.Status != models.OrderPending {
+		return nil, models.ErrOrderNotPending
+	}
+	if !o.ExpireAt.After(s.d.Clock().Add(minPayWindow)) {
+		return nil, fmt.Errorf("%w: 订单剩余支付窗口不足 %s%w", models.ErrOrderNotPending, minPayWindow, rejection(obs.PrepareRejectPayWindow))
+	}
+	return o, nil
+}
+
+// newAttempt 解析渠道账号并新建 REQUESTING 尝试。截止取 AttemptTTL 与订单截止的较早者:
+// 该值作为 time_expire 传给渠道,订单到期时渠道侧二维码/交易随之失效。
+func (s *Service) newAttempt(ctx context.Context, r store.Repos, in PrepareInput, channel string, o *models.Order, plan *attemptPlan) error {
+	acct, err := s.d.Accounts.Resolve(ctx, in.AppID, channel)
+	if err != nil {
+		return err
+	}
+	cnt, err := r.Attempts().CountByOrder(ctx, in.OrderNo)
+	if err != nil {
+		return err
+	}
+	expireAt := s.d.Clock().Add(s.d.AttemptTTL)
+	if o.ExpireAt.Before(expireAt) {
+		expireAt = o.ExpireAt
+	}
+	na := &models.PaymentAttempt{
+		AppID: in.AppID, OrderNo: in.OrderNo, AttemptNo: int32(cnt + 1),
+		Channel: channel, PayAccountID: acct.PayAccountID, ConfigVersion: acct.ConfigVersion,
+		OutTradeNo: s.d.OutTradeNo(), Status: models.AttemptRequesting, ExpireAt: expireAt,
+	}
+	if err := r.Attempts().Insert(ctx, na); err != nil {
+		return err
+	}
+	plan.take(na, false)
+	return nil
+}
+
+// replaceAttempt 换渠道 / 旧尝试将到期:事务外向渠道关闭旧 READY 尝试,再在事务内锁订单→锁旧尝试复核后替换。
+// 关单成功 → 旧尝试 CLOSED + 新建;失败 → 旧尝试 CLOSING(提交后返回 ErrActiveAttemptExists),
+// 由查单 worker 按渠道查单结果收敛,期间不在渠道侧仍可支付的旧单旁边开新单。
+func (s *Service) replaceAttempt(ctx context.Context, in PrepareInput, channel string, plan *attemptPlan) error {
+	closed := s.CloseAtGateway(ctx, plan.replace)
+	var closingKept bool
+	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		o, err := s.lockPendingOrder(ctx, r, in)
+		if err != nil {
+			return err
+		}
+		old, err := r.Attempts().GetByOutTradeNo(ctx, plan.replace.OutTradeNo, true)
+		if err != nil {
+			return err
+		}
+		if old == nil || old.Status != models.AttemptReady {
+			return fmt.Errorf("%w: 旧尝试已被并发推进", models.ErrActiveAttemptExists)
+		}
+		if !closed {
+			old.Status = models.AttemptClosing
+			closingKept = true
+			return r.Attempts().Update(ctx, old)
+		}
+		old.Status = models.AttemptClosed
+		if err := r.Attempts().Update(ctx, old); err != nil {
+			return err
+		}
+		return s.newAttempt(ctx, r, in, channel, o, plan)
+	})
+	if err != nil {
+		return err
+	}
+	if closingKept {
+		return fmt.Errorf("%w: 旧尝试渠道关单未确认,待查单收敛后重试%w", models.ErrActiveAttemptExists, rejection(obs.PrepareRejectCloseFailed))
+	}
+	return nil
+}
+
+// CloseAtGateway 事务外尽力向渠道关闭一个尝试,返回是否成功。它只负责缩窄"渠道侧仍可支付"的窗口:
+// 失败只记日志;尝试/订单从 CLOSING 到 CLOSED 的落定一律由查单 worker 按渠道查单结果完成。
+func (s *Service) CloseAtGateway(ctx context.Context, a *models.PaymentAttempt) bool {
+	gw, err := s.d.Router.Resolve(a.Channel, a.PayAccountID)
+	if err == nil {
+		gctx, cancel := context.WithTimeout(ctx, s.gwTimeout())
+		defer cancel()
+		err = gw.Close(gctx, paygateway.CloseInput{Channel: a.Channel, PayAccountID: a.PayAccountID, OutTradeNo: a.OutTradeNo})
+	}
+	if err != nil {
+		logger.Warnw("渠道关单失败,交查单 worker 收敛", "channel", a.Channel, "out_trade_no", a.OutTradeNo, "err", err)
+		return false
+	}
+	return true
 }
 
 // markAttemptUnknown 网关下单失败/超时后,把该尝试置为 UNKNOWN(结果未知),交查单 worker 收敛。
@@ -250,27 +356,41 @@ type ConfirmResult struct {
 	Outcome     string // paid / duplicate / anomaly
 	Anomaly     bool
 	AnomalyKind string
+	// Recovered 结算前订单为 CLOSED(关闭后迟到付款):Outcome 仍为 paid,埋点与告警单列。
+	Recovered bool
 }
 
 // ConfirmPaySuccess 在单事务内完成 §7,并遵守两条资金铁律:
-//   - 资金真相必落库:第二笔真实付款/金额账号不符的真实交易,追加 anomaly 流水后提交(不回滚丢证),
-//     再事务外告警(评审 #4);
+//   - 资金真相必落库:第二笔真实付款/金额账号不符/无法绑定尝试的真实交易,追加 anomaly 流水后提交
+//     (不回滚丢证),再事务外告警(评审 #4);
 //   - CAS 唯一成功:仅一笔跃迁订单到 PAID,胜出后关其它活跃尝试并写成功账号快照(评审 #6)。
 func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (ConfirmResult, error) {
 	if in.Amount <= 0 {
 		return ConfirmResult{}, fmt.Errorf("%w: 确认金额必须为正", models.ErrInvalidAmount)
 	}
-	var res ConfirmResult
-	var alertOrderNo string
-	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+	// 路由账号在事务外解析:供结算快照(mch_id/pay_app_id)与无法绑定尝试时的流水归属。
+	// 解析失败返回错误让渠道重投,不静默写空快照。
+	acct, err := s.d.Accounts.ResolveByID(ctx, in.PayAccountID)
+	if err != nil {
+		return ConfirmResult{}, fmt.Errorf("解析路由账号 %s 失败: %w", in.PayAccountID, err)
+	}
+	var (
+		res          ConfirmResult
+		alertOrderNo string
+		prevReason   models.CloseReason
+	)
+	err = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		// 权威身份由 out_trade_no 唯一派生(评审 P0):不信任回调传入的 order_no/app_id。
 		attempt, err := r.Attempts().GetByOutTradeNo(ctx, in.OutTradeNo, false)
 		if err != nil {
 			return err
 		}
 		if attempt == nil {
-			// 未知商户单号的真实通知:无法安全绑定订单 → 拒绝结算 + 高等级告警(不静默)。
-			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: "unknown_out_trade_no"}
+			// 未知商户单号的真实通知:无法安全绑定订单 → 资金事实按路由账号归属落 anomaly 流水(order_no 为空),不结算。
+			if err := insertAnomalyTxn(ctx, r, acct.AppID, "", in, nil, models.AnomalyKindUnknownOutTradeNo); err != nil {
+				return err
+			}
+			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindUnknownOutTradeNo}
 			return nil
 		}
 		alertOrderNo = attempt.OrderNo
@@ -281,7 +401,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 
 		// 通知路由到的渠道/账号必须与该尝试冻结的一致;不一致=错误路由/映射 → anomaly 落库不结算。
 		if in.Channel != attempt.Channel || in.PayAccountID != attempt.PayAccountID {
-			if err := s.insertAnomalyTxn(ctx, r, o, in, attempt, models.AnomalyKindAccountChannelMismatch); err != nil {
+			if err := insertAnomalyTxn(ctx, r, o.AppID, o.OrderNo, in, attempt, models.AnomalyKindAccountChannelMismatch); err != nil {
 				return err
 			}
 			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindAccountChannelMismatch}
@@ -298,12 +418,8 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 			}
 			// 该交易已结算过本订单:若尝试仍占活跃槽(状态被并发回写打回/前次事务半途),
 			// 补推进到 PAID 释放槽位;不推进则查单 worker 每轮"查到已付→duplicate→重排"永不收敛。
-			// 置 PAID 只释放 active_order 槽位、不申请,不会触发唯一守卫冲突。
-			if attempt.Status.Active() {
-				attempt.Status = models.AttemptPaid
-				if err := r.Attempts().Update(ctx, attempt); err != nil {
-					return err
-				}
+			if err := settleAttempt(ctx, r, attempt); err != nil {
+				return err
 			}
 			res = ConfirmResult{Outcome: "duplicate"}
 			return nil
@@ -315,22 +431,23 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		// 不改订单(评审 #4)。准入用 CanSettlePayment 而非状态机全表:REFUNDING→PAID 是
 		// 退款失败回退专用边,支付确认借道会把退款中订单错误拉回 PAID(覆盖快照+二次发事件)。
 		if !models.CanSettlePayment(o.Status) {
-			if err := s.insertAnomalyTxn(ctx, r, o, in, attempt, models.AnomalyKindSecondRealPayment); err != nil {
+			if err := insertAnomalyTxn(ctx, r, o.AppID, o.OrderNo, in, attempt, models.AnomalyKindSecondRealPayment); err != nil {
 				return err
 			}
-			if attempt.Status.Active() {
-				attempt.Status = models.AttemptPaid
-				if err := r.Attempts().Update(ctx, attempt); err != nil {
-					return err
-				}
+			if err := settleAttempt(ctx, r, attempt); err != nil {
+				return err
 			}
 			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindSecondRealPayment}
 			return nil
 		}
 
-		// 3) 金额/币种不符的真实交易:落 anomaly 流水,不改订单。
+		// 3) 金额/币种不符的真实交易:落 anomaly 流水,不改订单。渠道侧该单已支付终态,尝试同样
+		// 收敛 PAID 释放活跃槽——否则订单卡在"PENDING 但无可用尝试",到期后只能靠滞留兜底关闭。
 		if mismatch {
-			if err := s.insertAnomalyTxn(ctx, r, o, in, attempt, models.AnomalyKindAmountMismatch); err != nil {
+			if err := insertAnomalyTxn(ctx, r, o.AppID, o.OrderNo, in, attempt, models.AnomalyKindAmountMismatch); err != nil {
+				return err
+			}
+			if err := settleAttempt(ctx, r, attempt); err != nil {
 				return err
 			}
 			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindAmountMismatch}
@@ -338,7 +455,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		}
 
 		// 4) 正常胜出:落流水(冲突重读比对,评审 P0)+ 尝试 PAID + 关其它活跃 + 订单 CAS→PAID + 快照 + 事件。
-		ins, err := s.insertWinningTxn(ctx, r, o, in, attempt)
+		ins, err := insertWinningTxn(ctx, r, o, in, attempt)
 		if err != nil {
 			return err
 		}
@@ -355,12 +472,14 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		if err := r.Attempts().Update(ctx, attempt); err != nil {
 			return err
 		}
-		if err := s.closeOtherActiveAttempts(ctx, r, o.OrderNo, attempt); err != nil {
+		if err := closeOtherActiveAttempts(ctx, r, o.OrderNo, attempt); err != nil {
 			return err
 		}
 
 		prev := o.Status
+		prevReason = o.CloseReason
 		o.Status = models.OrderPaid
+		o.CloseReason = models.CloseNone // CLOSING/CLOSED 迟到付款胜出:不留"已支付但带关单原因"的矛盾读数
 		o.AggregateVersion++
 		o.TradeNo = in.TransactionID
 		o.PaidAt = sqlutil.Time(in.PaidAt)
@@ -370,10 +489,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		o.SettledOutTradeNo = attempt.OutTradeNo
 		o.SettledPayAccountID = attempt.PayAccountID
 		o.SettledConfigVersion = attempt.ConfigVersion
-		if acct, aerr := s.d.Accounts.ResolveByID(ctx, attempt.PayAccountID); aerr == nil {
-			o.SettledMchID = acct.MchID
-			o.SettledPayAppID = acct.PayAppID
-		}
+		o.SettledMchID, o.SettledPayAppID = acct.MchID, acct.PayAppID
 		if err := r.Orders().Update(ctx, o); err != nil {
 			return err
 		}
@@ -388,7 +504,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		if err := eventapp.WriteEvent(ctx, r, o.AppID, o.OrderNo, env); err != nil {
 			return err
 		}
-		res = ConfirmResult{Outcome: "paid"}
+		res = ConfirmResult{Outcome: "paid", Recovered: prev == models.OrderClosed}
 		return nil
 	})
 	if err != nil {
@@ -400,7 +516,16 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 			"amount": in.Amount, "channel": in.Channel, "pay_account_id": in.PayAccountID,
 		})
 	}
-	s.d.Obs.ConfirmOutcome(res.Outcome) // 事务外纯内存计数
+	outcome := res.Outcome
+	if res.Recovered {
+		// 已关闭订单收到真实付款:资金已正确结算,但说明关单收敛与渠道侧可付窗口存在偏差,须可见。
+		outcome = "paid_after_closed"
+		s.d.Alerter.Anomaly(ctx, "paid_after_closed", map[string]any{
+			"order_no": alertOrderNo, "out_trade_no": in.OutTradeNo, "txn_id": in.TransactionID,
+			"amount": in.Amount, "channel": in.Channel, "close_reason": int(prevReason),
+		})
+	}
+	s.d.Obs.ConfirmOutcome(outcome) // 事务外纯内存计数
 	return res, nil
 }
 
@@ -452,7 +577,8 @@ func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string) erro
 // CloseAttemptAndMaybeOrder 查单确证不存在/已关闭 → 尝试转 CLOSED;
 // 若订单处于 CLOSING 且已无活跃尝试,则订单转 CLOSED 并发 order.closed 事件(完成取消/关单闭环)。
 func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo string) error {
-	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+	var closingSince time.Time // 非零=本次把订单由 CLOSING 落定为 CLOSED(updated_at 即进入 CLOSING 的时刻)
+	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		// 统一锁序订单→尝试:先无锁读取不可变的 app_id/order_no,再锁订单,再锁尝试重读复核。
 		// (旧实现"先写尝试后锁订单"是全库唯一逆序,与五条订单→尝试路径互为死锁环;
 		//  且无锁复核会把并发已 PAID 的尝试盲写覆盖成 CLOSED。)
@@ -484,7 +610,7 @@ func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo stri
 		if active != nil {
 			return nil // 仍有活跃尝试,暂不关单
 		}
-		prev := o.Status
+		prev, since := o.Status, o.UpdatedAt
 		o.Status = models.OrderClosed
 		o.AggregateVersion++
 		if err := r.Orders().Update(ctx, o); err != nil {
@@ -498,15 +624,33 @@ func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo stri
 			return err
 		}
 		env := models.BuildClosedEnvelope(o, prev, eid, s.d.Clock())
-		return eventapp.WriteEvent(ctx, r, o.AppID, o.OrderNo, env)
+		if err := eventapp.WriteEvent(ctx, r, o.AppID, o.OrderNo, env); err != nil {
+			return err
+		}
+		closingSince = since
+		return nil
 	})
+	if err == nil && !closingSince.IsZero() {
+		s.d.Obs.ClosingSettled(obs.ClosingViaQuery, max(s.d.Clock().Sub(closingSince).Seconds(), 0))
+	}
+	return err
 }
 
-// payTxn 由权威订单 o + 通知 in + 胜出尝试 attempt 组装一条支付流水。
+// settleAttempt 把渠道侧已支付终态的尝试收敛为 PAID(释放活跃槽);已非活跃则不动。
+// 置 PAID 只释放 active_order 槽位、不申请,不会触发唯一守卫冲突。
+func settleAttempt(ctx context.Context, r store.Repos, a *models.PaymentAttempt) error {
+	if !a.Status.Active() {
+		return nil
+	}
+	a.Status = models.AttemptPaid
+	return r.Attempts().Update(ctx, a)
+}
+
+// payTxn 由流水归属(appID/orderNo)+ 通知 in + 尝试 attempt(可为 nil)组装一条支付流水。
 // anomalyKind:异常成因(models.AnomalyKind*),正常流水传空串——处置方式因成因而异,必须随流水落库。
-func payTxn(o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, anomaly bool, anomalyKind string) *models.PaymentTransaction {
+func payTxn(appID, orderNo string, in ConfirmInput, attempt *models.PaymentAttempt, anomaly bool, anomalyKind string) *models.PaymentTransaction {
 	t := &models.PaymentTransaction{
-		AppID: o.AppID, OrderNo: o.OrderNo, PayAccountID: in.PayAccountID,
+		AppID: appID, OrderNo: orderNo, PayAccountID: in.PayAccountID,
 		Channel: in.Channel, Kind: models.TxnPay, OutTradeNo: in.OutTradeNo,
 		TransactionID: in.TransactionID, Amount: in.Amount, Currency: sqlutil.OrDefault(in.Currency, "CNY"),
 		Anomaly: anomaly, AnomalyKind: anomalyKind, PaidAt: sqlutil.Time(in.PaidAt), NotifyDigest: in.NotifyDigest,
@@ -518,8 +662,8 @@ func payTxn(o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, an
 }
 
 // insertAnomalyTxn 插入异常流水(anomaly=1,携带成因);命中唯一键视为已记录,忽略(异常事实已在库)。
-func (s *Service) insertAnomalyTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt, anomalyKind string) error {
-	if err := r.Transactions().Insert(ctx, payTxn(o, in, attempt, true, anomalyKind)); err != nil && !errors.Is(err, store.ErrDuplicate) {
+func insertAnomalyTxn(ctx context.Context, r store.Repos, appID, orderNo string, in ConfirmInput, attempt *models.PaymentAttempt, anomalyKind string) error {
+	if err := r.Transactions().Insert(ctx, payTxn(appID, orderNo, in, attempt, true, anomalyKind)); err != nil && !errors.Is(err, store.ErrDuplicate) {
 		return err
 	}
 	return nil
@@ -538,8 +682,8 @@ const (
 // 已被订单行锁 + CanSettlePayment 前置串行化(第二个确认见 PAID 走 second_real_payment,不到此),故
 // txnDupConsistent 在正常并发下罕见,是防御性保留;此处主要拦【跨订单复用同交易号】(不同订单锁,
 // 能并发到此并撞 uk_txn,重读到他订单已提交流水 → txnDupConflict 禁止结算本单)。
-func (s *Service) insertWinningTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt) (txnInsertResult, error) {
-	err := r.Transactions().Insert(ctx, payTxn(o, in, attempt, false, ""))
+func insertWinningTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt) (txnInsertResult, error) {
+	err := r.Transactions().Insert(ctx, payTxn(o.AppID, o.OrderNo, in, attempt, false, ""))
 	if err == nil {
 		return txnInserted, nil
 	}
@@ -556,21 +700,27 @@ func (s *Service) insertWinningTxn(ctx context.Context, r store.Repos, o *models
 	return txnDupConsistent, nil
 }
 
-// closeOtherActiveAttempts 关闭除胜出尝试外的其它活跃尝试(§7)。
-func (s *Service) closeOtherActiveAttempts(ctx context.Context, r store.Repos, orderNo string, winner *models.PaymentAttempt) error {
+// closeOtherActiveAttempts 把除胜出尝试外的其它活跃尝试转 CLOSING(已提交网关,由查单 worker 确认,§7)。
+// 逐个行锁重读后再改:ListByOrder 的无锁快照整行回写会抹掉 worker 刚打的租约与调度字段。
+func closeOtherActiveAttempts(ctx context.Context, r store.Repos, orderNo string, winner *models.PaymentAttempt) error {
 	list, err := r.Attempts().ListByOrder(ctx, orderNo)
 	if err != nil {
 		return err
 	}
 	for _, a := range list {
-		if winner != nil && a.ID == winner.ID {
+		if a.ID == winner.ID || !a.Status.Active() {
 			continue
 		}
-		if a.Status.Active() {
-			a.Status = models.AttemptClosing // 已提交网关的其它尝试转关单中,由 reconcile 确认
-			if err := r.Attempts().Update(ctx, a); err != nil {
-				return err
-			}
+		cur, err := r.Attempts().GetByOutTradeNo(ctx, a.OutTradeNo, true)
+		if err != nil {
+			return err
+		}
+		if cur == nil || !cur.Status.Active() {
+			continue
+		}
+		cur.Status = models.AttemptClosing
+		if err := r.Attempts().Update(ctx, cur); err != nil {
+			return err
 		}
 	}
 	return nil

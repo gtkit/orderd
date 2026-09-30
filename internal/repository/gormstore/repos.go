@@ -303,6 +303,14 @@ func (r refundRepo) ListStuckCreated(ctx context.Context, before time.Time, limi
 	return out, nil
 }
 
+func (r refundRepo) ListBySourceTxn(ctx context.Context, txnID uint64) ([]*models.Refund, error) {
+	var out []*models.Refund
+	if err := dbOf(ctx, r.base).Where("source_txn_id = ?", txnID).Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("gormstore: list refunds by source txn: %w", err)
+	}
+	return out, nil
+}
+
 func (r refundRepo) Update(ctx context.Context, rf *models.Refund) error {
 	err := dbOf(ctx, r.base).Model(&models.Refund{}).Where("id = ?", rf.ID).
 		Select("Status", "GatewayRefundID", "SucceededAt", "LastError", "NextQueryAt", "QueryCount", "LockedBy", "LockedUntil").
@@ -332,6 +340,18 @@ func (r txnRepo) GetByTxnID(ctx context.Context, channel, payAccountID, txnID st
 	}
 	if err != nil {
 		return nil, fmt.Errorf("gormstore: get txn by id: %w", err)
+	}
+	return &t, nil
+}
+
+func (r txnRepo) GetByID(ctx context.Context, id uint64, fu bool) (*models.PaymentTransaction, error) {
+	var t models.PaymentTransaction
+	err := forUpdate(dbOf(ctx, r.base), fu).Where("id = ?", id).Take(&t).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gormstore: get txn by pk: %w", err)
 	}
 	return &t, nil
 }

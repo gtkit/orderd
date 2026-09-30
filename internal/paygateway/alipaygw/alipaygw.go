@@ -6,9 +6,9 @@ package alipaygw
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	alipayp "github.com/gtkit/go-pay/alipay"
 	"github.com/gtkit/go-pay/paymgr"
@@ -97,8 +97,8 @@ func (g *Gateway) Prepare(ctx context.Context, in paygateway.PrepareInput) (payg
 func (g *Gateway) Query(ctx context.Context, in paygateway.QueryInput) (paygateway.QueryResult, error) {
 	rsp, err := g.provider.QueryOrder(ctx, &paymgr.QueryOrderRequest{OutTradeNo: in.OutTradeNo})
 	if err != nil {
-		// paymgr 未单列"订单不存在";尽力从错误串识别(支付宝 ACQ.TRADE_NOT_EXIST)。
-		if strings.Contains(strings.ToUpper(err.Error()), "NOT_EXIST") {
+		// go-pay 把业务响应 ACQ.TRADE_NOT_EXIST 翻译为哨兵 ErrOrderNotFound(文本不含渠道码,只能按哨兵判定)。
+		if errors.Is(err, paymgr.ErrOrderNotFound) {
 			return paygateway.QueryResult{State: paygateway.QueryNotExist}, nil
 		}
 		return paygateway.QueryResult{State: paygateway.QueryError}, nil
@@ -136,9 +136,9 @@ func (g *Gateway) Refund(ctx context.Context, in paygateway.RefundInput) (paygat
 func (g *Gateway) RefundQuery(ctx context.Context, in paygateway.RefundQueryInput) (paygateway.RefundQueryResult, error) {
 	rsp, err := g.provider.QueryRefund(ctx, &paymgr.QueryRefundRequest{OutTradeNo: in.OutTradeNo, OutRefundNo: in.OutRefundNo})
 	if err != nil {
-		// paymgr 未单列"退款单不存在";尽力从错误串识别(支付宝 ACQ.TRADE_NOT_EXIST)。
-		// 识别不了的错误一律 RefundQueryError(继续重试),绝不猜测性落终态。
-		if strings.Contains(strings.ToUpper(err.Error()), "NOT_EXIST") {
+		// go-pay 对交易不存在(ACQ.TRADE_NOT_EXIST)与退款单号不存在(空响应)都返回哨兵 ErrOrderNotFound。
+		// 其它错误一律 RefundQueryError(继续重试),绝不猜测性落终态。
+		if errors.Is(err, paymgr.ErrOrderNotFound) {
 			return paygateway.RefundQueryResult{State: paygateway.RefundQueryNotExist}, nil
 		}
 		return paygateway.RefundQueryResult{State: paygateway.RefundQueryError}, err

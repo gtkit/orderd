@@ -21,8 +21,9 @@ func claimsFromCtx(ctx context.Context) (auth.Claims, bool) {
 }
 
 // methodPermission 方法级权限(DESIGN §13)。未登记的方法一律拒绝。
-// AdminService 为运维契约:三个权限(ops:reconcile/event:requeue/ops:txn:read)不进接入方
-// token 模板,发放需与 refund:execute 同级审批。
+// AdminService 为运维契约:权限(ops:reconcile/event:requeue/ops:txn:read/ops:txn:refund/
+// ops:refund:resolve)不进接入方 token 模板,发放需与 refund:execute 同级审批;后两者直接动资金,
+// 应只发给财务运维角色。
 var methodPermission = map[string]string{
 	"/order.v1.OrderService/CreateOrder":     "order:create",
 	"/order.v1.OrderService/GetOrderStatus":  "order:read",
@@ -33,11 +34,13 @@ var methodPermission = map[string]string{
 	"/order.v1.OrderService/GetRefund":       "refund:read",
 	"/order.v1.OrderService/ListOrderEvents": "event:read",
 
-	"/order.v1.AdminService/ListReconcileDiffs":  "ops:reconcile",
-	"/order.v1.AdminService/HandleReconcileDiff": "ops:reconcile",
-	"/order.v1.AdminService/ListDeadLetters":     "event:requeue",
-	"/order.v1.AdminService/RequeueDeadLetter":   "event:requeue",
-	"/order.v1.AdminService/ListAnomalyTxns":     "ops:txn:read",
+	"/order.v1.AdminService/ListReconcileDiffs":    "ops:reconcile",
+	"/order.v1.AdminService/HandleReconcileDiff":   "ops:reconcile",
+	"/order.v1.AdminService/ListDeadLetters":       "event:requeue",
+	"/order.v1.AdminService/RequeueDeadLetter":     "event:requeue",
+	"/order.v1.AdminService/ListAnomalyTxns":       "ops:txn:read",
+	"/order.v1.AdminService/RefundAnomalyTxn":      "ops:txn:refund",
+	"/order.v1.AdminService/ResolveRefundAbnormal": "ops:refund:resolve",
 }
 
 // AuthInterceptor 返回鉴权 unary 拦截器:校验 Bearer token → Claims 入 context → 方法级权限门禁。

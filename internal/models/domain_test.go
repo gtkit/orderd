@@ -132,6 +132,9 @@ func TestAttemptAndRefundTransitions(t *testing.T) {
 	if CanAttemptTransit(AttemptPaid, AttemptClosed) {
 		t.Fatal("PAID 为终态,不可转 CLOSED")
 	}
+	if !CanAttemptTransit(AttemptReady, AttemptClosed) {
+		t.Fatal("READY→CLOSED(换渠道时渠道同步关单成功)应允许")
+	}
 	if !CanRefundTransit(RefundProcessing, RefundAbnormal) {
 		t.Fatal("PROCESSING→ABNORMAL 应允许")
 	}
@@ -284,4 +287,24 @@ func TestBuildPaidEnvelope(t *testing.T) {
 		t.Fatalf("paid 载荷错误:%+v", paid.Paid)
 	}
 	// order_token 已从事件删除:OrderPaidEvent 不再有该字段(编译期即保证,此处断言载荷不含凭证)。
+}
+
+// TestBuildPaidEnvelopeChannel 支付事件渠道取结算快照;无快照的历史单回退下单渠道。
+func TestBuildPaidEnvelopeChannel(t *testing.T) {
+	tests := []struct {
+		name, settled, placed, wantChannel string
+		wantMethod                         PayMethod
+	}{
+		{"换渠道后取结算渠道", "alipay", "wechat", "alipay", PayMethodAlipay},
+		{"无结算快照回退下单渠道", "", "wechat", "wechat", PayMethodWechat},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &Order{OrderNo: "OD1", Status: OrderPaid, SettledChannel: tc.settled, PayChannel: tc.placed, PayMethod: PayMethodWechat}
+			paid := BuildPaidEnvelope(o, OrderPending, "evt-1", time.Now()).GetPaid()
+			if paid.PayChannel != tc.wantChannel || paid.PayMethod != int32(tc.wantMethod) {
+				t.Fatalf("期望 %s/%d,实际 %s/%d", tc.wantChannel, tc.wantMethod, paid.PayChannel, paid.PayMethod)
+			}
+		})
+	}
 }

@@ -184,6 +184,8 @@ type RefundRepo interface {
 	// ListStuckCreated 列出停留在 CREATED 且 created_at 早于 before 的退款
 	// (建单事务已提交但网关调用结果丢失的滞留,供退款查单 worker 恢复为 PROCESSING)。
 	ListStuckCreated(ctx context.Context, before time.Time, limit int) ([]*models.Refund, error)
+	// ListBySourceTxn 列出以某支付流水为源的全部退款(按异常流水退款的重复发起判定)。
+	ListBySourceTxn(ctx context.Context, txnID uint64) ([]*models.Refund, error)
 	Update(ctx context.Context, r *models.Refund) error
 }
 
@@ -193,6 +195,9 @@ type TransactionRepo interface {
 	Insert(ctx context.Context, t *models.PaymentTransaction) error
 	// GetByTxnID 未命中返回 (nil, nil)。
 	GetByTxnID(ctx context.Context, channel, payAccountID, txnID string) (*models.PaymentTransaction, error)
+	// GetByID 按主键取流水;不存在返回 ErrNotFound。forUpdate=true 行锁(流水不可变,锁只用于
+	// 串行化以其为源的退款发起)。
+	GetByID(ctx context.Context, id uint64, forUpdate bool) (*models.PaymentTransaction, error)
 	// ListByAccountDate 列出某账号某日(按 paid_at 归属)的流水,供对账比对。
 	ListByAccountDate(ctx context.Context, channel, payAccountID string, billDate time.Time) ([]*models.PaymentTransaction, error)
 	// ListAnomalies 资金异常流水清单(anomaly=1,自增 id 升序游标)。

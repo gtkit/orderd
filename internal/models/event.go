@@ -25,6 +25,11 @@ func BuildPaidEnvelope(o *Order, prev OrderStatus, eventID string, occurredAt ti
 	if o.PaidAt.Valid {
 		paidAt = timestamppb.New(o.PaidAt.Time)
 	}
+	// 渠道取结算快照(换渠道后与下单渠道不同);无快照的历史单回退下单渠道。
+	channel := o.SettledChannel
+	if channel == "" {
+		channel = o.PayChannel
+	}
 	env := newEnvelope(o, prev, eventID, occurredAt, EventTypePaid)
 	env.Payload = &orderv1.EventEnvelope_Paid{Paid: &orderv1.OrderPaidEvent{
 		OrderNo:         o.OrderNo,
@@ -34,8 +39,8 @@ func BuildPaidEnvelope(o *Order, prev OrderStatus, eventID string, occurredAt ti
 		Amount:          o.PayAmount,
 		Currency:        o.Currency,
 		TradeNo:         o.TradeNo,
-		PayMethod:       int32(o.PayMethod),
-		PayChannel:      o.PayChannel,
+		PayMethod:       int32(PayMethodFromChannel(channel)),
+		PayChannel:      channel,
 		PaidAt:          paidAt,
 		MetadataType:    o.MetadataType,
 		MetadataVersion: o.MetadataVersion,

@@ -206,8 +206,9 @@ CREATE TABLE refunds (
     refund_no      VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '本服务退款单号',
     out_refund_no  VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '调用方幂等键',
     request_hash   CHAR(64)     CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '退款请求哈希(out_refund_no+order+amount+reason)',
-    order_no       VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '原订单号',
-    pay_account_id VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '成功交易账号(退款用,取订单 settled 账号)',
+    order_no       VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '原订单号(按异常流水退款时取流水的 order_no,可为空串)',
+    source_txn_id  BIGINT UNSIGNED NULL COMMENT '按异常流水退款的源支付流水 payment_transactions.id(NULL=订单级退款)',
+    pay_account_id VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '成功交易账号(退款用,取订单 settled 账号;异常流水退款取流水账号)',
 
     refund_amount     BIGINT NOT NULL COMMENT '退款金额(分),V1=全额',
     status            TINYINT NOT NULL DEFAULT 0 COMMENT '0已建 1处理中 2成功 3失败 4关闭 5异常',
@@ -224,14 +225,17 @@ CREATE TABLE refunds (
 
     created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    -- 活跃退款守卫:活跃(0已建/1处理中/5异常)时=order_no,否则 NULL;唯一索引保证一订单最多一笔活跃退款。
+    -- 活跃退款守卫:活跃(0已建/1处理中/5异常)时取来源键,否则 NULL;唯一索引保证一订单(订单级退款)
+    -- 或一条源流水(按异常流水退款,键 'txn:<id>')最多一笔活跃退款,两类来源互不阻塞。
     active_guard   VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin
-                     GENERATED ALWAYS AS (CASE WHEN status IN (0, 1, 5) THEN order_no ELSE NULL END) STORED,
+                     GENERATED ALWAYS AS (CASE WHEN status IN (0, 1, 5)
+                       THEN IF(source_txn_id IS NULL, order_no, CONCAT('txn:', source_txn_id)) ELSE NULL END) STORED,
     PRIMARY KEY (id),
     UNIQUE KEY uk_refund_no (refund_no),
     UNIQUE KEY uk_app_out_refund (app_id, out_refund_no),
     UNIQUE KEY uk_active_refund (active_guard),
     KEY idx_order (order_no),
+    KEY idx_source_txn (source_txn_id),
     KEY idx_status (status),
     KEY idx_query_due (status, next_query_at),
     CONSTRAINT chk_refund_amount_pos CHECK (refund_amount > 0)

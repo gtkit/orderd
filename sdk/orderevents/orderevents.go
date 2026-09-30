@@ -6,6 +6,9 @@
 // + 按 (order_no, aggregate_version) 单调校验 + 发权益 + 记流水,提交后才回 2xx。
 // Redis 只能加速,不能作权威幂等源。
 //
+// order.closed 不是终态:关闭后迟到付款会再发 order.paid(EventMeta.PreviousStatus=CLOSED,
+// aggregate_version 更大),OnPaid 须照常发放权益(或由接入方发起退款),不得因已收到 closed 而忽略。
+//
 //	h := orderevents.NewHandler(orderevents.Config{
 //	    KeyID: keyID, Secret: []byte(secret),
 //	    OnPaid: func(ctx context.Context, m orderevents.EventMeta, e *orderv1.OrderPaidEvent) error {

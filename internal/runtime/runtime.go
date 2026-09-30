@@ -155,7 +155,7 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		Amounts: amounts, Accounts: accounts, Clock: clock,
 		NewOrderNo: gen.OrderNo, NewToken: func() (string, error) { return idgen.SecureToken(32) },
 		NewEventID: idgen.UUIDv4, OrderTTL: cfg.OrderTTL, MaxPendingPerUser: cfg.MaxPendingPerUser,
-		Alerter: alerter,
+		Alerter: alerter, Obs: flow,
 	})
 	ref := refundapp.New(refundapp.Deps{
 		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
@@ -165,7 +165,7 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	adminSrv, err := opsgrpc.New(opsapp.New(opsapp.Deps{Store: st, Clock: clock}))
+	adminSrv, err := opsgrpc.New(opsapp.New(opsapp.Deps{Store: st, Clock: clock}), ref)
 	if err != nil {
 		return nil, err
 	}

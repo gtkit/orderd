@@ -423,7 +423,7 @@ func TestRefundFullFlow(t *testing.T) {
 		t.Fatalf("退款受理失败: out=%+v err=%v", out, err)
 	}
 	// 网关确认退款成功 → 订单 REFUNDED + refunded 事件 + 退款流水(回指 refund_no)。
-	if err := h.refund.ConfirmRefundSuccess(bg, "app1", out.RefundNo, "gwr", 90, time.Now()); err != nil {
+	if err := h.refund.ConfirmRefundSuccess(bg, out.RefundNo, "gwr", 90, time.Now()); err != nil {
 		t.Fatalf("确认退款成功失败: %v", err)
 	}
 	o, _ := h.order.GetOrderStatus(bg, "app1", token, 42)

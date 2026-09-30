@@ -70,7 +70,7 @@ func TestRefundTxnFallsBackToOutRefundNo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("退款受理失败: %v", err)
 	}
-	if err := h.refund.ConfirmRefundSuccess(bg, "app1", out.RefundNo, "", 90, time.Now()); err != nil {
+	if err := h.refund.ConfirmRefundSuccess(bg, out.RefundNo, "", 90, time.Now()); err != nil {
 		t.Fatalf("确认退款成功失败: %v", err)
 	}
 	txns := refundTxns(h, out.RefundNo)
@@ -88,7 +88,7 @@ func TestRefundConfirmIdempotent(t *testing.T) {
 		t.Fatalf("退款受理失败: %v", err)
 	}
 	for range 2 {
-		if err := h.refund.ConfirmRefundSuccess(bg, "app1", out.RefundNo, "gwr-9", 90, time.Now()); err != nil {
+		if err := h.refund.ConfirmRefundSuccess(bg, out.RefundNo, "gwr-9", 90, time.Now()); err != nil {
 			t.Fatalf("确认退款成功失败: %v", err)
 		}
 	}
@@ -254,7 +254,7 @@ func TestRefundAmountMismatchGoesAbnormal(t *testing.T) {
 		t.Fatalf("金额不符不得发 refunded 事件: %d", n)
 	}
 	// 重复的金额不符确认:幂等,不重复告警。
-	if err := h.refund.ConfirmRefundSuccess(bg, "app1", out.RefundNo, "gwr", 50, time.Now()); err != nil {
+	if err := h.refund.ConfirmRefundSuccess(bg, out.RefundNo, "gwr", 50, time.Now()); err != nil {
 		t.Fatalf("重复确认应幂等: %v", err)
 	}
 	if n := h.alerter.count("refund_amount_mismatch"); n != 1 {

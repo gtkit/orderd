@@ -107,6 +107,7 @@ type Refund struct {
 	OutRefundNo     string
 	RequestHash     string
 	OrderNo         string
+	SourceTxnID     sql.NullInt64 // 按异常流水退款的源支付流水 id;NULL=订单级退款
 	PayAccountID    string
 	RefundAmount    int64
 	Status          RefundStatus
@@ -137,6 +138,7 @@ const (
 	AnomalyKindSecondRealPayment      = "second_real_payment"      // 第二笔真实付款(订单不可再结算)
 	AnomalyKindAmountMismatch         = "amount_mismatch"          // 金额/币种与订单快照不符
 	AnomalyKindAccountChannelMismatch = "account_channel_mismatch" // 通知路由账号/渠道与尝试冻结不符
+	AnomalyKindUnknownOutTradeNo      = "unknown_out_trade_no"     // 商户单号无法绑定任何尝试(order_no 为空,app_id 取路由账号归属)
 )
 
 // PaymentTransaction 不可变财务流水(payment_transactions)。
@@ -310,10 +312,14 @@ type ReconcileDiff struct {
 
 // 运维审计动作/对象标识(ops_audit_logs)。
 const (
-	OpsActionDeadLetterRequeue   = "dead_letter_requeue"
-	OpsActionReconcileDiffHandle = "reconcile_diff_handle"
-	OpsTargetEventOutbox         = "event_outbox"
-	OpsTargetReconcileDiff       = "reconcile_diff"
+	OpsActionDeadLetterRequeue    = "dead_letter_requeue"
+	OpsActionReconcileDiffHandle  = "reconcile_diff_handle"
+	OpsActionAnomalyTxnRefund     = "anomaly_txn_refund"
+	OpsActionRefundAbnormalSettle = "refund_abnormal_resolve"
+	OpsTargetEventOutbox          = "event_outbox"
+	OpsTargetReconcileDiff        = "reconcile_diff"
+	OpsTargetPaymentTxn           = "payment_transaction"
+	OpsTargetRefund               = "refund"
 	// OpsActorSystem 自动动作(兜底重放 worker)的发起者标识。
 	OpsActorSystem = "system"
 )

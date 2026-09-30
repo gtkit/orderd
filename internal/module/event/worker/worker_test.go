@@ -186,7 +186,9 @@ func (o *recObserver) DeliveryResult(outcome string, seconds float64) {
 	o.seconds = append(o.seconds, seconds)
 	o.mu.Unlock()
 }
-func (o *recObserver) ConfirmOutcome(string) {}
+func (o *recObserver) ConfirmOutcome(string)          {}
+func (o *recObserver) ClosingSettled(string, float64) {}
+func (o *recObserver) PrepareRejected(string)         {}
 
 // TestDeliveryObserverOutcomes delivered/failed/dead 互斥计数,耗时非负。
 func TestDeliveryObserverOutcomes(t *testing.T) {

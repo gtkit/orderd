@@ -15,13 +15,15 @@ package models
 // CLOSED  → PAID(异常恢复:网关查单证明真实付款)
 // PAID    → REFUNDING
 // REFUNDING → REFUNDED / PAID(退款失败回退) / REFUND_EXCEPTION
-// CANCELLED / REFUNDED / REFUND_EXCEPTION:终态(自动机无出边;异常人工处理走独立审计路径)
+// REFUND_EXCEPTION → REFUNDED / PAID(仅人工落定 ResolveRefundAbnormal,带审计)
+// CANCELLED / REFUNDED:终态
 var orderTransitions = map[OrderStatus]map[OrderStatus]bool{
-	OrderPending:   {OrderPaid: true, OrderCancelled: true, OrderClosing: true},
-	OrderClosing:   {OrderClosed: true, OrderPaid: true},
-	OrderClosed:    {OrderPaid: true},
-	OrderPaid:      {OrderRefunding: true},
-	OrderRefunding: {OrderRefunded: true, OrderPaid: true, OrderRefundException: true},
+	OrderPending:         {OrderPaid: true, OrderCancelled: true, OrderClosing: true},
+	OrderClosing:         {OrderClosed: true, OrderPaid: true},
+	OrderClosed:          {OrderPaid: true},
+	OrderPaid:            {OrderRefunding: true},
+	OrderRefunding:       {OrderRefunded: true, OrderPaid: true, OrderRefundException: true},
+	OrderRefundException: {OrderRefunded: true, OrderPaid: true},
 }
 
 // CanOrderTransit 报告订单能否从 from 跃迁到 to。
@@ -47,7 +49,7 @@ func CanSettlePayment(s OrderStatus) bool {
 //
 // CREATED → REQUESTING
 // REQUESTING → READY / UNKNOWN / PAID(回调早于下单返回) / FAILED
-// READY → PAID / CLOSING
+// READY → PAID / CLOSING / CLOSED(换渠道时渠道同步关单成功)
 // UNKNOWN → READY(查单=有单) / PAID(查单=已付) / CLOSED(多次查证不存在)
 // CLOSING → CLOSED / PAID(关单窗口内已付)
 // CLOSED → PAID(异常恢复)
@@ -55,7 +57,7 @@ func CanSettlePayment(s OrderStatus) bool {
 var attemptTransitions = map[AttemptStatus]map[AttemptStatus]bool{
 	AttemptCreated:    {AttemptRequesting: true},
 	AttemptRequesting: {AttemptReady: true, AttemptUnknown: true, AttemptPaid: true, AttemptFailed: true},
-	AttemptReady:      {AttemptPaid: true, AttemptClosing: true},
+	AttemptReady:      {AttemptPaid: true, AttemptClosing: true, AttemptClosed: true},
 	AttemptUnknown:    {AttemptReady: true, AttemptPaid: true, AttemptClosed: true},
 	AttemptClosing:    {AttemptClosed: true, AttemptPaid: true},
 	AttemptClosed:     {AttemptPaid: true},
@@ -70,10 +72,12 @@ func CanAttemptTransit(from, to AttemptStatus) bool { return attemptTransitions[
 //
 // CREATED → PROCESSING
 // PROCESSING → SUCCEEDED / FAILED / CLOSED / ABNORMAL
-// SUCCEEDED / FAILED / CLOSED / ABNORMAL:终态(ABNORMAL 人工处理走独立路径)
+// ABNORMAL → SUCCEEDED / FAILED(仅人工落定 ResolveRefundAbnormal,带审计)
+// SUCCEEDED / FAILED / CLOSED:终态
 var refundTransitions = map[RefundStatus]map[RefundStatus]bool{
 	RefundCreated:    {RefundProcessing: true},
 	RefundProcessing: {RefundSucceeded: true, RefundFailed: true, RefundClosed: true, RefundAbnormal: true},
+	RefundAbnormal:   {RefundSucceeded: true, RefundFailed: true},
 }
 
 // CanRefundTransit 报告退款能否从 from 跃迁到 to。

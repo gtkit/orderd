@@ -7,3 +7,5 @@ config/env
 # 散落 .log 文件(logs/ 下的运行日志已由 logs/** 忽略)
 *.log
 .proto-deps/
+*.out
+.env

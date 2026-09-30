@@ -7,8 +7,9 @@
 // AdminService 是 orderd 的【运维契约】,与接入方契约 OrderService 完全隔离(DESIGN 评审 D1/D2):
 //   · 方法不加 google.api.http 注解、服务端不注册 gateway handler——只在 gRPC 端口可达,
 //     :8080 的接入方 REST 与渠道回调面不新增任何运维路由;
-//   · 权限独立(ops:reconcile / event:requeue / ops:txn:read),不进接入方 token 模板;
-//   · 覆盖三类异常的处置出口:对账差异处置、Outbox 死信重放、资金异常流水查询。
+//   · 权限独立(ops:reconcile / event:requeue / ops:txn:read / ops:txn:refund / ops:refund:resolve),
+//     不进接入方 token 模板;
+//   · 覆盖异常的处置出口:对账差异处置、Outbox 死信重放、资金异常流水查询与按流水退款、异常退款人工落定。
 // 列表统一自增 id 游标分页:cursor 空=从头,limit 0=默认 50、上限 200;结果按 id 升序,
 // next_cursor 为本页末条 id,不足一页时为空。
 
@@ -1012,7 +1013,7 @@ type AnomalyTxnRecord struct {
 	TransactionId string                 `protobuf:"bytes,7,opt,name=transaction_id,json=transactionId,proto3" json:"transaction_id,omitempty"`
 	Amount        int64                  `protobuf:"varint,8,opt,name=amount,proto3" json:"amount,omitempty"` // 金额(分)
 	Currency      string                 `protobuf:"bytes,9,opt,name=currency,proto3" json:"currency,omitempty"`
-	// 成因:second_real_payment / amount_mismatch / account_channel_mismatch;
+	// 成因:second_real_payment / amount_mismatch / account_channel_mismatch / unknown_out_trade_no;
 	// 空串=成因未落库的历史行(anomaly_kind 列上线前写入)。
 	AnomalyKind   string                 `protobuf:"bytes,10,opt,name=anomaly_kind,json=anomalyKind,proto3" json:"anomaly_kind,omitempty"`
 	PaidAt        *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=paid_at,json=paidAt,proto3" json:"paid_at,omitempty"`
@@ -1187,11 +1188,257 @@ func (x *ListAnomalyTxnsResponse) GetNextCursor() string {
 	return ""
 }
 
+// RefundAnomalyTxnRequest 按异常流水全额退款:退到该流水实际入账的渠道账号与原商户单号。
+type RefundAnomalyTxnRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	TxnId uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"` // AnomalyTxnRecord.id
+	// 幂等键(同流水 app 维度唯一):重复请求返回已有退款,请求内容不同返回 AlreadyExists。
+	OutRefundNo   string `protobuf:"bytes,2,opt,name=out_refund_no,json=outRefundNo,proto3" json:"out_refund_no,omitempty"`
+	Reason        string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RefundAnomalyTxnRequest) Reset() {
+	*x = RefundAnomalyTxnRequest{}
+	mi := &file_order_v1_admin_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RefundAnomalyTxnRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RefundAnomalyTxnRequest) ProtoMessage() {}
+
+func (x *RefundAnomalyTxnRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_order_v1_admin_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RefundAnomalyTxnRequest.ProtoReflect.Descriptor instead.
+func (*RefundAnomalyTxnRequest) Descriptor() ([]byte, []int) {
+	return file_order_v1_admin_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *RefundAnomalyTxnRequest) GetTxnId() uint64 {
+	if x != nil {
+		return x.TxnId
+	}
+	return 0
+}
+
+func (x *RefundAnomalyTxnRequest) GetOutRefundNo() string {
+	if x != nil {
+		return x.OutRefundNo
+	}
+	return ""
+}
+
+func (x *RefundAnomalyTxnRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type RefundAnomalyTxnResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RefundNo      string                 `protobuf:"bytes,1,opt,name=refund_no,json=refundNo,proto3" json:"refund_no,omitempty"`
+	Status        RefundStatus           `protobuf:"varint,2,opt,name=status,proto3,enum=order.v1.RefundStatus" json:"status,omitempty"`
+	Reused        bool                   `protobuf:"varint,3,opt,name=reused,proto3" json:"reused,omitempty"` // true=幂等命中已有退款
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RefundAnomalyTxnResponse) Reset() {
+	*x = RefundAnomalyTxnResponse{}
+	mi := &file_order_v1_admin_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RefundAnomalyTxnResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RefundAnomalyTxnResponse) ProtoMessage() {}
+
+func (x *RefundAnomalyTxnResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_order_v1_admin_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RefundAnomalyTxnResponse.ProtoReflect.Descriptor instead.
+func (*RefundAnomalyTxnResponse) Descriptor() ([]byte, []int) {
+	return file_order_v1_admin_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *RefundAnomalyTxnResponse) GetRefundNo() string {
+	if x != nil {
+		return x.RefundNo
+	}
+	return ""
+}
+
+func (x *RefundAnomalyTxnResponse) GetStatus() RefundStatus {
+	if x != nil {
+		return x.Status
+	}
+	return RefundStatus_REFUND_STATUS_UNSPECIFIED
+}
+
+func (x *RefundAnomalyTxnResponse) GetReused() bool {
+	if x != nil {
+		return x.Reused
+	}
+	return false
+}
+
+// ResolveRefundAbnormalRequest 对 ABNORMAL 退款做人工落定(核实渠道后)。
+type ResolveRefundAbnormalRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	RefundNo string                 `protobuf:"bytes,1,opt,name=refund_no,json=refundNo,proto3" json:"refund_no,omitempty"`
+	// 目标:REFUND_STATUS_SUCCEEDED(3) 或 REFUND_STATUS_FAILED(4)。
+	Target RefundStatus `protobuf:"varint,2,opt,name=target,proto3,enum=order.v1.RefundStatus" json:"target,omitempty"`
+	// SUCCEEDED 时须填渠道实际退款金额(分)且等于退款单金额(双录确认);FAILED 时忽略。
+	ActualAmount  int64  `protobuf:"varint,3,opt,name=actual_amount,json=actualAmount,proto3" json:"actual_amount,omitempty"`
+	Remark        string `protobuf:"bytes,4,opt,name=remark,proto3" json:"remark,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResolveRefundAbnormalRequest) Reset() {
+	*x = ResolveRefundAbnormalRequest{}
+	mi := &file_order_v1_admin_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolveRefundAbnormalRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolveRefundAbnormalRequest) ProtoMessage() {}
+
+func (x *ResolveRefundAbnormalRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_order_v1_admin_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolveRefundAbnormalRequest.ProtoReflect.Descriptor instead.
+func (*ResolveRefundAbnormalRequest) Descriptor() ([]byte, []int) {
+	return file_order_v1_admin_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ResolveRefundAbnormalRequest) GetRefundNo() string {
+	if x != nil {
+		return x.RefundNo
+	}
+	return ""
+}
+
+func (x *ResolveRefundAbnormalRequest) GetTarget() RefundStatus {
+	if x != nil {
+		return x.Target
+	}
+	return RefundStatus_REFUND_STATUS_UNSPECIFIED
+}
+
+func (x *ResolveRefundAbnormalRequest) GetActualAmount() int64 {
+	if x != nil {
+		return x.ActualAmount
+	}
+	return 0
+}
+
+func (x *ResolveRefundAbnormalRequest) GetRemark() string {
+	if x != nil {
+		return x.Remark
+	}
+	return ""
+}
+
+type ResolveRefundAbnormalResponse struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Status RefundStatus           `protobuf:"varint,1,opt,name=status,proto3,enum=order.v1.RefundStatus" json:"status,omitempty"`
+	// 订单级退款的订单落定后状态;按异常流水退款为 UNSPECIFIED(不涉及订单)。
+	OrderStatus   OrderStatus `protobuf:"varint,2,opt,name=order_status,json=orderStatus,proto3,enum=order.v1.OrderStatus" json:"order_status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResolveRefundAbnormalResponse) Reset() {
+	*x = ResolveRefundAbnormalResponse{}
+	mi := &file_order_v1_admin_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolveRefundAbnormalResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolveRefundAbnormalResponse) ProtoMessage() {}
+
+func (x *ResolveRefundAbnormalResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_order_v1_admin_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolveRefundAbnormalResponse.ProtoReflect.Descriptor instead.
+func (*ResolveRefundAbnormalResponse) Descriptor() ([]byte, []int) {
+	return file_order_v1_admin_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ResolveRefundAbnormalResponse) GetStatus() RefundStatus {
+	if x != nil {
+		return x.Status
+	}
+	return RefundStatus_REFUND_STATUS_UNSPECIFIED
+}
+
+func (x *ResolveRefundAbnormalResponse) GetOrderStatus() OrderStatus {
+	if x != nil {
+		return x.OrderStatus
+	}
+	return OrderStatus_ORDER_STATUS_UNSPECIFIED
+}
+
 var File_order_v1_admin_proto protoreflect.FileDescriptor
 
 const file_order_v1_admin_proto_rawDesc = "" +
 	"\n" +
-	"\x14order/v1/admin.proto\x12\border.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe5\x03\n" +
+	"\x14order/v1/admin.proto\x12\border.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x14order/v1/order.proto\"\xe5\x03\n" +
 	"\x19ListReconcileDiffsRequest\x12I\n" +
 	"\rhandle_status\x18\x01 \x01(\x0e2\x1a.order.v1.DiffHandleStatusB\b\xbaH\x05\x82\x01\x02\x10\x01R\fhandleStatus\x12B\n" +
 	"\tdiff_type\x18\x02 \x01(\x0e2\x1b.order.v1.ReconcileDiffTypeB\b\xbaH\x05\x82\x01\x02\x10\x01R\bdiffType\x12\x1e\n" +
@@ -1295,7 +1542,26 @@ const file_order_v1_admin_proto_rawDesc = "" +
 	"\x17ListAnomalyTxnsResponse\x12.\n" +
 	"\x04txns\x18\x01 \x03(\v2\x1a.order.v1.AnomalyTxnRecordR\x04txns\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\tR\n" +
-	"nextCursor*\xba\x01\n" +
+	"nextCursor\"\x8a\x01\n" +
+	"\x17RefundAnomalyTxnRequest\x12\x1e\n" +
+	"\x06txn_id\x18\x01 \x01(\x04B\a\xbaH\x042\x02 \x00R\x05txnId\x12-\n" +
+	"\rout_refund_no\x18\x02 \x01(\tB\t\xbaH\x06r\x04\x10\x01\x18@R\voutRefundNo\x12 \n" +
+	"\x06reason\x18\x03 \x01(\tB\b\xbaH\x05r\x03\x18\x80\x04R\x06reason\"\x7f\n" +
+	"\x18RefundAnomalyTxnResponse\x12\x1b\n" +
+	"\trefund_no\x18\x01 \x01(\tR\brefundNo\x12.\n" +
+	"\x06status\x18\x02 \x01(\x0e2\x16.order.v1.RefundStatusR\x06status\x12\x16\n" +
+	"\x06reused\x18\x03 \x01(\bR\x06reused\"\xd5\x01\n" +
+	"\x1cResolveRefundAbnormalRequest\x12'\n" +
+	"\trefund_no\x18\x01 \x01(\tB\n" +
+	"\xbaH\ar\x05\x10\x01\x18\x80\x01R\brefundNo\x12:\n" +
+	"\x06target\x18\x02 \x01(\x0e2\x16.order.v1.RefundStatusB\n" +
+	"\xbaH\a\x82\x01\x04\x18\x03\x18\x04R\x06target\x12,\n" +
+	"\ractual_amount\x18\x03 \x01(\x03B\a\xbaH\x04\"\x02(\x00R\factualAmount\x12\"\n" +
+	"\x06remark\x18\x04 \x01(\tB\n" +
+	"\xbaH\ar\x05\x10\x01\x18\x80\x04R\x06remark\"\x89\x01\n" +
+	"\x1dResolveRefundAbnormalResponse\x12.\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x16.order.v1.RefundStatusR\x06status\x128\n" +
+	"\forder_status\x18\x02 \x01(\x0e2\x15.order.v1.OrderStatusR\vorderStatus*\xba\x01\n" +
 	"\x10DiffHandleStatus\x12\"\n" +
 	"\x1eDIFF_HANDLE_STATUS_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aDIFF_HANDLE_STATUS_PENDING\x10\x01\x12!\n" +
@@ -1307,13 +1573,15 @@ const file_order_v1_admin_proto_rawDesc = "" +
 	"\x1bRECONCILE_DIFF_TYPE_SURPLUS\x10\x01\x12\x1d\n" +
 	"\x19RECONCILE_DIFF_TYPE_SHORT\x10\x02\x12\x1e\n" +
 	"\x1aRECONCILE_DIFF_TYPE_AMOUNT\x10\x03\x12\x1e\n" +
-	"\x1aRECONCILE_DIFF_TYPE_STATUS\x10\x042\xe1\x03\n" +
+	"\x1aRECONCILE_DIFF_TYPE_STATUS\x10\x042\xa6\x05\n" +
 	"\fAdminService\x12_\n" +
 	"\x12ListReconcileDiffs\x12#.order.v1.ListReconcileDiffsRequest\x1a$.order.v1.ListReconcileDiffsResponse\x12b\n" +
 	"\x13HandleReconcileDiff\x12$.order.v1.HandleReconcileDiffRequest\x1a%.order.v1.HandleReconcileDiffResponse\x12V\n" +
 	"\x0fListDeadLetters\x12 .order.v1.ListDeadLettersRequest\x1a!.order.v1.ListDeadLettersResponse\x12\\\n" +
 	"\x11RequeueDeadLetter\x12\".order.v1.RequeueDeadLetterRequest\x1a#.order.v1.RequeueDeadLetterResponse\x12V\n" +
-	"\x0fListAnomalyTxns\x12 .order.v1.ListAnomalyTxnsRequest\x1a!.order.v1.ListAnomalyTxnsResponseB-Z+github.com/gtkit/orderd/pb/order/v1;orderv1b\x06proto3"
+	"\x0fListAnomalyTxns\x12 .order.v1.ListAnomalyTxnsRequest\x1a!.order.v1.ListAnomalyTxnsResponse\x12Y\n" +
+	"\x10RefundAnomalyTxn\x12!.order.v1.RefundAnomalyTxnRequest\x1a\".order.v1.RefundAnomalyTxnResponse\x12h\n" +
+	"\x15ResolveRefundAbnormal\x12&.order.v1.ResolveRefundAbnormalRequest\x1a'.order.v1.ResolveRefundAbnormalResponseB-Z+github.com/gtkit/orderd/pb/order/v1;orderv1b\x06proto3"
 
 var (
 	file_order_v1_admin_proto_rawDescOnce sync.Once
@@ -1328,58 +1596,72 @@ func file_order_v1_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_order_v1_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_order_v1_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_order_v1_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_order_v1_admin_proto_goTypes = []any{
-	(DiffHandleStatus)(0),               // 0: order.v1.DiffHandleStatus
-	(ReconcileDiffType)(0),              // 1: order.v1.ReconcileDiffType
-	(*ListReconcileDiffsRequest)(nil),   // 2: order.v1.ListReconcileDiffsRequest
-	(*ReconcileDiffRecord)(nil),         // 3: order.v1.ReconcileDiffRecord
-	(*ListReconcileDiffsResponse)(nil),  // 4: order.v1.ListReconcileDiffsResponse
-	(*HandleReconcileDiffRequest)(nil),  // 5: order.v1.HandleReconcileDiffRequest
-	(*HandleReconcileDiffResponse)(nil), // 6: order.v1.HandleReconcileDiffResponse
-	(*ListDeadLettersRequest)(nil),      // 7: order.v1.ListDeadLettersRequest
-	(*DeadLetterRecord)(nil),            // 8: order.v1.DeadLetterRecord
-	(*ListDeadLettersResponse)(nil),     // 9: order.v1.ListDeadLettersResponse
-	(*RequeueDeadLetterRequest)(nil),    // 10: order.v1.RequeueDeadLetterRequest
-	(*RequeueDeadLetterResponse)(nil),   // 11: order.v1.RequeueDeadLetterResponse
-	(*ListAnomalyTxnsRequest)(nil),      // 12: order.v1.ListAnomalyTxnsRequest
-	(*AnomalyTxnRecord)(nil),            // 13: order.v1.AnomalyTxnRecord
-	(*ListAnomalyTxnsResponse)(nil),     // 14: order.v1.ListAnomalyTxnsResponse
-	(*timestamppb.Timestamp)(nil),       // 15: google.protobuf.Timestamp
+	(DiffHandleStatus)(0),                 // 0: order.v1.DiffHandleStatus
+	(ReconcileDiffType)(0),                // 1: order.v1.ReconcileDiffType
+	(*ListReconcileDiffsRequest)(nil),     // 2: order.v1.ListReconcileDiffsRequest
+	(*ReconcileDiffRecord)(nil),           // 3: order.v1.ReconcileDiffRecord
+	(*ListReconcileDiffsResponse)(nil),    // 4: order.v1.ListReconcileDiffsResponse
+	(*HandleReconcileDiffRequest)(nil),    // 5: order.v1.HandleReconcileDiffRequest
+	(*HandleReconcileDiffResponse)(nil),   // 6: order.v1.HandleReconcileDiffResponse
+	(*ListDeadLettersRequest)(nil),        // 7: order.v1.ListDeadLettersRequest
+	(*DeadLetterRecord)(nil),              // 8: order.v1.DeadLetterRecord
+	(*ListDeadLettersResponse)(nil),       // 9: order.v1.ListDeadLettersResponse
+	(*RequeueDeadLetterRequest)(nil),      // 10: order.v1.RequeueDeadLetterRequest
+	(*RequeueDeadLetterResponse)(nil),     // 11: order.v1.RequeueDeadLetterResponse
+	(*ListAnomalyTxnsRequest)(nil),        // 12: order.v1.ListAnomalyTxnsRequest
+	(*AnomalyTxnRecord)(nil),              // 13: order.v1.AnomalyTxnRecord
+	(*ListAnomalyTxnsResponse)(nil),       // 14: order.v1.ListAnomalyTxnsResponse
+	(*RefundAnomalyTxnRequest)(nil),       // 15: order.v1.RefundAnomalyTxnRequest
+	(*RefundAnomalyTxnResponse)(nil),      // 16: order.v1.RefundAnomalyTxnResponse
+	(*ResolveRefundAbnormalRequest)(nil),  // 17: order.v1.ResolveRefundAbnormalRequest
+	(*ResolveRefundAbnormalResponse)(nil), // 18: order.v1.ResolveRefundAbnormalResponse
+	(*timestamppb.Timestamp)(nil),         // 19: google.protobuf.Timestamp
+	(RefundStatus)(0),                     // 20: order.v1.RefundStatus
+	(OrderStatus)(0),                      // 21: order.v1.OrderStatus
 }
 var file_order_v1_admin_proto_depIdxs = []int32{
 	0,  // 0: order.v1.ListReconcileDiffsRequest.handle_status:type_name -> order.v1.DiffHandleStatus
 	1,  // 1: order.v1.ListReconcileDiffsRequest.diff_type:type_name -> order.v1.ReconcileDiffType
 	1,  // 2: order.v1.ReconcileDiffRecord.diff_type:type_name -> order.v1.ReconcileDiffType
 	0,  // 3: order.v1.ReconcileDiffRecord.handle_status:type_name -> order.v1.DiffHandleStatus
-	15, // 4: order.v1.ReconcileDiffRecord.handled_at:type_name -> google.protobuf.Timestamp
-	15, // 5: order.v1.ReconcileDiffRecord.created_at:type_name -> google.protobuf.Timestamp
+	19, // 4: order.v1.ReconcileDiffRecord.handled_at:type_name -> google.protobuf.Timestamp
+	19, // 5: order.v1.ReconcileDiffRecord.created_at:type_name -> google.protobuf.Timestamp
 	3,  // 6: order.v1.ListReconcileDiffsResponse.diffs:type_name -> order.v1.ReconcileDiffRecord
 	0,  // 7: order.v1.HandleReconcileDiffRequest.target:type_name -> order.v1.DiffHandleStatus
 	0,  // 8: order.v1.HandleReconcileDiffResponse.handle_status:type_name -> order.v1.DiffHandleStatus
-	15, // 9: order.v1.DeadLetterRecord.created_at:type_name -> google.protobuf.Timestamp
-	15, // 10: order.v1.DeadLetterRecord.updated_at:type_name -> google.protobuf.Timestamp
+	19, // 9: order.v1.DeadLetterRecord.created_at:type_name -> google.protobuf.Timestamp
+	19, // 10: order.v1.DeadLetterRecord.updated_at:type_name -> google.protobuf.Timestamp
 	8,  // 11: order.v1.ListDeadLettersResponse.dead_letters:type_name -> order.v1.DeadLetterRecord
-	15, // 12: order.v1.ListAnomalyTxnsRequest.paid_from:type_name -> google.protobuf.Timestamp
-	15, // 13: order.v1.ListAnomalyTxnsRequest.paid_to:type_name -> google.protobuf.Timestamp
-	15, // 14: order.v1.AnomalyTxnRecord.paid_at:type_name -> google.protobuf.Timestamp
-	15, // 15: order.v1.AnomalyTxnRecord.created_at:type_name -> google.protobuf.Timestamp
+	19, // 12: order.v1.ListAnomalyTxnsRequest.paid_from:type_name -> google.protobuf.Timestamp
+	19, // 13: order.v1.ListAnomalyTxnsRequest.paid_to:type_name -> google.protobuf.Timestamp
+	19, // 14: order.v1.AnomalyTxnRecord.paid_at:type_name -> google.protobuf.Timestamp
+	19, // 15: order.v1.AnomalyTxnRecord.created_at:type_name -> google.protobuf.Timestamp
 	13, // 16: order.v1.ListAnomalyTxnsResponse.txns:type_name -> order.v1.AnomalyTxnRecord
-	2,  // 17: order.v1.AdminService.ListReconcileDiffs:input_type -> order.v1.ListReconcileDiffsRequest
-	5,  // 18: order.v1.AdminService.HandleReconcileDiff:input_type -> order.v1.HandleReconcileDiffRequest
-	7,  // 19: order.v1.AdminService.ListDeadLetters:input_type -> order.v1.ListDeadLettersRequest
-	10, // 20: order.v1.AdminService.RequeueDeadLetter:input_type -> order.v1.RequeueDeadLetterRequest
-	12, // 21: order.v1.AdminService.ListAnomalyTxns:input_type -> order.v1.ListAnomalyTxnsRequest
-	4,  // 22: order.v1.AdminService.ListReconcileDiffs:output_type -> order.v1.ListReconcileDiffsResponse
-	6,  // 23: order.v1.AdminService.HandleReconcileDiff:output_type -> order.v1.HandleReconcileDiffResponse
-	9,  // 24: order.v1.AdminService.ListDeadLetters:output_type -> order.v1.ListDeadLettersResponse
-	11, // 25: order.v1.AdminService.RequeueDeadLetter:output_type -> order.v1.RequeueDeadLetterResponse
-	14, // 26: order.v1.AdminService.ListAnomalyTxns:output_type -> order.v1.ListAnomalyTxnsResponse
-	22, // [22:27] is the sub-list for method output_type
-	17, // [17:22] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	20, // 17: order.v1.RefundAnomalyTxnResponse.status:type_name -> order.v1.RefundStatus
+	20, // 18: order.v1.ResolveRefundAbnormalRequest.target:type_name -> order.v1.RefundStatus
+	20, // 19: order.v1.ResolveRefundAbnormalResponse.status:type_name -> order.v1.RefundStatus
+	21, // 20: order.v1.ResolveRefundAbnormalResponse.order_status:type_name -> order.v1.OrderStatus
+	2,  // 21: order.v1.AdminService.ListReconcileDiffs:input_type -> order.v1.ListReconcileDiffsRequest
+	5,  // 22: order.v1.AdminService.HandleReconcileDiff:input_type -> order.v1.HandleReconcileDiffRequest
+	7,  // 23: order.v1.AdminService.ListDeadLetters:input_type -> order.v1.ListDeadLettersRequest
+	10, // 24: order.v1.AdminService.RequeueDeadLetter:input_type -> order.v1.RequeueDeadLetterRequest
+	12, // 25: order.v1.AdminService.ListAnomalyTxns:input_type -> order.v1.ListAnomalyTxnsRequest
+	15, // 26: order.v1.AdminService.RefundAnomalyTxn:input_type -> order.v1.RefundAnomalyTxnRequest
+	17, // 27: order.v1.AdminService.ResolveRefundAbnormal:input_type -> order.v1.ResolveRefundAbnormalRequest
+	4,  // 28: order.v1.AdminService.ListReconcileDiffs:output_type -> order.v1.ListReconcileDiffsResponse
+	6,  // 29: order.v1.AdminService.HandleReconcileDiff:output_type -> order.v1.HandleReconcileDiffResponse
+	9,  // 30: order.v1.AdminService.ListDeadLetters:output_type -> order.v1.ListDeadLettersResponse
+	11, // 31: order.v1.AdminService.RequeueDeadLetter:output_type -> order.v1.RequeueDeadLetterResponse
+	14, // 32: order.v1.AdminService.ListAnomalyTxns:output_type -> order.v1.ListAnomalyTxnsResponse
+	16, // 33: order.v1.AdminService.RefundAnomalyTxn:output_type -> order.v1.RefundAnomalyTxnResponse
+	18, // 34: order.v1.AdminService.ResolveRefundAbnormal:output_type -> order.v1.ResolveRefundAbnormalResponse
+	28, // [28:35] is the sub-list for method output_type
+	21, // [21:28] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_order_v1_admin_proto_init() }
@@ -1387,13 +1669,14 @@ func file_order_v1_admin_proto_init() {
 	if File_order_v1_admin_proto != nil {
 		return
 	}
+	file_order_v1_order_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_order_v1_admin_proto_rawDesc), len(file_order_v1_admin_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   13,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

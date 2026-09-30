@@ -653,7 +653,7 @@ func TestIntegrationRefundFailSuccessRace(t *testing.T) {
 	if err := refFail.QueryRefund(bg, readRf("RF-rc")); err != nil {
 		t.Fatalf("QueryRefund(失败): %v", err)
 	}
-	if err := refNormal.ConfirmRefundSuccess(bg, "app1", "RF-rc", "gwr-rc", 90, time.Now()); err != nil {
+	if err := refNormal.ConfirmRefundSuccess(bg, "RF-rc", "gwr-rc", 90, time.Now()); err != nil {
 		t.Fatalf("ConfirmRefundSuccess 不应报错(应降级告警): %v", err)
 	}
 	if readRf("RF-rc").Status != models.RefundFailed {
@@ -669,7 +669,7 @@ func TestIntegrationRefundFailSuccessRace(t *testing.T) {
 
 	// 反向:成功先落定,failRefund 迟到不得覆盖 SUCCEEDED。
 	seed("OD-rc2", "RF-rc2")
-	if err := refNormal.ConfirmRefundSuccess(bg, "app1", "RF-rc2", "gwr-rc2", 90, time.Now()); err != nil {
+	if err := refNormal.ConfirmRefundSuccess(bg, "RF-rc2", "gwr-rc2", 90, time.Now()); err != nil {
 		t.Fatalf("ConfirmRefundSuccess: %v", err)
 	}
 	if err := refFail.QueryRefund(bg, readRf("RF-rc2")); err != nil {
@@ -811,5 +811,97 @@ func TestIntegrationLockOrderPreventsDeadlock(t *testing.T) {
 	wg2.Wait()
 	if e1 != nil || e2 != nil {
 		t.Fatalf("统一锁序并发不应死锁(证明锁序统一消解了环),e1=%v e2=%v", e1, e2)
+	}
+}
+
+// TestIntegrationSettleKeepsOtherAttemptLease 反证结算写回卫生:结算事务在 RR 快照建立后、
+// 关闭其它活跃尝试前,查单 worker 为另一尝试提交了租约;结算必须以行锁当前读重读该尝试再置 CLOSING,
+// 不得用事务内的快照(ListByOrder)整行回写抹掉租约与调度字段。
+func TestIntegrationSettleKeepsOtherAttemptLease(t *testing.T) {
+	st := openTestStore(t)
+	defer func() { _ = st.Close() }()
+	var n int64
+	pay := paymentapp.New(paymentapp.Deps{
+		Store: st, Router: itRouter{}, Accounts: gormstore.NewAccountResolver(st.DB()), Alerter: alert.Nop{}, Clock: time.Now,
+		NewEventID: func() (string, error) { n++; return "evt-lease-" + strconv.FormatInt(n, 10), nil },
+		OutTradeNo: func() string { n++; return "PT-lease-x" + strconv.FormatInt(n, 10) },
+	})
+	// 播种:订单 PENDING;尝试1 已 CLOSED(迟到付款的胜出方);尝试2 UNKNOWN(活跃,待查单)。
+	if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
+		if e := r.Orders().Insert(ctx, &models.Order{
+			AppID: "app1", OrderNo: "OD-lease", OrderToken: "tok-lease", UserID: 42, Status: models.OrderPending,
+			ProductID: 1, ProductTitle: "x", Currency: "CNY", OriginalPrice: 90, PayAmount: 90,
+			PayMethod: models.PayMethodWechat, PayChannel: "wechat", PayAccountID: "acc-wechat",
+			ExpireAt: time.Now().Add(time.Hour),
+		}); e != nil {
+			return e
+		}
+		for i, s := range []models.AttemptStatus{models.AttemptClosed, models.AttemptUnknown} {
+			if e := r.Attempts().Insert(ctx, &models.PaymentAttempt{
+				AppID: "app1", OrderNo: "OD-lease", AttemptNo: int32(i + 1), Channel: "wechat", PayAccountID: "acc-wechat",
+				OutTradeNo: "PT-lease-" + strconv.Itoa(i+1), Status: s, ExpireAt: time.Now().Add(time.Hour),
+			}); e != nil {
+				return e
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("播种: %v", err)
+	}
+
+	// 裸事务持订单行锁(绕开 ormx.WithTx 自动重试),让结算事务在"快照已建立、订单锁未拿到"处阻塞。
+	db, err := sql.Open("mysql", os.Getenv("ORDERD_TEST_MYSQL_DSN"))
+	if err != nil {
+		t.Fatalf("开裸连接: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	holder, err := db.BeginTx(bg, nil)
+	if err != nil {
+		t.Fatalf("开持锁事务: %v", err)
+	}
+	var id int64
+	if err := holder.QueryRowContext(bg, "SELECT id FROM orders WHERE app_id='app1' AND order_no='OD-lease' FOR UPDATE").Scan(&id); err != nil {
+		t.Fatalf("持订单锁: %v", err)
+	}
+
+	type result struct {
+		res paymentapp.ConfirmResult
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := pay.ConfirmPaySuccess(bg, paymentapp.ConfirmInput{
+			OutTradeNo: "PT-lease-1", Channel: "wechat", PayAccountID: "acc-wechat",
+			TransactionID: "txn-lease", Amount: 90, Currency: "CNY", PaidAt: time.Now(),
+		})
+		done <- result{res, err}
+	}()
+	time.Sleep(300 * time.Millisecond) // 结算事务:首个一致性读已建快照,阻塞在订单 FOR UPDATE
+
+	// 查单 worker 为尝试2 提交租约与调度字段(自动提交,结算事务的快照看不到)。
+	leaseUntil := time.Now().Add(time.Minute).Truncate(time.Second)
+	if _, err := db.ExecContext(bg,
+		"UPDATE payment_attempts SET locked_by='worker-x', locked_until=?, query_count=3, next_query_at=? WHERE out_trade_no='PT-lease-2'",
+		leaseUntil, leaseUntil); err != nil {
+		t.Fatalf("写租约: %v", err)
+	}
+	if err := holder.Commit(); err != nil {
+		t.Fatalf("释放订单锁: %v", err)
+	}
+	r := <-done
+	if r.err != nil || r.res.Outcome != "paid" {
+		t.Fatalf("结算: res=%+v err=%v", r.res, r.err)
+	}
+
+	a2, err := st.Reader().Attempts().GetByOutTradeNo(bg, "PT-lease-2", false)
+	if err != nil || a2 == nil {
+		t.Fatalf("读尝试2: %v", err)
+	}
+	if a2.Status != models.AttemptClosing {
+		t.Fatalf("其它活跃尝试应转 CLOSING,实际 %v", a2.Status)
+	}
+	if a2.LockedBy != "worker-x" || a2.QueryCount != 3 || !a2.NextQueryAt.Valid {
+		t.Fatalf("worker 租约/调度字段被结算的快照回写抹掉: locked_by=%q query_count=%d next_query_at=%v",
+			a2.LockedBy, a2.QueryCount, a2.NextQueryAt)
 	}
 }

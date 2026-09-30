@@ -7,8 +7,9 @@
 // AdminService 是 orderd 的【运维契约】,与接入方契约 OrderService 完全隔离(DESIGN 评审 D1/D2):
 //   · 方法不加 google.api.http 注解、服务端不注册 gateway handler——只在 gRPC 端口可达,
 //     :8080 的接入方 REST 与渠道回调面不新增任何运维路由;
-//   · 权限独立(ops:reconcile / event:requeue / ops:txn:read),不进接入方 token 模板;
-//   · 覆盖三类异常的处置出口:对账差异处置、Outbox 死信重放、资金异常流水查询。
+//   · 权限独立(ops:reconcile / event:requeue / ops:txn:read / ops:txn:refund / ops:refund:resolve),
+//     不进接入方 token 模板;
+//   · 覆盖异常的处置出口:对账差异处置、Outbox 死信重放、资金异常流水查询与按流水退款、异常退款人工落定。
 // 列表统一自增 id 游标分页:cursor 空=从头,limit 0=默认 50、上限 200;结果按 id 升序,
 // next_cursor 为本页末条 id,不足一页时为空。
 
@@ -27,11 +28,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AdminService_ListReconcileDiffs_FullMethodName  = "/order.v1.AdminService/ListReconcileDiffs"
-	AdminService_HandleReconcileDiff_FullMethodName = "/order.v1.AdminService/HandleReconcileDiff"
-	AdminService_ListDeadLetters_FullMethodName     = "/order.v1.AdminService/ListDeadLetters"
-	AdminService_RequeueDeadLetter_FullMethodName   = "/order.v1.AdminService/RequeueDeadLetter"
-	AdminService_ListAnomalyTxns_FullMethodName     = "/order.v1.AdminService/ListAnomalyTxns"
+	AdminService_ListReconcileDiffs_FullMethodName    = "/order.v1.AdminService/ListReconcileDiffs"
+	AdminService_HandleReconcileDiff_FullMethodName   = "/order.v1.AdminService/HandleReconcileDiff"
+	AdminService_ListDeadLetters_FullMethodName       = "/order.v1.AdminService/ListDeadLetters"
+	AdminService_RequeueDeadLetter_FullMethodName     = "/order.v1.AdminService/RequeueDeadLetter"
+	AdminService_ListAnomalyTxns_FullMethodName       = "/order.v1.AdminService/ListAnomalyTxns"
+	AdminService_RefundAnomalyTxn_FullMethodName      = "/order.v1.AdminService/RefundAnomalyTxn"
+	AdminService_ResolveRefundAbnormal_FullMethodName = "/order.v1.AdminService/ResolveRefundAbnormal"
 )
 
 // AdminServiceClient is the client API for AdminService service.
@@ -50,6 +53,12 @@ type AdminServiceClient interface {
 	RequeueDeadLetter(ctx context.Context, in *RequeueDeadLetterRequest, opts ...grpc.CallOption) (*RequeueDeadLetterResponse, error)
 	// 资金异常流水清单(权限 ops:txn:read)。
 	ListAnomalyTxns(ctx context.Context, in *ListAnomalyTxnsRequest, opts ...grpc.CallOption) (*ListAnomalyTxnsResponse, error)
+	// 按异常流水全额退款(权限 ops:txn:refund):不改订单状态、不发订单事件;同一流水同时最多一笔在途退款,
+	// 成功后不可再退;受 refund.enabled 开关约束;写审计。
+	RefundAnomalyTxn(ctx context.Context, in *RefundAnomalyTxnRequest, opts ...grpc.CallOption) (*RefundAnomalyTxnResponse, error)
+	// ABNORMAL 退款人工落定(权限 ops:refund:resolve):FAILED → 订单回 PAID;SUCCEEDED(金额双录)→
+	// 订单 REFUNDED 并发 order.refunded;写审计。
+	ResolveRefundAbnormal(ctx context.Context, in *ResolveRefundAbnormalRequest, opts ...grpc.CallOption) (*ResolveRefundAbnormalResponse, error)
 }
 
 type adminServiceClient struct {
@@ -110,6 +119,26 @@ func (c *adminServiceClient) ListAnomalyTxns(ctx context.Context, in *ListAnomal
 	return out, nil
 }
 
+func (c *adminServiceClient) RefundAnomalyTxn(ctx context.Context, in *RefundAnomalyTxnRequest, opts ...grpc.CallOption) (*RefundAnomalyTxnResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RefundAnomalyTxnResponse)
+	err := c.cc.Invoke(ctx, AdminService_RefundAnomalyTxn_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) ResolveRefundAbnormal(ctx context.Context, in *ResolveRefundAbnormalRequest, opts ...grpc.CallOption) (*ResolveRefundAbnormalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolveRefundAbnormalResponse)
+	err := c.cc.Invoke(ctx, AdminService_ResolveRefundAbnormal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AdminServiceServer is the server API for AdminService service.
 // All implementations must embed UnimplementedAdminServiceServer
 // for forward compatibility.
@@ -126,6 +155,12 @@ type AdminServiceServer interface {
 	RequeueDeadLetter(context.Context, *RequeueDeadLetterRequest) (*RequeueDeadLetterResponse, error)
 	// 资金异常流水清单(权限 ops:txn:read)。
 	ListAnomalyTxns(context.Context, *ListAnomalyTxnsRequest) (*ListAnomalyTxnsResponse, error)
+	// 按异常流水全额退款(权限 ops:txn:refund):不改订单状态、不发订单事件;同一流水同时最多一笔在途退款,
+	// 成功后不可再退;受 refund.enabled 开关约束;写审计。
+	RefundAnomalyTxn(context.Context, *RefundAnomalyTxnRequest) (*RefundAnomalyTxnResponse, error)
+	// ABNORMAL 退款人工落定(权限 ops:refund:resolve):FAILED → 订单回 PAID;SUCCEEDED(金额双录)→
+	// 订单 REFUNDED 并发 order.refunded;写审计。
+	ResolveRefundAbnormal(context.Context, *ResolveRefundAbnormalRequest) (*ResolveRefundAbnormalResponse, error)
 	mustEmbedUnimplementedAdminServiceServer()
 }
 
@@ -150,6 +185,12 @@ func (UnimplementedAdminServiceServer) RequeueDeadLetter(context.Context, *Reque
 }
 func (UnimplementedAdminServiceServer) ListAnomalyTxns(context.Context, *ListAnomalyTxnsRequest) (*ListAnomalyTxnsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAnomalyTxns not implemented")
+}
+func (UnimplementedAdminServiceServer) RefundAnomalyTxn(context.Context, *RefundAnomalyTxnRequest) (*RefundAnomalyTxnResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RefundAnomalyTxn not implemented")
+}
+func (UnimplementedAdminServiceServer) ResolveRefundAbnormal(context.Context, *ResolveRefundAbnormalRequest) (*ResolveRefundAbnormalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveRefundAbnormal not implemented")
 }
 func (UnimplementedAdminServiceServer) mustEmbedUnimplementedAdminServiceServer() {}
 func (UnimplementedAdminServiceServer) testEmbeddedByValue()                      {}
@@ -262,6 +303,42 @@ func _AdminService_ListAnomalyTxns_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AdminService_RefundAnomalyTxn_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RefundAnomalyTxnRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).RefundAnomalyTxn(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_RefundAnomalyTxn_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).RefundAnomalyTxn(ctx, req.(*RefundAnomalyTxnRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_ResolveRefundAbnormal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveRefundAbnormalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).ResolveRefundAbnormal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_ResolveRefundAbnormal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).ResolveRefundAbnormal(ctx, req.(*ResolveRefundAbnormalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AdminService_ServiceDesc is the grpc.ServiceDesc for AdminService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -288,6 +365,14 @@ var AdminService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListAnomalyTxns",
 			Handler:    _AdminService_ListAnomalyTxns_Handler,
+		},
+		{
+			MethodName: "RefundAnomalyTxn",
+			Handler:    _AdminService_RefundAnomalyTxn_Handler,
+		},
+		{
+			MethodName: "ResolveRefundAbnormal",
+			Handler:    _AdminService_ResolveRefundAbnormal_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

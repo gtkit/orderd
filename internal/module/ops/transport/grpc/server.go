@@ -11,6 +11,7 @@ import (
 	"buf.build/go/protovalidate"
 	"github.com/gtkit/orderd/internal/models"
 	opsapp "github.com/gtkit/orderd/internal/module/ops/application"
+	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
 	"github.com/gtkit/orderd/internal/pkg/auth"
 	"github.com/gtkit/orderd/internal/store"
 	orderv1 "github.com/gtkit/orderd/pb/order/v1"
@@ -26,16 +27,17 @@ const dateLayout = "2006-01-02"
 type Server struct {
 	orderv1.UnimplementedAdminServiceServer
 	svc       *opsapp.Service
+	refund    *refundapp.Service // 按异常流水退款 / 异常退款人工落定(动作与审计在退款事务内完成)
 	validator protovalidate.Validator
 }
 
 // New 构造 AdminService 服务器。
-func New(svc *opsapp.Service) (*Server, error) {
+func New(svc *opsapp.Service, refund *refundapp.Service) (*Server, error) {
 	v, err := protovalidate.New()
 	if err != nil {
 		return nil, err
 	}
-	return &Server{svc: svc, validator: v}, nil
+	return &Server{svc: svc, refund: refund, validator: v}, nil
 }
 
 func (s *Server) validate(msg proto.Message) error {
@@ -59,10 +61,14 @@ func toStatus(err error) error {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return status.Error(codes.NotFound, "记录不存在")
-	case errors.Is(err, models.ErrIllegalTransition):
+	case errors.Is(err, models.ErrIllegalTransition), errors.Is(err, models.ErrRefundNotAllowed):
 		return status.Error(codes.FailedPrecondition, err.Error())
-	case errors.Is(err, opsapp.ErrInvalidRequest):
+	case errors.Is(err, opsapp.ErrInvalidRequest), errors.Is(err, models.ErrInvalidAmount):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, models.ErrActiveRefundExists):
+		return status.Error(codes.Aborted, err.Error())
+	case errors.Is(err, models.ErrIdempotencyConflict):
+		return status.Error(codes.AlreadyExists, "IDEMPOTENCY_CONFLICT")
 	default:
 		return status.Error(codes.Internal, "内部错误")
 	}
@@ -264,6 +270,47 @@ func (s *Server) ListAnomalyTxns(ctx context.Context, req *orderv1.ListAnomalyTx
 			rec.PaidAt = timestamppb.New(t.PaidAt.Time)
 		}
 		resp.Txns = append(resp.Txns, rec)
+	}
+	return resp, nil
+}
+
+// RefundAnomalyTxn 按异常流水全额退款。
+func (s *Server) RefundAnomalyTxn(ctx context.Context, req *orderv1.RefundAnomalyTxnRequest) (*orderv1.RefundAnomalyTxnResponse, error) {
+	if err := s.validate(req); err != nil {
+		return nil, err
+	}
+	actor, err := actorFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.refund.RefundAnomalyTxn(ctx, refundapp.AnomalyRefundInput{
+		TxnID: req.TxnId, OutRefundNo: req.OutRefundNo, Reason: req.Reason, Actor: actor.String(),
+	})
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &orderv1.RefundAnomalyTxnResponse{RefundNo: out.RefundNo, Status: out.Status.Proto(), Reused: out.Reused}, nil
+}
+
+// ResolveRefundAbnormal 异常退款人工落定。
+func (s *Server) ResolveRefundAbnormal(ctx context.Context, req *orderv1.ResolveRefundAbnormalRequest) (*orderv1.ResolveRefundAbnormalResponse, error) {
+	if err := s.validate(req); err != nil {
+		return nil, err
+	}
+	actor, err := actorFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	target, _ := models.RefundStatusFromProto(req.Target) // protovalidate 已限定 SUCCEEDED/FAILED
+	out, err := s.refund.ResolveRefundAbnormal(ctx, refundapp.ResolveInput{
+		RefundNo: req.RefundNo, Target: target, ActualAmount: req.ActualAmount, Remark: req.Remark, Actor: actor.String(),
+	})
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	resp := &orderv1.ResolveRefundAbnormalResponse{Status: out.Status.Proto()}
+	if out.HasOrder {
+		resp.OrderStatus = out.OrderStatus.Proto()
 	}
 	return resp, nil
 }

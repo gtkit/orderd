@@ -42,8 +42,7 @@ func TestRESTGatewayForwardsAuthAndQuery(t *testing.T) {
 	go func() { _ = gs.Serve(lis) }()
 	defer gs.Stop()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	gwMux, err := newRESTGateway(ctx, lis.Addr().String())
 	if err != nil {
 		t.Fatalf("构造网关: %v", err)

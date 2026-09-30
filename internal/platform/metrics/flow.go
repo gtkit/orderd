@@ -9,6 +9,8 @@ type FlowMetrics struct {
 	deliveryTotal   *prometheus.CounterVec
 	deliverySeconds prometheus.Histogram
 	confirmTotal    *prometheus.CounterVec
+	closingSeconds  *prometheus.HistogramVec
+	prepareRejected *prometheus.CounterVec
 }
 
 // NewFlowMetrics 构造并注册到 reg。
@@ -25,10 +27,19 @@ func NewFlowMetrics(reg prometheus.Registerer) *FlowMetrics {
 		}),
 		confirmTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "orderd_pay_confirm_total",
-			Help: "支付确认结果次数(paid/duplicate/anomaly)",
+			Help: "支付确认结果次数(paid/paid_after_closed/duplicate/anomaly;paid_after_closed=结算前订单已 CLOSED 的迟到付款)",
 		}, []string{"outcome"}),
+		closingSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "orderd_order_closing_seconds",
+			Help:    "订单从进入 CLOSING 到落定 CLOSED 的耗时(via=query 查单确认 / watchdog 滞留兜底)",
+			Buckets: []float64{5, 15, 30, 60, 120, 300, 600, 900, 1200, 1800, 3600, 5400},
+		}, []string{"via"}),
+		prepareRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "orderd_prepare_rejected_total",
+			Help: "调起支付被拒次数(closing/foreign_inflight/close_failed/pay_window)",
+		}, []string{"reason"}),
 	}
-	reg.MustRegister(f.deliveryTotal, f.deliverySeconds, f.confirmTotal)
+	reg.MustRegister(f.deliveryTotal, f.deliverySeconds, f.confirmTotal, f.closingSeconds, f.prepareRejected)
 	return f
 }
 
@@ -41,4 +52,14 @@ func (f *FlowMetrics) DeliveryResult(outcome string, seconds float64) {
 // ConfirmOutcome 实现 obs.FlowObserver。
 func (f *FlowMetrics) ConfirmOutcome(outcome string) {
 	f.confirmTotal.WithLabelValues(outcome).Inc()
+}
+
+// ClosingSettled 实现 obs.FlowObserver。
+func (f *FlowMetrics) ClosingSettled(via string, seconds float64) {
+	f.closingSeconds.WithLabelValues(via).Observe(seconds)
+}
+
+// PrepareRejected 实现 obs.FlowObserver。
+func (f *FlowMetrics) PrepareRejected(reason string) {
+	f.prepareRejected.WithLabelValues(reason).Inc()
 }

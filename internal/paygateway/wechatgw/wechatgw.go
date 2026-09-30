@@ -7,9 +7,9 @@ package wechatgw
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/gtkit/go-pay/paymgr"
 	wechatp "github.com/gtkit/go-pay/wechat"
@@ -107,7 +107,7 @@ func (g *Gateway) Prepare(ctx context.Context, in paygateway.PrepareInput) (payg
 func (g *Gateway) Query(ctx context.Context, in paygateway.QueryInput) (paygateway.QueryResult, error) {
 	rsp, err := g.provider.QueryOrder(ctx, &paymgr.QueryOrderRequest{OutTradeNo: in.OutTradeNo})
 	if err != nil {
-		if strings.Contains(strings.ToUpper(err.Error()), "NOT_EXIST") || strings.Contains(err.Error(), "ORDERNOTEXIST") {
+		if channelCode(err) == "ORDER_NOT_EXIST" {
 			return paygateway.QueryResult{State: paygateway.QueryNotExist}, nil
 		}
 		return paygateway.QueryResult{State: paygateway.QueryError}, nil
@@ -145,9 +145,8 @@ func (g *Gateway) Refund(ctx context.Context, in paygateway.RefundInput) (paygat
 func (g *Gateway) RefundQuery(ctx context.Context, in paygateway.RefundQueryInput) (paygateway.RefundQueryResult, error) {
 	rsp, err := g.provider.QueryRefund(ctx, &paymgr.QueryRefundRequest{OutTradeNo: in.OutTradeNo, OutRefundNo: in.OutRefundNo})
 	if err != nil {
-		// 尽力从错误串识别"退款单不存在"(微信 v3 RESOURCE_NOT_EXISTS 含 NOT_EXIST;
-		// 具体形态待沙箱联调核对后收紧)。识别不了的错误一律 RefundQueryError(继续重试),绝不猜测性落终态。
-		if strings.Contains(strings.ToUpper(err.Error()), "NOT_EXIST") {
+		// 仅渠道码 RESOURCE_NOT_EXISTS 视为退款单不存在;其它错误一律 RefundQueryError(继续重试),绝不猜测性落终态。
+		if channelCode(err) == "RESOURCE_NOT_EXISTS" {
 			return paygateway.RefundQueryResult{State: paygateway.RefundQueryNotExist}, nil
 		}
 		return paygateway.RefundQueryResult{State: paygateway.RefundQueryError}, err
@@ -162,6 +161,16 @@ func (g *Gateway) RefundQuery(ctx context.Context, in paygateway.RefundQueryInpu
 	default:
 		return paygateway.RefundQueryResult{State: paygateway.RefundQueryError}, nil
 	}
+}
+
+// channelCode 取 go-pay 包装的微信 APIv3 错误码(ChannelError.Code);非 ChannelError 返回空串。
+// 按码精确判定"资源不存在"(查单 ORDER_NOT_EXIST、退款查单 RESOURCE_NOT_EXISTS),不匹配描述文本:
+// 误判为确定性"无此单"会触发关单或退款失败回退。
+func channelCode(err error) string {
+	if ce, ok := errors.AsType[*paymgr.ChannelError](err); ok {
+		return ce.Code
+	}
+	return ""
 }
 
 // Notify 是验签后的通知结果(供回调层)。

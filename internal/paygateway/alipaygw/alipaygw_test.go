@@ -3,6 +3,7 @@ package alipaygw
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,6 +17,7 @@ type fakeProvider struct {
 	paymgr.UnimplementedProvider
 	unified   *paymgr.UnifiedOrderResponse
 	query     *paymgr.QueryOrderResponse
+	queryErr  error
 	refund    *paymgr.RefundResponse
 	rquery    *paymgr.QueryRefundResponse
 	rqueryErr error
@@ -29,6 +31,9 @@ func (f *fakeProvider) UnifiedOrder(context.Context, *paymgr.UnifiedOrderRequest
 }
 
 func (f *fakeProvider) QueryOrder(context.Context, *paymgr.QueryOrderRequest) (*paymgr.QueryOrderResponse, error) {
+	if f.queryErr != nil {
+		return nil, f.queryErr
+	}
 	return f.query, nil
 }
 
@@ -110,18 +115,41 @@ func TestRefundAndQueryMapping(t *testing.T) {
 	}
 }
 
+// 错误形态取自 go-pay v1.6.1 支付宝 provider 的真实输出:业务响应 ACQ.TRADE_NOT_EXIST 与退款单号不存在
+// 均返回哨兵 paymgr.ErrOrderNotFound(文本 "payment: order not found",不含渠道码);其它业务失败为 ChannelError。
 func TestRefundQueryErrorMapping(t *testing.T) {
-	// "退款单不存在"类错误 → NotExist(无错误,供阈值终态判定)。
-	gw := gwWith(&fakeProvider{rqueryErr: errors.New("alipay: ACQ.TRADE_NOT_EXIST 交易不存在")})
+	// 退款单/交易不存在 → NotExist(无错误,供阈值终态判定)。
+	gw := gwWith(&fakeProvider{rqueryErr: paymgr.ErrOrderNotFound})
 	q, err := gw.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
 	if err != nil || q.State != paygateway.RefundQueryNotExist {
-		t.Fatalf("NOT_EXIST 错误应映射 NotExist 且无错误: %+v err=%v", q, err)
+		t.Fatalf("ErrOrderNotFound 应映射 NotExist 且无错误: %+v err=%v", q, err)
 	}
 	// 无法归类的错误 → Error(继续重试),绝不猜测性落终态。
-	gw2 := gwWith(&fakeProvider{rqueryErr: errors.New("alipay: SYSTEM_ERROR")})
+	gw2 := gwWith(&fakeProvider{rqueryErr: paymgr.NewChannelError(paymgr.ChannelAlipay, "ACQ.SYSTEM_ERROR", "系统错误", nil)})
 	q2, err2 := gw2.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
 	if err2 == nil || q2.State != paygateway.RefundQueryError {
 		t.Fatalf("未知错误应映射 Error 并带错误: %+v err=%v", q2, err2)
+	}
+}
+
+func TestQueryErrorMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want paygateway.QueryState
+	}{
+		{"交易不存在(预下单未扫码)", paymgr.ErrOrderNotFound, paygateway.QueryNotExist},
+		{"包装后的哨兵", fmt.Errorf("query: %w", paymgr.ErrOrderNotFound), paygateway.QueryNotExist},
+		{"其它业务失败", paymgr.NewChannelError(paymgr.ChannelAlipay, "ACQ.SYSTEM_ERROR", "系统错误", nil), paygateway.QueryError},
+		{"网络错误", errors.New("dial tcp: i/o timeout"), paygateway.QueryError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := gwWith(&fakeProvider{queryErr: tc.err}).Query(ctx, paygateway.QueryInput{OutTradeNo: "PT1"})
+			if err != nil || q.State != tc.want {
+				t.Fatalf("期望 %v 且无错误,实际 %+v err=%v", tc.want, q, err)
+			}
+		})
 	}
 }
 

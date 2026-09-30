@@ -17,6 +17,7 @@ type fakeProvider struct {
 	paymgr.UnimplementedProvider
 	unified   *paymgr.UnifiedOrderResponse
 	query     *paymgr.QueryOrderResponse
+	queryErr  error
 	refund    *paymgr.RefundResponse
 	rquery    *paymgr.QueryRefundResponse
 	rqueryErr error
@@ -31,6 +32,9 @@ func (f *fakeProvider) UnifiedOrder(context.Context, *paymgr.UnifiedOrderRequest
 }
 
 func (f *fakeProvider) QueryOrder(context.Context, *paymgr.QueryOrderRequest) (*paymgr.QueryOrderResponse, error) {
+	if f.queryErr != nil {
+		return nil, f.queryErr
+	}
 	return f.query, nil
 }
 
@@ -116,15 +120,36 @@ func TestRefundAndQueryMapping(t *testing.T) {
 	}
 }
 
+func TestQueryErrorMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want paygateway.QueryState
+	}{
+		{"订单不存在", paymgr.NewChannelError(paymgr.ChannelWechat, "ORDER_NOT_EXIST", "订单不存在", nil), paygateway.QueryNotExist},
+		{"其它渠道码描述含字样不误判", paymgr.NewChannelError(paymgr.ChannelWechat, "SYSTEM_ERROR", "order ORDER_NOT_EXIST maybe", nil), paygateway.QueryError},
+		{"非渠道错误", errors.New("ORDER_NOT_EXIST"), paygateway.QueryError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := gwWith(&fakeProvider{queryErr: tc.err}).Query(ctx, paygateway.QueryInput{OutTradeNo: "PT1"})
+			if err != nil || q.State != tc.want {
+				t.Fatalf("期望 %v 且无错误,实际 %+v err=%v", tc.want, q, err)
+			}
+		})
+	}
+}
+
+// 错误形态取自 go-pay v1.6.1 微信 provider 的真实输出:wrapWechatError 把 APIv3 错误码放进 ChannelError.Code。
 func TestRefundQueryErrorMapping(t *testing.T) {
-	// "退款单不存在"类错误(微信 v3 RESOURCE_NOT_EXISTS)→ NotExist(无错误,供阈值终态判定)。
-	gw := gwWith(&fakeProvider{rqueryErr: errors.New("wechat: RESOURCE_NOT_EXISTS 退款单不存在")})
+	// 退款单不存在(APIv3 RESOURCE_NOT_EXISTS)→ NotExist(无错误,供阈值终态判定)。
+	gw := gwWith(&fakeProvider{rqueryErr: paymgr.NewChannelError(paymgr.ChannelWechat, "RESOURCE_NOT_EXISTS", "退款单不存在", nil)})
 	q, err := gw.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
 	if err != nil || q.State != paygateway.RefundQueryNotExist {
-		t.Fatalf("NOT_EXIST 错误应映射 NotExist 且无错误: %+v err=%v", q, err)
+		t.Fatalf("RESOURCE_NOT_EXISTS 应映射 NotExist 且无错误: %+v err=%v", q, err)
 	}
-	// 无法归类的错误 → Error(继续重试),绝不猜测性落终态。
-	gw2 := gwWith(&fakeProvider{rqueryErr: errors.New("wechat: SYSTEM_ERROR")})
+	// 其它渠道码(即使描述里出现 not exist 字样)→ Error(继续重试),绝不猜测性落终态。
+	gw2 := gwWith(&fakeProvider{rqueryErr: paymgr.NewChannelError(paymgr.ChannelWechat, "SYSTEM_ERROR", "resource NOT_EXISTS in cache", nil)})
 	q2, err2 := gw2.RefundQuery(ctx, paygateway.RefundQueryInput{OutRefundNo: "or1"})
 	if err2 == nil || q2.State != paygateway.RefundQueryError {
 		t.Fatalf("未知错误应映射 Error 并带错误: %+v err=%v", q2, err2)

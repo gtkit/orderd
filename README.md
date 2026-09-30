@@ -233,14 +233,16 @@ JWT 载荷(claims):
 | `ListReconcileDiffs` / `HandleReconcileDiff` | `ops:reconcile` |
 | `ListDeadLetters` / `RequeueDeadLetter` | `event:requeue` |
 | `ListAnomalyTxns` | `ops:txn:read` |
+| `RefundAnomalyTxn` | `ops:txn:refund` |
+| `ResolveRefundAbnormal` | `ops:refund:resolve` |
 
-运维权限不进接入方 token 模板,发放与 `refund:execute` 同级审批。
+运维权限不进接入方 token 模板,发放与 `refund:execute` 同级审批;`ops:txn:refund`、`ops:refund:resolve` 直接动资金,只发给财务运维角色。
 
 签发示例见 [`examples/createorder/main.go`](./examples/createorder/main.go)。
 
 ### AdminService(运维出口)
 
-三类异常的处置闭环,定义在 `proto/order/v1/admin.proto`,**只在 gRPC(:9090)可达**——方法不带
+异常的处置闭环,定义在 `proto/order/v1/admin.proto`,**只在 gRPC(:9090)可达**——方法不带
 `google.api.http` 注解、服务端不注册 gateway handler,`:8080` 的接入方 REST 与渠道回调面没有任何
 运维路由(运维查询会返回跨订单资金数据,不与外部可达面同网;运维侧用 grpcurl 或内部 admin BFF 调用):
 
@@ -252,8 +254,16 @@ JWT 载荷(claims):
   另有**定时兜底重放 worker**(`outbox.deadletter.*` 配置,默认关闭):冷却 + 次数上限 + 存活上限三条件
   齐备才自动重放,认领 SKIP LOCKED 与 system 审计同事务;
 - **资金异常流水**:`ListAnomalyTxns`(anomaly=1,含成因 `anomaly_kind`:
-  `second_real_payment`/`amount_mismatch`/`account_channel_mismatch`;列上线前的历史行成因为空串);
-- **审计**:每次处置/重放写一条 `ops_audit_logs`(actor/action/target/detail,与动作同事务,只插不改)。
+  `second_real_payment`/`amount_mismatch`/`account_channel_mismatch`/`unknown_out_trade_no`;列上线前的历史行成因为空串)
+  + `RefundAnomalyTxn`(按流水 id 全额退回到该笔钱实际入账的渠道账号与原商户单号;不改订单状态、不发订单事件;
+  同一流水同时最多一笔在途退款,成功后不可再退;`out_refund_no` 幂等;受 `refund.enabled` 约束,结果由退款查单
+  worker 收敛,可按 `out_refund_no` 重复调用查询当前状态);
+- **异常退款人工落定**:`ResolveRefundAbnormal`(仅 `ABNORMAL` 退款;`remark` 必填。`FAILED`:退款失败、订单
+  `REFUND_EXCEPTION→PAID`,可重新发起退款;`SUCCEEDED`:`actual_amount` 须等于退款单金额,写退款流水、订单
+  `REFUND_EXCEPTION→REFUNDED` 并发 `order.refunded`;两者都释放活跃退款守卫);
+- **审计**:每次处置/重放/按流水退款/人工落定写一条 `ops_audit_logs`(actor/action/target/detail,与动作同事务,只插不改)。
+
+上线本能力前须执行迁移 `docs/sql/20260929000001_alter_refunds_add_source_txn.sql`(refunds 加 `source_txn_id`,活跃退款守卫按来源区分)。
 
 ---
 
@@ -267,13 +277,20 @@ JWT 载荷(claims):
 幂等:同 `idempotency_key` 同请求 → 复用(`reused=true`);同 key 异请求 → `AlreadyExists("IDEMPOTENCY_CONFLICT")`。
 
 ### PreparePayment — 换渠道 / 重新调起支付
-请求:`order_no`、`pay_method`、`channel_id`、`client_ip`。对已 PENDING 订单(重新)调起支付;换渠道=开新尝试(旧的关单),同时只允许一个活跃尝试(§8/§9)。
+请求:`order_no`、`pay_method`、`channel_id`、`client_ip`。对已 PENDING 订单(重新)调起支付;同一时刻只允许一个活跃尝试(§8/§9)。
+- 同渠道且旧尝试距截止 ≥1 分钟:复用旧尝试(同一商户单号)重新取调起参数。
+- 换渠道,或旧尝试距截止 <1 分钟:先向渠道关闭旧尝试——成功则旧尝试 CLOSED 并新建尝试;关不掉(如支付宝预下单尚未扫码,渠道侧无可关交易)则旧尝试转 CLOSING、返回 `Aborted`,待查单 worker 确认旧单不可再支付后可重试。
+- 旧尝试正在关单确认中(CLOSING),或异渠道尝试提交结果未定(REQUESTING/UNKNOWN):返回 `Aborted`,稍后重试。
+- 订单剩余支付窗口 <1 分钟:返回 `FailedPrecondition`,不再向渠道下单。
+新建尝试的截止时间取 `order.attemptttl` 与订单截止的较早者,并作为 `time_expire` 传给渠道:订单到期时渠道侧二维码/交易同时失效。
 
 ### GetOrderStatus — 查询(前端反馈 + 兜底)
 请求:`order_token`。响应:`status`、`status_text`、`close_reason`、`amount`、`trade_no`、`paid_at`、`refunded_amount`、`aggregate_version`(与事件对齐,判新旧)、`metadata`。
 
 ### CancelOrder — 用户取消待支付订单
-从未提交网关 → `CANCELLED`;有已提交历史 → `CLOSING`(reconcile/查单确认后 `CLOSED`)。
+从未提交网关 → `CANCELLED`;有已提交历史 → `CLOSING`,提交后 orderd 立即向渠道尽力关单一次,再由查单 worker 按渠道查单结果确认 `CLOSED` 并发 `order.closed`。
+`CLOSING` 表示"渠道侧可能仍可支付":预下单/扫码模式下用户尚未扫码时渠道查不到交易,订单会保持 `CLOSING` 直到商户单截止(`order.attemptttl`)后才落 `CLOSED`;期间用户若扫旧码付款,订单转 `PAID` 并发 `order.paid`。
+`CLOSED` 表示渠道已确认不可再支付。已 `CLOSED` 的订单再收到真实付款仍会结算为 `PAID`(资金已入账,不能丢弃),同时清空 `close_reason`、指标 `orderd_pay_confirm_total{outcome="paid_after_closed"}` 计数并发出 `paid_after_closed` 告警——该情形应当罕见,出现即需排查关单收敛。
 
 ### RefundOrder / GetRefund — 退款(V1 授权关闭)
 `RefundOrder`:`order_no`、`refund_amount`(V1=全额)、`reason`、`out_refund_no`(幂等键)。需 `refund:execute` + `ORDERD_REFUND_ENABLED=true`。
@@ -335,6 +352,8 @@ orderd 通过 Outbox worker 把订单事件 HTTP 推给接入方配置的 `webho
 - 头:`X-Order-Event-Id`(幂等键)、`X-Order-Event-Type`、`X-Order-Key-Id`、`X-Order-Timestamp`、`X-Order-Signature = sha256=HMAC-SHA256(timestamp + "." + raw_body, secret)`。
 - 事件类型:`order.paid` / `order.refunded` / `order.closed`。
 - **幂等 + 防乱序**:`event_id` 去重 + `aggregate_version` 单调(拒绝比已处理更旧的事件)。
+- **`order.paid` 可能晚于 `order.closed`**:关闭后迟到付款会再发 `order.paid`(`previous_status=CLOSED`,`aggregate_version` 更大)。接入方消费 `order.closed` 后不得把订单视为终态;收到后续 `order.paid` 应以其为准发放权益,或调用 `RefundOrder` 退款。
+- `order.paid` 的 `pay_channel`/`pay_method` 是**实际结算渠道**(换渠道后与下单渠道可能不同)。
 
 接入方消费(权益发放的**幂等真相源必须是接入方 MySQL 的 `inbox_events`**,见 `sdk/orderevents/inbox_schema.sql`):
 
@@ -380,6 +399,14 @@ SDK 行为(资金安全):`OnPaid` 必填(缺失 panic);资金事件(paid/refunde
 `orderd_refunds_in_flight{status=created|processing}`、`orderd_orders_expired_pending`、
 `orderd_anomaly_txns_total`。指标不含敏感数据;`/metrics` 的来源限制由部署入口层(防火墙/网关)承担。
 
+关键路径进程内指标(事务外内存计数,标签均为低基数枚举):
+- `orderd_webhook_delivery_total{outcome=delivered|failed|dead}` / `orderd_webhook_delivery_seconds`:webhook 投递结果与耗时;
+- `orderd_pay_confirm_total{outcome=paid|paid_after_closed|duplicate|anomaly}`:支付确认结果;
+- `orderd_order_closing_seconds{via=query|watchdog}`:订单从进入 CLOSING 到落定 CLOSED 的耗时(查单确认 / 滞留兜底),
+  用于校准 `order.attemptttl`;`via=watchdog` 持续出现说明存在未收敛的生产路径;
+- `orderd_prepare_rejected_total{reason=closing|foreign_inflight|close_failed|pay_window}`:调起支付被拒原因
+  (旧尝试关单确认中 / 异渠道尝试结果未定 / 换渠道时渠道关单失败 / 剩余支付窗口不足)。
+
 ---
 
 ## 支付宝接入与沙箱联调
@@ -408,7 +435,7 @@ SDK 行为(资金安全):`OnPaid` 必填(缺失 panic);资金事件(paid/refunde
 | worker | 职责 |
 |---|---|
 | Outbox 投递 | 认领待投递事件 → 签名 HTTP 推送 → 退避重试 → 死信告警(§12) |
-| 支付查单 | 收敛 UNKNOWN/CLOSING 支付尝试(§9),查单=已付走 §7 |
+| 支付查单 | 收敛 UNKNOWN/CLOSING 支付尝试(§9),查单=已付走 §7;CLOSING 尝试"渠道无此单"须等商户单截止后才确认关闭 |
 | 超时关单 | 过期 PENDING 订单 → CLOSING/CLOSED;卡死 REQUESTING → UNKNOWN |
 | 退款查单 | 收敛 PROCESSING 退款(`ORDERD_REFUND_ENABLED` 时) |
 | 对账 | 每日渠道账单比对 → 差异落 `reconcile_diffs` + 告警(`ORDERD_RECONCILE_ENABLED` 时) |

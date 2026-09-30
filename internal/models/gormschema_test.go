@@ -26,7 +26,7 @@ var ddlColumns = map[string]map[string]bool{
 		"query_count", "locked_by", "locked_until", "created_at", "updated_at",
 	),
 	"refunds": set(
-		"id", "app_id", "refund_no", "out_refund_no", "request_hash", "order_no", "pay_account_id",
+		"id", "app_id", "refund_no", "out_refund_no", "request_hash", "order_no", "source_txn_id", "pay_account_id",
 		"refund_amount", "status", "gateway_refund_id", "reason", "succeeded_at", "last_error",
 		"next_query_at", "query_count", "locked_by", "locked_until", "created_at", "updated_at",
 	),

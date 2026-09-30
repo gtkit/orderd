@@ -101,6 +101,18 @@ func (m PayMethod) Channel() string {
 
 func (m PayMethod) Valid() bool { return m == PayMethodWechat || m == PayMethodAlipay }
 
+// PayMethodFromChannel 由渠道字符串反推支付方式(Channel 的逆映射);未知渠道返回 Unspecified。
+func PayMethodFromChannel(ch string) PayMethod {
+	switch ch {
+	case "wechat":
+		return PayMethodWechat
+	case "alipay":
+		return PayMethodAlipay
+	default:
+		return PayMethodUnspecified
+	}
+}
+
 func (m PayMethod) Proto() orderv1.PayMethod { return orderv1.PayMethod(m) }
 
 func PayMethodFromProto(p orderv1.PayMethod) (PayMethod, bool) {

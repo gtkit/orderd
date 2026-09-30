@@ -386,6 +386,8 @@ type obsRecorder struct {
 }
 
 func (o *obsRecorder) DeliveryResult(string, float64) {}
+func (o *obsRecorder) ClosingSettled(string, float64) {}
+func (o *obsRecorder) PrepareRejected(string)         {}
 func (o *obsRecorder) ConfirmOutcome(outcome string) {
 	o.mu.Lock()
 	o.outcomes = append(o.outcomes, outcome)

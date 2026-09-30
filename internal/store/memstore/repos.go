@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/gtkit/orderd/internal/models"
@@ -308,7 +309,7 @@ func (r refundRepo) Insert(_ context.Context, rf *models.Refund) error {
 		if e.AppID == rf.AppID && e.OutRefundNo == rf.OutRefundNo {
 			return store.ErrDuplicate
 		}
-		if rf.Status.Active() && e.OrderNo == rf.OrderNo && e.Status.Active() {
+		if rf.Status.Active() && e.Status.Active() && refundGuard(e) == refundGuard(*rf) {
 			return store.ErrDuplicate
 		}
 	}
@@ -321,11 +322,19 @@ func (r refundRepo) Insert(_ context.Context, rf *models.Refund) error {
 	return nil
 }
 
+// refundGuard 对齐 DDL active_guard:订单级退款取 order_no,按异常流水退款取 'txn:<id>'。
+func refundGuard(rf models.Refund) string {
+	if rf.SourceTxnID.Valid {
+		return "txn:" + strconv.FormatInt(rf.SourceTxnID.Int64, 10)
+	}
+	return rf.OrderNo
+}
+
 func (r refundRepo) GetActiveByOrder(_ context.Context, orderNo string, _ bool) (*models.Refund, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.refunds {
-		if e.OrderNo == orderNo && e.Status.Active() {
+		if refundGuard(e) == orderNo && e.Status.Active() {
 			cp := e
 			return &cp, nil
 		}
@@ -395,6 +404,19 @@ func (r refundRepo) ListStuckCreated(_ context.Context, before time.Time, limit 
 		out = append(out, &cp)
 		if len(out) >= limit {
 			break
+		}
+	}
+	return out, nil
+}
+
+func (r refundRepo) ListBySourceTxn(_ context.Context, txnID uint64) ([]*models.Refund, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	var out []*models.Refund
+	for _, e := range r.m.d.refunds {
+		if e.SourceTxnID.Valid && uint64(e.SourceTxnID.Int64) == txnID {
+			cp := e
+			out = append(out, &cp)
 		}
 	}
 	return out, nil
@@ -474,6 +496,16 @@ func (r txnRepo) ListByAccountDate(_ context.Context, channel, payAccountID stri
 		}
 	}
 	return out, nil
+}
+
+func (r txnRepo) GetByID(_ context.Context, id uint64, _ bool) (*models.PaymentTransaction, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	t, ok := r.m.d.txns[id]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return &t, nil
 }
 
 func (r txnRepo) GetByTxnID(_ context.Context, channel, payAccountID, txnID string) (*models.PaymentTransaction, error) {

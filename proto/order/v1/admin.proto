@@ -3,14 +3,16 @@ syntax = "proto3";
 // AdminService 是 orderd 的【运维契约】,与接入方契约 OrderService 完全隔离(DESIGN 评审 D1/D2):
 //   · 方法不加 google.api.http 注解、服务端不注册 gateway handler——只在 gRPC 端口可达,
 //     :8080 的接入方 REST 与渠道回调面不新增任何运维路由;
-//   · 权限独立(ops:reconcile / event:requeue / ops:txn:read),不进接入方 token 模板;
-//   · 覆盖三类异常的处置出口:对账差异处置、Outbox 死信重放、资金异常流水查询。
+//   · 权限独立(ops:reconcile / event:requeue / ops:txn:read / ops:txn:refund / ops:refund:resolve),
+//     不进接入方 token 模板;
+//   · 覆盖异常的处置出口:对账差异处置、Outbox 死信重放、资金异常流水查询与按流水退款、异常退款人工落定。
 // 列表统一自增 id 游标分页:cursor 空=从头,limit 0=默认 50、上限 200;结果按 id 升序,
 // next_cursor 为本页末条 id,不足一页时为空。
 package order.v1;
 
 import "buf/validate/validate.proto";
 import "google/protobuf/timestamp.proto";
+import "order/v1/order.proto";
 
 option go_package = "github.com/gtkit/orderd/pb/order/v1;orderv1";
 
@@ -154,7 +156,7 @@ message AnomalyTxnRecord {
   string transaction_id = 7;
   int64 amount          = 8; // 金额(分)
   string currency       = 9;
-  // 成因:second_real_payment / amount_mismatch / account_channel_mismatch;
+  // 成因:second_real_payment / amount_mismatch / account_channel_mismatch / unknown_out_trade_no;
   // 空串=成因未落库的历史行(anomaly_kind 列上线前写入)。
   string anomaly_kind = 10;
   google.protobuf.Timestamp paid_at    = 11;
@@ -164,6 +166,40 @@ message AnomalyTxnRecord {
 message ListAnomalyTxnsResponse {
   repeated AnomalyTxnRecord txns = 1;
   string next_cursor = 2;
+}
+
+// RefundAnomalyTxnRequest 按异常流水全额退款:退到该流水实际入账的渠道账号与原商户单号。
+message RefundAnomalyTxnRequest {
+  uint64 txn_id = 1 [(buf.validate.field).uint64.gt = 0]; // AnomalyTxnRecord.id
+  // 幂等键(同流水 app 维度唯一):重复请求返回已有退款,请求内容不同返回 AlreadyExists。
+  string out_refund_no = 2 [(buf.validate.field).string = {min_len: 1, max_len: 64}];
+  string reason = 3 [(buf.validate.field).string.max_len = 512];
+}
+
+message RefundAnomalyTxnResponse {
+  string refund_no = 1;
+  RefundStatus status = 2;
+  bool reused = 3; // true=幂等命中已有退款
+}
+
+// =====================================================================
+// 异常退款人工落定
+// =====================================================================
+
+// ResolveRefundAbnormalRequest 对 ABNORMAL 退款做人工落定(核实渠道后)。
+message ResolveRefundAbnormalRequest {
+  string refund_no = 1 [(buf.validate.field).string = {min_len: 1, max_len: 128}];
+  // 目标:REFUND_STATUS_SUCCEEDED(3) 或 REFUND_STATUS_FAILED(4)。
+  RefundStatus target = 2 [(buf.validate.field).enum = {in: [3, 4]}];
+  // SUCCEEDED 时须填渠道实际退款金额(分)且等于退款单金额(双录确认);FAILED 时忽略。
+  int64 actual_amount = 3 [(buf.validate.field).int64.gte = 0];
+  string remark = 4 [(buf.validate.field).string = {min_len: 1, max_len: 512}];
+}
+
+message ResolveRefundAbnormalResponse {
+  RefundStatus status = 1;
+  // 订单级退款的订单落定后状态;按异常流水退款为 UNSPECIFIED(不涉及订单)。
+  OrderStatus order_status = 2;
 }
 
 // =====================================================================
@@ -182,4 +218,10 @@ service AdminService {
   rpc RequeueDeadLetter(RequeueDeadLetterRequest) returns (RequeueDeadLetterResponse);
   // 资金异常流水清单(权限 ops:txn:read)。
   rpc ListAnomalyTxns(ListAnomalyTxnsRequest) returns (ListAnomalyTxnsResponse);
+  // 按异常流水全额退款(权限 ops:txn:refund):不改订单状态、不发订单事件;同一流水同时最多一笔在途退款,
+  // 成功后不可再退;受 refund.enabled 开关约束;写审计。
+  rpc RefundAnomalyTxn(RefundAnomalyTxnRequest) returns (RefundAnomalyTxnResponse);
+  // ABNORMAL 退款人工落定(权限 ops:refund:resolve):FAILED → 订单回 PAID;SUCCEEDED(金额双录)→
+  // 订单 REFUNDED 并发 order.refunded;写审计。
+  rpc ResolveRefundAbnormal(ResolveRefundAbnormalRequest) returns (ResolveRefundAbnormalResponse);
 }

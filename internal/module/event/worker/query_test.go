@@ -314,6 +314,60 @@ func TestQueryClosingStallAlertEdgeTriggered(t *testing.T) {
 	}
 }
 
+// TestQueryClosingNotExistWaitsForExpiry 反证 CLOSED 判据:CLOSING 尝试查得"渠道无此单"时,
+// 商户单截止 + 宽限(默认 2m)之前只重排、不关单(预下单未扫码时二维码仍可付);过期后才确认关闭。
+func TestQueryClosingNotExistWaitsForExpiry(t *testing.T) {
+	tests := []struct {
+		name       string
+		expireAt   time.Time
+		wantClosed bool
+	}{
+		{"商户单未到期保持CLOSING", qClock().Add(10 * time.Minute), false},
+		{"已到期但在宽限内保持CLOSING", qClock().Add(-time.Minute), false},
+		{"超过截止加宽限确认关闭", qClock().Add(-3 * time.Minute), true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := memstore.New()
+			seed(t, mem, "OD-cne", models.OrderClosing, models.CloseUserCancel, models.AttemptClosing, 0)
+			err := mem.WithinTx(context.Background(), func(ctx context.Context, r store.Repos) error {
+				a, e := r.Attempts().GetByOutTradeNo(ctx, "PT-OD-cne", true)
+				if e != nil {
+					return e
+				}
+				a.ExpireAt = tc.expireAt
+				return r.Attempts().Update(ctx, a)
+			})
+			if err != nil {
+				t.Fatalf("设截止失败: %v", err)
+			}
+			qw := buildQueryWorker(mem, paygateway.QueryResult{State: paygateway.QueryNotExist}, 6)
+			if _, err := qw.RunOnce(bg); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if !tc.wantClosed {
+				a := mem.Attempts("OD-cne")[0]
+				if a.Status != models.AttemptClosing || orderStatus(t, mem, "OD-cne") != models.OrderClosing {
+					t.Fatalf("未过截止+宽限不得关闭: attempt=%v order=%v", a.Status, orderStatus(t, mem, "OD-cne"))
+				}
+				if a.QueryCount != 1 || !a.NextQueryAt.Valid || !a.NextQueryAt.Time.After(qClock()) {
+					t.Fatalf("应重排继续观察: %+v", a)
+				}
+				if hasEvent(mem, models.EventTypeClosed) {
+					t.Fatal("未关闭不得发 order.closed")
+				}
+				return
+			}
+			if attemptStatus(t, mem, "OD-cne") != models.AttemptClosed || orderStatus(t, mem, "OD-cne") != models.OrderClosed {
+				t.Fatal("过截止+宽限后尝试与订单应 CLOSED")
+			}
+			if !hasEvent(mem, models.EventTypeClosed) {
+				t.Fatal("应发 order.closed")
+			}
+		})
+	}
+}
+
 func TestQueryUnknownNotExistBelowThreshold(t *testing.T) {
 	mem := memstore.New()
 	seed(t, mem, "OD-ne", models.OrderPending, models.CloseNone, models.AttemptUnknown, 0)

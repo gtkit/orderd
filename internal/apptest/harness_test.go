@@ -43,7 +43,7 @@ func (fakeAccounts) Resolve(_ context.Context, appID, channel string) (models.Ap
 
 func (fakeAccounts) ResolveByID(_ context.Context, payAccountID string) (models.AppPayAccount, error) {
 	return models.AppPayAccount{
-		PayAccountID: payAccountID, MchID: "mch-" + payAccountID, PayAppID: "app-" + payAccountID,
+		PayAccountID: payAccountID, AppID: "app1", MchID: "mch-" + payAccountID, PayAppID: "app-" + payAccountID,
 		ConfigVersion: 1, Enabled: true,
 	}, nil
 }
@@ -67,6 +67,9 @@ type fakeGateway struct {
 	// refundQuerySet=true 时 RefundQuery 返回 refundQuery(测试自定义退款查单结果)。
 	refundQuery    paygateway.RefundQueryResult
 	refundQuerySet bool
+	closeErr       error    // Close 返回该错误(模拟渠道关单失败)
+	closes         []string // 关单调用的 out_trade_no
+	closeHook      func()   // Close 内同步执行(模拟关单调用期间的并发事件,不持 g.mu)
 }
 
 func (g *fakeGateway) Prepare(_ context.Context, in paygateway.PrepareInput) (paygateway.PrepareResult, error) {
@@ -82,7 +85,16 @@ func (g *fakeGateway) Prepare(_ context.Context, in paygateway.PrepareInput) (pa
 func (g *fakeGateway) Query(context.Context, paygateway.QueryInput) (paygateway.QueryResult, error) {
 	return paygateway.QueryResult{State: paygateway.QueryNotPay}, nil
 }
-func (g *fakeGateway) Close(context.Context, paygateway.CloseInput) error { return nil }
+func (g *fakeGateway) Close(_ context.Context, in paygateway.CloseInput) error {
+	g.mu.Lock()
+	g.closes = append(g.closes, in.OutTradeNo)
+	hook, err := g.closeHook, g.closeErr
+	g.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return err
+}
 func (g *fakeGateway) Refund(_ context.Context, in paygateway.RefundInput) (paygateway.RefundResult, error) {
 	g.mu.Lock()
 	g.refunds = append(g.refunds, refundCall{Channel: in.Channel, PayAccountID: in.PayAccountID, OutTradeNo: in.OutTradeNo, OutRefundNo: in.OutRefundNo})
