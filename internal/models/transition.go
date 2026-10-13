@@ -12,15 +12,16 @@ package models
 //
 // PENDING → PAID / CANCELLED(无支付单) / CLOSING(有支付单/超时/被取代)
 // CLOSING → CLOSED / PAID(关单窗口内已付)
-// CLOSED  → PAID(异常恢复:网关查单证明真实付款)
+// CLOSED  → PAID(回调或查单验证真实付款后恢复)
 // PAID    → REFUNDING
 // REFUNDING → REFUNDED / PAID(退款失败回退) / REFUND_EXCEPTION
 // REFUND_EXCEPTION → REFUNDED / PAID(仅人工落定 ResolveRefundAbnormal,带审计)
-// CANCELLED / REFUNDED:终态
+// CANCELLED → PAID(已验证付款恢复);REFUNDED:支付不可恢复
 var orderTransitions = map[OrderStatus]map[OrderStatus]bool{
 	OrderPending:         {OrderPaid: true, OrderCancelled: true, OrderClosing: true},
 	OrderClosing:         {OrderClosed: true, OrderPaid: true},
 	OrderClosed:          {OrderPaid: true},
+	OrderCancelled:       {OrderPaid: true},
 	OrderPaid:            {OrderRefunding: true},
 	OrderRefunding:       {OrderRefunded: true, OrderPaid: true, OrderRefundException: true},
 	OrderRefundException: {OrderRefunded: true, OrderPaid: true},
@@ -33,10 +34,10 @@ func CanOrderTransit(from, to OrderStatus) bool { return orderTransitions[from][
 // 注意它不是 CanOrderTransit(s, OrderPaid):REFUNDING→PAID 是【退款失败回退】专用边,
 // 支付确认路径绝不允许借道——退款中/已退款订单收到的新真实交易只能落 anomaly 流水
 // (second_real_payment),否则会把订单从退款域拉回 PAID、覆盖 settled_* 快照并二次发 order.paid。
-// 白名单:PENDING/CLOSING 正常结算;CLOSED→PAID 为异常恢复(网关查单证明真实付款)。
+// 白名单:PENDING/CLOSING 正常结算;CLOSED/CANCELLED→PAID 为已验证真实付款恢复。
 func CanSettlePayment(s OrderStatus) bool {
 	switch s {
-	case OrderPending, OrderClosing, OrderClosed:
+	case OrderPending, OrderClosing, OrderClosed, OrderCancelled:
 		return true
 	default:
 		return false
@@ -48,17 +49,17 @@ func CanSettlePayment(s OrderStatus) bool {
 // ---------------------------------------------------------------------
 //
 // CREATED → REQUESTING
-// REQUESTING → READY / UNKNOWN / PAID(回调早于下单返回) / FAILED
-// READY → PAID / CLOSING / CLOSED(换渠道时渠道同步关单成功)
-// UNKNOWN → READY(查单=有单) / PAID(查单=已付) / CLOSED(多次查证不存在)
+// REQUESTING → READY / UNKNOWN / PAID(回调早于下单返回) / FAILED / CLOSING
+// READY → REQUESTING(同渠道重入) / PAID / CLOSING / CLOSED(渠道确认关闭或到期后查证不存在)
+// UNKNOWN → REQUESTING(同渠道重入) / READY(查单=有单) / PAID / CLOSING / CLOSED(到期加宽限后查证不存在)
 // CLOSING → CLOSED / PAID(关单窗口内已付)
 // CLOSED → PAID(异常恢复)
 // PAID / FAILED:终态
 var attemptTransitions = map[AttemptStatus]map[AttemptStatus]bool{
 	AttemptCreated:    {AttemptRequesting: true},
-	AttemptRequesting: {AttemptReady: true, AttemptUnknown: true, AttemptPaid: true, AttemptFailed: true},
-	AttemptReady:      {AttemptPaid: true, AttemptClosing: true, AttemptClosed: true},
-	AttemptUnknown:    {AttemptReady: true, AttemptPaid: true, AttemptClosed: true},
+	AttemptRequesting: {AttemptReady: true, AttemptUnknown: true, AttemptPaid: true, AttemptFailed: true, AttemptClosing: true},
+	AttemptReady:      {AttemptRequesting: true, AttemptPaid: true, AttemptClosing: true, AttemptClosed: true},
+	AttemptUnknown:    {AttemptRequesting: true, AttemptClosing: true, AttemptReady: true, AttemptPaid: true, AttemptClosed: true},
 	AttemptClosing:    {AttemptClosed: true, AttemptPaid: true},
 	AttemptClosed:     {AttemptPaid: true},
 }
@@ -70,12 +71,13 @@ func CanAttemptTransit(from, to AttemptStatus) bool { return attemptTransitions[
 // 退款状态机(DESIGN §10)
 // ---------------------------------------------------------------------
 //
-// CREATED → PROCESSING
+// CREATED → PROCESSING / FAILED(确定未发出或渠道明确拒绝)
+// CREATED → SUCCEEDED / ABNORMAL(受理写回未完成时已获得渠道事实)
 // PROCESSING → SUCCEEDED / FAILED / CLOSED / ABNORMAL
 // ABNORMAL → SUCCEEDED / FAILED(仅人工落定 ResolveRefundAbnormal,带审计)
 // SUCCEEDED / FAILED / CLOSED:终态
 var refundTransitions = map[RefundStatus]map[RefundStatus]bool{
-	RefundCreated:    {RefundProcessing: true},
+	RefundCreated:    {RefundProcessing: true, RefundSucceeded: true, RefundFailed: true, RefundAbnormal: true},
 	RefundProcessing: {RefundSucceeded: true, RefundFailed: true, RefundClosed: true, RefundAbnormal: true},
 	RefundAbnormal:   {RefundSucceeded: true, RefundFailed: true},
 }

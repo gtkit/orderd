@@ -73,6 +73,18 @@ message ReconcileDiffRecord {
   google.protobuf.Timestamp handled_at = 15;
   string handle_remark  = 16;
   google.protobuf.Timestamp created_at = 17;
+  // 0=历史未指定，1=支付，2=退款；本金均为正整数分。
+  int32 transaction_kind = 18;
+  string original_transaction_id = 19;
+  string out_refund_no = 20;
+  string refund_no = 21;
+  string currency = 22;
+  string import_id = 23;
+  // 本地待核实证据可能不属于已取得的账期，此时batch_id=0。
+  uint64 local_transaction_id = 24;
+  int32 verification_attempts = 25;
+  google.protobuf.Timestamp next_verification_at = 26;
+  string verification_last_error = 27;
 }
 
 message ListReconcileDiffsResponse {

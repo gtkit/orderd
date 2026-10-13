@@ -21,8 +21,38 @@ type fakeBill struct {
 	err error
 }
 
-func (f fakeBill) Fetch(context.Context, string, string, time.Time) (bill.Bill, error) {
-	return f.b, f.err
+func emitFixture(b bill.Bill, emit func(bill.Entry) error) (bill.Summary, error) {
+	var result bill.Summary
+	for _, e := range b.Entries {
+		if e.Kind == 0 {
+			e.Kind = models.TxnPay
+		}
+		if e.Currency == "" {
+			e.Currency = "CNY"
+		}
+		if e.Status == "" {
+			e.Status = "SUCCESS"
+		}
+		if e.OutTradeNo == "" {
+			e.OutTradeNo = "fixture-" + e.TransactionID
+		}
+		if err := emit(e); err != nil {
+			return result, err
+		}
+		result.Count++
+		if e.Kind == models.TxnPay {
+			result.PayAmount += e.Amount
+		} else {
+			result.RefundAmount += e.Amount
+		}
+	}
+	return result, nil
+}
+func (f fakeBill) Fetch(_ context.Context, _, _ string, _ time.Time, emit func(bill.Entry) error) (bill.Summary, error) {
+	if f.err != nil {
+		return bill.Summary{}, f.err
+	}
+	return emitFixture(f.b, emit)
 }
 
 type recAlerter struct{ n int }
@@ -31,6 +61,7 @@ func (a *recAlerter) Anomaly(context.Context, string, map[string]any) { a.n++ }
 
 func newSvc(mem *memstore.Mem, b bill.Bill, alerter *recAlerter) *Service {
 	var seq int64
+	mem.SeedAccount(models.AppPayAccount{PayAccountID: "acc-wechat", AppID: "app1", Channel: "wechat", CreatedAt: billDate})
 	return New(Deps{
 		Store: mem, Bill: fakeBill{b: b}, Alerter: alerter,
 		Clock:      func() time.Time { return time.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC) },
@@ -45,7 +76,7 @@ func seedTxn(t *testing.T, mem *memstore.Mem, txnID, outTradeNo, orderNo string,
 		return r.Transactions().Insert(ctx, &models.PaymentTransaction{
 			AppID: "app1", OrderNo: orderNo, PayAccountID: "acc-wechat", Channel: "wechat", Kind: models.TxnPay,
 			OutTradeNo: outTradeNo, TransactionID: txnID, Amount: amount, Currency: "CNY",
-			PaidAt: sqlutil.Time(billDate.Add(10 * time.Hour)),
+			PaidAt: sqlutil.Time(billDate.Add(10 * time.Hour)), CreatedAt: billDate,
 		})
 	})
 	if err != nil {

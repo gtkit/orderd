@@ -66,7 +66,7 @@ func (h *Handler) alipayNotify(w http.ResponseWriter, r *http.Request) {
 	// 由 out_trade_no 唯一派生订单;渠道/账号取本路由账号供 ConfirmPaySuccess 严格校验。
 	res, err := h.payment.ConfirmPaySuccess(r.Context(), paymentapp.ConfirmInput{
 		OutTradeNo: n.OutTradeNo, Channel: "alipay", PayAccountID: gw.PayAccountID(),
-		TransactionID: n.TransactionID, Amount: n.AmountFen, Currency: "CNY", NotifyDigest: "alipay-notify",
+		TransactionID: n.TransactionID, Amount: n.AmountFen, Currency: "CNY", PaidAt: n.PaidAt, NotifyDigest: "alipay-notify",
 	})
 	if err != nil {
 		logger.Errorw("支付宝回调入账失败", "route_id", routeID, "out_trade_no", n.OutTradeNo, "err", err)
@@ -102,7 +102,7 @@ func (h *Handler) wechatNotify(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := h.payment.ConfirmPaySuccess(r.Context(), paymentapp.ConfirmInput{
 		OutTradeNo: n.OutTradeNo, Channel: "wechat", PayAccountID: gw.PayAccountID(),
-		TransactionID: n.TransactionID, Amount: n.AmountFen, Currency: "CNY", NotifyDigest: "wechat-notify",
+		TransactionID: n.TransactionID, Amount: n.AmountFen, Currency: "CNY", PaidAt: n.PaidAt, NotifyDigest: "wechat-notify",
 	})
 	if err != nil {
 		logger.Errorw("微信回调入账失败", "route_id", routeID, "out_trade_no", n.OutTradeNo, "err", err)

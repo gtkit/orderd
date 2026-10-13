@@ -15,6 +15,6 @@ var ErrNotImplemented = errors.New("bill/stub: 渠道账单源未接入")
 // Source 恒返回错误(对账 worker 会将该账期批次标记为失败,不产生假差异)。
 type Source struct{}
 
-func (Source) Fetch(context.Context, string, string, time.Time) (bill.Bill, error) {
-	return bill.Bill{}, ErrNotImplemented
+func (Source) Fetch(context.Context, string, string, time.Time, func(bill.Entry) error) (bill.Summary, error) {
+	return bill.Summary{}, ErrNotImplemented
 }

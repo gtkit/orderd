@@ -95,6 +95,7 @@ CREATE TABLE orders (
     KEY idx_app_user_status (app_id, user_id, status),
     KEY idx_trade_no (trade_no),
     KEY idx_status_expire (status, expire_at),
+    KEY idx_closing_scan (status, updated_at, id),
     KEY idx_paid_at (paid_at),
     CONSTRAINT chk_amount CHECK (original_price - discount_amount = pay_amount),
     CONSTRAINT chk_amount_nonneg CHECK (original_price >= 0 AND discount_amount >= 0 AND pay_amount > 0 AND refunded_amount >= 0),
@@ -144,7 +145,7 @@ CREATE TABLE event_outbox (
     status          TINYINT  NOT NULL DEFAULT 0 COMMENT '0待投递 1已投递 2死信',
     attempts        INT      NOT NULL DEFAULT 0 COMMENT '已尝试次数',
     next_attempt_at DATETIME NOT NULL COMMENT '下次投递时间(退避+抖动)',
-    locked_by       VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '租约持有者(worker 实例)',
+    locked_by       VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '本次认领随机标识(每次重新生成,失败写回CAS)',
     locked_until    DATETIME NULL COMMENT '租约到期时间',
     last_error      TEXT     NULL COMMENT '最近失败原因',
 
@@ -213,6 +214,8 @@ CREATE TABLE refunds (
     refund_amount     BIGINT NOT NULL COMMENT '退款金额(分),V1=全额',
     status            TINYINT NOT NULL DEFAULT 0 COMMENT '0已建 1处理中 2成功 3失败 4关闭 5异常',
     gateway_refund_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '渠道退款单号',
+    not_exist_count INT NOT NULL DEFAULT 0 COMMENT '连续明确退款不存在次数,非不存在结果或查询错误清零,不用于退避',
+    gateway_confirmed TINYINT NOT NULL DEFAULT 0 COMMENT '渠道已受理或查到存在(历史在途保守保护),0否1是,确认后不可清零',
     reason            VARCHAR(512) NOT NULL DEFAULT '' COMMENT '退款原因',
     succeeded_at      DATETIME(3) NULL COMMENT '退款成功时间',
     last_error        TEXT NULL COMMENT '最近错误',
@@ -220,7 +223,7 @@ CREATE TABLE refunds (
     -- worker 调度(退款查单退避 + 租约)。
     next_query_at  DATETIME NULL COMMENT '下次查单时间(PROCESSING 退避)',
     query_count    INT      NOT NULL DEFAULT 0 COMMENT '已查单次数',
-    locked_by      VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '租约持有 worker',
+    locked_by      VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '本次认领随机token,每次重新生成,非成功查询与重排写回须匹配',
     locked_until   DATETIME NULL COMMENT '租约到期',
 
     created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -238,7 +241,9 @@ CREATE TABLE refunds (
     KEY idx_source_txn (source_txn_id),
     KEY idx_status (status),
     KEY idx_query_due (status, next_query_at),
-    CONSTRAINT chk_refund_amount_pos CHECK (refund_amount > 0)
+    CONSTRAINT chk_refund_amount_pos CHECK (refund_amount > 0),
+    CONSTRAINT chk_refund_not_exist_count CHECK (not_exist_count >= 0),
+    CONSTRAINT chk_refund_gateway_confirmed CHECK (gateway_confirmed IN (0, 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='退款执行流水';
 
 
@@ -256,8 +261,8 @@ CREATE TABLE refunds (
 -- CLOSING(已向网关发起关单、结果未知)时唯一守卫失效,可并发建新 attempt → 双支付风险。
 -- 故活跃 = 0,1,2,3,5(排除 4已付/6已关/7失败三个终态)。
 --
--- worker 调度字段(评审补充):next_query_at/query_count 支持 UNKNOWN/CLOSING 的退避查单;
--- locked_by/locked_until 支持多副本租约抢占(SELECT ... FOR UPDATE SKIP LOCKED)。
+-- worker 调度字段:next_query_at/query_count 支持 READY/UNKNOWN/CLOSING 的退避查单;
+-- locked_by 每次认领保存新随机 token,写回匹配 token;locked_until 为多副本租约截止时间。
 CREATE TABLE payment_attempts (
     id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
     app_id         VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '接入方标识',
@@ -274,9 +279,9 @@ CREATE TABLE payment_attempts (
     expire_at      DATETIME     NOT NULL COMMENT '本次尝试的支付截止',
 
     -- worker 调度(查单退避 + 租约)。
-    next_query_at  DATETIME     NULL COMMENT '下次查单时间(UNKNOWN/CLOSING 退避)',
+    next_query_at  DATETIME     NULL COMMENT '下次查单时间(READY/UNKNOWN/CLOSING 退避,空值立即可查)',
     query_count    INT          NOT NULL DEFAULT 0 COMMENT '已查单次数',
-    locked_by      VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '租约持有 worker',
+    locked_by      VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '本次认领随机token,每次重新生成,非成功查询与重排写回须匹配',
     locked_until   DATETIME     NULL COMMENT '租约到期',
 
     -- 活跃唯一:活跃(0,1,2,3,5)时取 order_no,否则 NULL;唯一索引保证一订单最多一个活跃尝试。
@@ -305,15 +310,19 @@ CREATE TABLE payment_attempts (
 -- 订单下单时冻结 pay_account_id + mch_id + app_id + config_version,退款/查单/关单沿用原账号。
 -- collation:身份/路由列 ascii_bin,notify_route_id 必须精确匹配(回调路由)。
 CREATE TABLE app_pay_accounts (
+    reconcile_scan_version SMALLINT NOT NULL DEFAULT 1 COMMENT '历史建批次游标算法版本;升级后从created_at重扫',
+    reconcile_local_seed_cursor BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '历史本地流水回填ID;新写入同事务队列覆盖晚提交',
+
     pay_account_id  VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '支付账号ID(路由键)',
     app_id          VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '归属接入方',
     channel         VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'wechat/alipay',
-    mch_id          VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '微信商户号(支付宝留空)',
+    mch_id          VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '微信商户号或支付宝收款seller_id,启用账号必填,无空值回落;用于回调归属校验',
     pay_app_id      VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '微信/支付宝应用ID',
     notify_route_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '回调路由标识(不透明,URL /notify/{ch}/{route_id} 用;非安全凭证)',
     config_ref      VARCHAR(255) NOT NULL COMMENT '密钥管理系统中的配置引用(证书/私钥)',
     config_version  INT         NOT NULL DEFAULT 1 COMMENT '配置版本(轮换)',
     enabled         TINYINT     NOT NULL DEFAULT 1 COMMENT '是否启用',
+    reconcile_scanned_through DATE NULL DEFAULT NULL COMMENT '已确保连续账期批次存在的游标;NULL从created_at日起步,不是完成水位',
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (pay_account_id),
@@ -345,7 +354,7 @@ CREATE TABLE payment_transactions (
     channel            VARCHAR(32)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'wechat/alipay',
     kind               TINYINT      NOT NULL COMMENT '1支付 2退款',
     out_trade_no       VARCHAR(64)  CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '商户订单/退款号',
-    transaction_id     VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '第三方交易号(唯一)',
+    transaction_id     VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '资金流水唯一标识(支付为渠道交易号,支付宝退款为refund:请求号)',
     amount             BIGINT       NOT NULL COMMENT '金额(分)',
     currency           VARCHAR(8)   CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'CNY' COMMENT '币种',
     anomaly            TINYINT      NOT NULL DEFAULT 0 COMMENT '0正常 1资金异常(第二笔真实付款/金额账号不符,待人工)',
@@ -360,6 +369,7 @@ CREATE TABLE payment_transactions (
     KEY idx_order (order_no),
     KEY idx_refund (refund_no),
     KEY idx_account_time (pay_account_id, paid_at),
+    KEY idx_account_seed (channel, pay_account_id, id),
     KEY idx_anomaly (anomaly),
     CONSTRAINT chk_txn_amount_pos CHECK (amount > 0),
     CONSTRAINT chk_txn_kind CHECK (kind IN (1, 2))
@@ -406,6 +416,21 @@ CREATE TABLE order_events (
 -- 与本地 payment_transactions 逐笔比对,差异写 reconcile_diffs。批次唯一防重(同日同账号
 -- 只对账一次),支持多副本租约抢占(locked_by/locked_until)。
 CREATE TABLE reconcile_batches (
+    algorithm_version SMALLINT NOT NULL DEFAULT 1 COMMENT '内部算法代次;1历史支付,2支付与退款',
+    run_id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '当前比较代次',
+    source_run_id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '当前完整源导入代次,重比沿用',
+    published_run_id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '对外可见完整比较代次',
+    published_source_run_id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '对外可见完整账单源代次',
+    import_complete BOOLEAN NOT NULL DEFAULT FALSE COMMENT '完整性与汇总校验成功后封存',
+    compare_after_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '源证据逐页比较检查点',
+    dirty_seq BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '迟到本地资金触发的重比序号',
+    run_dirty_seq BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '当前比较已接收的重比序号',
+    published_dirty_seq BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '已发布比较覆盖的重比序号',
+    source_digest_algorithm VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '源文件审计摘要算法,旧记录留空',
+    source_digest VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '源文件摘要,仅审计不替代渠道成功复核',
+    source_refund_amount BIGINT NOT NULL DEFAULT 0 COMMENT '渠道退款本金合计,分',
+    local_refund_amount BIGINT NOT NULL DEFAULT 0 COMMENT '匹配范围内本地退款本金合计,分',
+
     id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
     batch_no       VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '对账批次号(本服务生成,唯一)',
     app_id         VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '接入方(账号可跨 app 时留空)',
@@ -420,8 +445,8 @@ CREATE TABLE reconcile_batches (
     source_amount  BIGINT  NOT NULL DEFAULT 0 COMMENT '渠道账单总额(分)',
     local_amount   BIGINT  NOT NULL DEFAULT 0 COMMENT '本地流水总额(分)',
 
-    locked_by      VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '租约持有 worker',
-    locked_until   DATETIME NULL COMMENT '租约到期',
+    locked_by      VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '本次认领随机标识(每次重新生成,完成与失败写回CAS)',
+    locked_until   DATETIME NULL COMMENT '执行租约到期;失败且无持有者时为下次可重试时间',
     pulled_at      DATETIME NULL COMMENT '账单拉取完成时间',
     reconciled_at  DATETIME NULL COMMENT '对账完成时间',
     last_error     TEXT NULL COMMENT '最近错误',
@@ -430,8 +455,9 @@ CREATE TABLE reconcile_batches (
     updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_batch_no (batch_no),
-    UNIQUE KEY uk_account_date (channel, pay_account_id, bill_date),
-    KEY idx_status (status, bill_date)
+    UNIQUE KEY uk_account_date (channel, pay_account_id, bill_date, algorithm_version),
+    KEY idx_status (status, bill_date),
+    KEY idx_reconcile_claim (channel, pay_account_id, algorithm_version, status, locked_until, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='渠道账单对账批次';
 
 
@@ -445,6 +471,21 @@ CREATE TABLE reconcile_batches (
 -- 每条差异带独立处理状态与人工处理审计(处理人/时间/备注),不能只有清单无处理入口。
 -- 自动长短款处理为 roadmap;V1 落库 + 告警 + 人工处理入口。
 CREATE TABLE reconcile_diffs (
+    run_id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '比较代次;空为旧算法或本地单边差异',
+    entry_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '源证据ID;0禁止自动资金补偿',
+    kind TINYINT NOT NULL DEFAULT 1 COMMENT '1支付 2退款',
+    identity_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '完整资金身份SHA256;本地单边按流水ID',
+    local_txn_id BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '本地不可变资金流水ID',
+    original_transaction_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '退款原支付渠道交易号',
+    out_refund_no VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '商户退款请求号',
+    refund_no VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '本地退款单号',
+    currency VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '核对币种;旧差异未知留空',
+    verify_attempts INT NOT NULL DEFAULT 0 COMMENT '正向核实累计次数,不因重试清零',
+    next_verify_at DATETIME(3) NULL DEFAULT NULL COMMENT '正向补偿下次可尝试时间;NULL首次可领取',
+    verify_locked_by VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '每次补偿认领随机token',
+    verify_locked_until DATETIME(3) NULL DEFAULT NULL COMMENT '补偿租约截止,过期结果禁止写回',
+    verify_last_error TEXT NULL COMMENT '脱敏补偿结果,不写下载URL或原始响应',
+
     id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
     batch_id       BIGINT UNSIGNED NOT NULL COMMENT '所属对账批次',
     app_id         VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '接入方',
@@ -468,7 +509,9 @@ CREATE TABLE reconcile_diffs (
     updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (id),
     -- 同批次内一笔交易只记一条差异,重跑对账幂等。
-    UNIQUE KEY uk_batch_txn (batch_id, channel, transaction_id, diff_type),
+    UNIQUE KEY uk_batch_txn (batch_id, run_id, kind, identity_key, diff_type),
+    KEY idx_repair_claim (channel, pay_account_id, handle_status, next_verify_at, verify_locked_until, id),
+    KEY idx_local_diff (batch_id, local_txn_id),
     KEY idx_handle (handle_status, diff_type),
     KEY idx_order (order_no),
     CONSTRAINT chk_diff_type CHECK (diff_type IN (1, 2, 3, 4))
@@ -513,3 +556,47 @@ CREATE TABLE app_amount_policies (
     CONSTRAINT chk_amount_policy_nonneg CHECK (min_payable >= 0 AND max_payable >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='per-app 金额策略(未配置回退全局默认档)';
 
+
+-- 分页账单证据和本地资金唤醒（000003）
+CREATE TABLE reconcile_bill_entries (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    batch_id BIGINT UNSIGNED NOT NULL,
+    run_id VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    kind TINYINT NOT NULL,
+    identity_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    channel VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    pay_account_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    transaction_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '独立渠道交易或退款号;支付宝退款为空',
+    original_transaction_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+    out_trade_no VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    out_refund_no VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+    amount BIGINT NOT NULL COMMENT '本金分,包含券等资金组成,不使用净结算金额',
+    currency VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    event_at DATETIME(3) NULL COMMENT '渠道事件时间;退款可能为受理日,不能作为成功日',
+    merchant_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+    provider_app_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '' COMMENT '文件真实AppID;支付宝无此列留空',
+    source_status VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_source_identity (batch_id, run_id, kind, identity_key),
+    KEY idx_source_page (batch_id, run_id, id),
+    KEY idx_source_match (channel, pay_account_id, kind, identity_key, batch_id),
+    CONSTRAINT chk_bill_entry_kind CHECK (kind IN (1,2)),
+    CONSTRAINT chk_bill_entry_amount CHECK (amount > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE reconcile_local_changes (
+    txn_id BIGINT UNSIGNED NOT NULL COMMENT '同资金Insert事务创建,无外键或聚合锁',
+    channel VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    pay_account_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    done BOOLEAN NOT NULL DEFAULT FALSE COMMENT '已有完整匹配证据后停止重试',
+    attempts INT NOT NULL DEFAULT 0,
+    next_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    locked_by VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+    locked_until DATETIME(3) NULL DEFAULT NULL,
+    last_error TEXT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (txn_id),
+    KEY idx_local_claim (channel, pay_account_id, done, next_at, locked_until, txn_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

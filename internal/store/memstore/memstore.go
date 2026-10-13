@@ -20,6 +20,9 @@ type data struct {
 	refunds  map[uint64]models.Refund
 	txns     map[uint64]models.PaymentTransaction
 	batches  map[uint64]models.ReconcileBatch
+	accounts map[string]models.AppPayAccount
+	entries  map[uint64]models.ReconcileEntry
+	changes  map[uint64]models.ReconcileLocalChange
 	events   []models.OrderEvent
 	outbox   []models.EventOutbox
 	logs     []models.OrderLog
@@ -35,6 +38,9 @@ func newData() *data {
 		refunds:  map[uint64]models.Refund{},
 		txns:     map[uint64]models.PaymentTransaction{},
 		batches:  map[uint64]models.ReconcileBatch{},
+		accounts: map[string]models.AppPayAccount{},
+		entries:  map[uint64]models.ReconcileEntry{},
+		changes:  map[uint64]models.ReconcileLocalChange{},
 	}
 }
 
@@ -45,6 +51,9 @@ func (d *data) clone() *data {
 		refunds:  make(map[uint64]models.Refund, len(d.refunds)),
 		txns:     make(map[uint64]models.PaymentTransaction, len(d.txns)),
 		batches:  make(map[uint64]models.ReconcileBatch, len(d.batches)),
+		accounts: make(map[string]models.AppPayAccount, len(d.accounts)),
+		entries:  make(map[uint64]models.ReconcileEntry, len(d.entries)),
+		changes:  make(map[uint64]models.ReconcileLocalChange, len(d.changes)),
 		events:   append([]models.OrderEvent(nil), d.events...),
 		outbox:   append([]models.EventOutbox(nil), d.outbox...),
 		logs:     append([]models.OrderLog(nil), d.logs...),
@@ -57,6 +66,9 @@ func (d *data) clone() *data {
 	maps.Copy(n.refunds, d.refunds)
 	maps.Copy(n.txns, d.txns)
 	maps.Copy(n.batches, d.batches)
+	maps.Copy(n.accounts, d.accounts)
+	maps.Copy(n.entries, d.entries)
+	maps.Copy(n.changes, d.changes)
 	return n
 }
 
@@ -69,6 +81,13 @@ type Mem struct {
 
 // New 返回空的内存 store。
 func New() *Mem { return &Mem{d: newData()} }
+
+// SeedAccount 播种测试账号及其持久化对账游标;应用代码仍通过仓储端口读写。
+func (m *Mem) SeedAccount(a models.AppPayAccount) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.d.accounts[a.PayAccountID] = a
+}
 
 // WithinTx 串行执行事务:开始快照,fn 出错回滚。
 func (m *Mem) WithinTx(ctx context.Context, fn func(ctx context.Context, r store.Repos) error) error {

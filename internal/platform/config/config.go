@@ -43,7 +43,8 @@ type Config struct {
 	AttemptTTL    time.Duration // 单次支付尝试截止
 	// MaxPendingPerUser 单用户 PENDING 订单数上限(近似防刷;未配置默认 5,显式 0=不限)。
 	MaxPendingPerUser int
-	// LatePaymentRefundApps 已关闭订单收到付款时自动退款(不恢复订单)的 app;其余 app 结算为 PAID。
+	// LatePaymentRefundApps 检测遗留自动退款配置；默认空列表，非空拒绝启动。
+	// 有效支付统一恢复已关闭或取消订单，与退款开关无关。
 	LatePaymentRefundApps []string
 
 	// Outbox 投递 worker。
@@ -54,8 +55,9 @@ type Config struct {
 	SecretsDir        string            // 密钥挂载目录(K8s Secret volume);配置后优先于 env Static
 
 	// 对账 worker(需真实渠道账单源;V1 默认关闭)。
-	ReconcileEnabled  bool
-	ReconcileInterval time.Duration
+	ReconcileAutoConfirm bool // 已发布账单正向查单补偿；默认false，必须同时启用对账。
+	ReconcileEnabled     bool
+	ReconcileInterval    time.Duration
 
 	// 死信兜底重放 worker(outbox.deadletter 段;默认关闭,上线观察后再开)。
 	DeadLetter DeadLetterConfig
@@ -224,8 +226,9 @@ type fileConfig struct {
 		Enabled bool `yaml:"enabled"`
 	} `yaml:"refund"`
 	Reconcile struct {
-		Enabled  bool   `yaml:"enabled"`
-		Interval string `yaml:"interval"`
+		AutoConfirm bool   `yaml:"auto_confirm"`
+		Enabled     bool   `yaml:"enabled"`
+		Interval    string `yaml:"interval"`
 	} `yaml:"reconcile"`
 	Webhook struct {
 		AllowHosts []string `yaml:"allowhosts"`
@@ -317,19 +320,20 @@ func Load(path string) (Config, error) {
 			Compress: fc.Log.Compress != 0, Console: fc.Log.ConsoleStdout != 0, File: fc.Log.FileStdout != 0,
 			LocalTime: fc.Log.LocalTime != 0, SQL: fc.Log.SQL != 0,
 		},
-		GRPCAddr:           orDefault(fc.GRPC.Addr, ":9090"),
-		HTTPAddr:           orDefault(fc.HTTP.Addr, ":8080"),
-		MachineID:          fc.Snowflake.MachineID,
-		NotifyBaseURL:      fc.HTTP.NotifyBaseURL,
-		RefundEnabled:      fc.Refund.Enabled,
-		WebhookAllowHosts:  fc.Webhook.AllowHosts,
-		WebhookAllowCIDRs:  fc.Webhook.AllowCIDRs,
-		SecretsDir:         fc.Secrets.Dir,
-		ReconcileEnabled:   fc.Reconcile.Enabled,
-		JWTIssuer:          fc.Auth.Issuer,
-		JWTAudience:        fc.Auth.Audience,
-		PricingTrustCaller: fc.Pricing.TrustCaller,
-		Alert:              AlertConfig{Provider: fc.Alert.Provider, WebhookURL: fc.Alert.WebhookURL, Secret: fc.Alert.Secret},
+		GRPCAddr:             orDefault(fc.GRPC.Addr, ":9090"),
+		HTTPAddr:             orDefault(fc.HTTP.Addr, ":8080"),
+		MachineID:            fc.Snowflake.MachineID,
+		NotifyBaseURL:        fc.HTTP.NotifyBaseURL,
+		RefundEnabled:        fc.Refund.Enabled,
+		WebhookAllowHosts:    fc.Webhook.AllowHosts,
+		WebhookAllowCIDRs:    fc.Webhook.AllowCIDRs,
+		SecretsDir:           fc.Secrets.Dir,
+		ReconcileEnabled:     fc.Reconcile.Enabled,
+		ReconcileAutoConfirm: fc.Reconcile.AutoConfirm,
+		JWTIssuer:            fc.Auth.Issuer,
+		JWTAudience:          fc.Auth.Audience,
+		PricingTrustCaller:   fc.Pricing.TrustCaller,
+		Alert:                AlertConfig{Provider: fc.Alert.Provider, WebhookURL: fc.Alert.WebhookURL, Secret: fc.Alert.Secret},
 	}
 	c.WorkerID = orDefault(fc.Worker.ID, fmt.Sprintf("worker-%d", c.MachineID))
 
@@ -347,11 +351,14 @@ func Load(path string) (Config, error) {
 		c.MaxPendingPerUser = *fc.Order.MaxPendingPerUser
 	}
 	c.LatePaymentRefundApps = fc.Order.LatePaymentRefundApps
-	if len(c.LatePaymentRefundApps) > 0 && !c.RefundEnabled {
-		// 自动退款依赖退款查单 worker(仅 refund.enabled 时运行)收敛,关闭时退款会永久停在 PROCESSING。
-		return Config{}, fmt.Errorf("config: order.latepaymentrefundapps 非空需 refund.enabled=true")
+	if len(c.LatePaymentRefundApps) > 0 {
+		// 已关闭/取消订单统一按真实付款恢复；拒绝静默忽略旧的自动退款策略。
+		return Config{}, fmt.Errorf("config: order.latepaymentrefundapps 已废弃，请清空列表；有效支付将恢复已关闭或已取消订单为 PAID")
 	}
-	if c.ReconcileInterval, err = parseDur(fc.Reconcile.Interval, 24*time.Hour, "reconcile.interval"); err != nil {
+	if c.ReconcileAutoConfirm && !c.ReconcileEnabled {
+		return Config{}, fmt.Errorf("config: reconcile.auto_confirm requires reconcile.enabled")
+	}
+	if c.ReconcileInterval, err = parseDur(fc.Reconcile.Interval, time.Minute, "reconcile.interval"); err != nil {
 		return Config{}, err
 	}
 	c.DeadLetter.Enabled = fc.Outbox.Deadletter.Enabled

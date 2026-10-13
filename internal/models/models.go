@@ -101,20 +101,22 @@ type PaymentAttempt struct {
 
 // Refund 退款执行流水(refunds)。
 type Refund struct {
-	ID              uint64
-	AppID           string
-	RefundNo        string
-	OutRefundNo     string
-	RequestHash     string
-	OrderNo         string
-	SourceTxnID     sql.NullInt64 // 按异常流水退款的源支付流水 id;NULL=订单级退款
-	PayAccountID    string
-	RefundAmount    int64
-	Status          RefundStatus
-	GatewayRefundID string
-	Reason          string
-	SucceededAt     sql.NullTime
-	LastError       sql.NullString
+	ID               uint64
+	AppID            string
+	RefundNo         string
+	OutRefundNo      string
+	RequestHash      string
+	OrderNo          string
+	SourceTxnID      sql.NullInt64 // 按异常流水退款的源支付流水 id;NULL=订单级退款
+	PayAccountID     string
+	RefundAmount     int64
+	Status           RefundStatus
+	GatewayRefundID  string
+	Reason           string
+	SucceededAt      sql.NullTime
+	LastError        sql.NullString
+	NotExistCount    int32 // 连续查证不存在次数;任一其他结果/查询错误清零,不用于退避
+	GatewayConfirmed bool  // 渠道已受理/查到存在或迁移保守保护;一旦确认不由查询清除
 
 	NextQueryAt sql.NullTime
 	QueryCount  int32
@@ -227,6 +229,21 @@ const (
 
 // ReconcileBatch 渠道账单对账批次(reconcile_batches)。
 type ReconcileBatch struct {
+	SourceDigestAlgorithm string
+	SourceDigest          string
+	AlgorithmVersion      int16
+	RunID                 string
+	SourceRunID           string
+	PublishedSourceRunID  string
+	PublishedRunID        string
+	ImportComplete        bool
+	CompareAfterID        uint64
+	DirtySeq              uint64
+	RunDirtySeq           uint64
+	PublishedDirtySeq     uint64
+	SourceRefundAmount    int64
+	LocalRefundAmount     int64
+
 	ID           uint64
 	BatchNo      string
 	AppID        string
@@ -291,6 +308,21 @@ func CanDiffHandleTransit(from, to DiffHandleStatus) bool {
 
 // ReconcileDiff 对账差异(reconcile_diffs)。
 type ReconcileDiff struct {
+	RunID                 string
+	EntryID               uint64
+	Kind                  TxnKind
+	IdentityKey           string
+	LocalTxnID            uint64
+	OriginalTransactionID string
+	OutRefundNo           string
+	RefundNo              string
+	Currency              string
+	VerifyAttempts        int32
+	NextVerifyAt          sql.NullTime
+	VerifyLockedBy        string
+	VerifyLockedUntil     sql.NullTime
+	VerifyLastError       sql.NullString
+
 	ID            uint64
 	BatchID       uint64
 	AppID         string
@@ -341,12 +373,17 @@ type AppPayAccount struct {
 	PayAccountID  string `gorm:"primaryKey"`
 	AppID         string
 	Channel       string
-	MchID         string
+	MchID         string // 微信商户号或支付宝收款 seller_id;启用账号必填,用于回调归属校验,无空值回落
 	PayAppID      string
 	NotifyRouteID string
 	ConfigRef     string
 	ConfigVersion int32
 	Enabled       bool
+	CreatedAt     time.Time
+	// ReconcileScannedThrough 已确保连续账期批次存在的日期;NULL 从 CreatedAt 日起步,不是完成水位。
+	ReconcileScannedThrough  sql.NullTime
+	ReconcileScanVersion     int16
+	ReconcileLocalSeedCursor uint64
 }
 
 // AppAmountPolicy per-app 金额策略(app_amount_policies;未配置/停用回退全局默认档)。

@@ -40,6 +40,7 @@ func New(svc *opsapp.Service, refund *refundapp.Service) (*Server, error) {
 	return &Server{svc: svc, refund: refund, validator: v}, nil
 }
 
+// validate 使用 protovalidate 验证请求消息。
 func (s *Server) validate(msg proto.Message) error {
 	if err := s.validator.Validate(msg); err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -150,12 +151,19 @@ func (s *Server) ListReconcileDiffs(ctx context.Context, req *orderv1.ListReconc
 func diffProto(d *models.ReconcileDiff) *orderv1.ReconcileDiffRecord {
 	rec := &orderv1.ReconcileDiffRecord{
 		Id: d.ID, BatchId: d.BatchID, AppId: d.AppID, Channel: d.Channel, PayAccountId: d.PayAccountID,
-		DiffType: orderv1.ReconcileDiffType(d.DiffType), OrderNo: d.OrderNo,
+		TransactionKind: int32(d.Kind), OriginalTransactionId: d.OriginalTransactionID,
+		OutRefundNo: d.OutRefundNo, RefundNo: d.RefundNo, Currency: d.Currency,
+		ImportId: d.RunID, LocalTransactionId: d.LocalTxnID, VerificationAttempts: d.VerifyAttempts,
+		VerificationLastError: d.VerifyLastError.String,
+		DiffType:              orderv1.ReconcileDiffType(d.DiffType), OrderNo: d.OrderNo,
 		TransactionId: d.TransactionID, OutTradeNo: d.OutTradeNo,
 		GatewayAmount: d.GatewayAmount, LocalAmount: d.LocalAmount, Detail: d.Detail,
 		HandleStatus: orderv1.DiffHandleStatus(int32(d.HandleStatus) + 1),
 		HandledBy:    d.HandledBy, HandleRemark: d.HandleRemark,
 		CreatedAt: timestamppb.New(d.CreatedAt),
+	}
+	if d.NextVerifyAt.Valid {
+		rec.NextVerificationAt = timestamppb.New(d.NextVerifyAt.Time)
 	}
 	if d.HandledAt.Valid {
 		rec.HandledAt = timestamppb.New(d.HandledAt.Time)

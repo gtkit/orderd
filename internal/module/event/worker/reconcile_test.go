@@ -19,14 +19,26 @@ func (f fakeLister) List(context.Context) ([]models.AppPayAccount, error) { retu
 
 type fakeBillSrc struct{ b bill.Bill }
 
-func (f fakeBillSrc) Fetch(context.Context, string, string, time.Time) (bill.Bill, error) {
-	return f.b, nil
+func (f fakeBillSrc) Fetch(_ context.Context, _, _ string, _ time.Time, emit func(bill.Entry) error) (bill.Summary, error) {
+	var summary bill.Summary
+	for _, e := range f.b.Entries {
+		e.Kind = models.TxnPay
+		e.Currency = "CNY"
+		e.Status = "SUCCESS"
+		if err := emit(e); err != nil {
+			return summary, err
+		}
+		summary.Count++
+		summary.PayAmount += e.Amount
+	}
+	return summary, nil
 }
 
 func TestReconcileWorkerRunOnce(t *testing.T) {
 	mem := memstore.New()
 	now := time.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC)
 	day := yesterday(now) // 2026-07-16
+	mem.SeedAccount(models.AppPayAccount{AppID: "app1", Channel: "wechat", PayAccountID: "acc-wechat", CreatedAt: day, Enabled: true})
 
 	// 本地一笔支付流水落在前一账期。
 	if err := mem.WithinTx(bg, func(ctx context.Context, r store.Repos) error {

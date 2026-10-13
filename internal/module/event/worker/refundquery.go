@@ -8,6 +8,7 @@ import (
 	"github.com/gtkit/logger"
 	"github.com/gtkit/orderd/internal/models"
 	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
+	"github.com/gtkit/orderd/internal/pkg/idgen"
 	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/store"
 )
@@ -53,7 +54,7 @@ func (c *RefundQueryConfig) withDefaults() {
 	}
 }
 
-// RefundQueryWorker 认领处理中的退款,向网关查单收敛为成功/失败(DESIGN §10)。
+// RefundQueryWorker 认领处理中的退款,向网关查单收敛为成功、明确失败或人工异常(DESIGN §10)。
 type RefundQueryWorker struct {
 	store   store.Store
 	refund  *refundapp.Service
@@ -74,24 +75,37 @@ func NewRefundQueryWorker(st store.Store, ref *refundapp.Service, alerter alert.
 // RunOnce 认领一批 PROCESSING 退款并查单;仍处理中的按退避重排。
 // 认领前先恢复滞留 CREATED 的退款(崩溃/更新失败兜底),使其进入正常收敛链路。
 func (w *RefundQueryWorker) RunOnce(ctx context.Context) (int, error) {
-	now := w.clock()
-	w.recoverStuckCreated(ctx, now)
-	var batch []*models.Refund
-	err := w.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		var e error
-		batch, e = r.Refunds().ClaimQueryDue(ctx, w.cfg.WorkerID, now, now.Add(w.cfg.LeaseTTL), w.cfg.BatchSize)
-		return e
-	})
-	if err != nil {
-		return 0, err
-	}
-	for _, rf := range batch {
-		if qerr := w.refund.QueryRefund(ctx, rf); qerr != nil {
-			logger.Warnw("退款查单失败", "refund_no", rf.RefundNo, "err", qerr)
+	w.recoverStuckCreated(ctx, w.clock())
+	processed := 0
+	for range w.cfg.BatchSize {
+		if err := ctx.Err(); err != nil {
+			return processed, err
 		}
-		w.rescheduleIfProcessing(ctx, rf.RefundNo, rf.QueryCount)
+		token, err := idgen.UUIDv4()
+		if err != nil {
+			return processed, err
+		}
+		now := w.clock()
+		var batch []*models.Refund
+		err = w.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+			var e error
+			batch, e = r.Refunds().ClaimQueryDue(ctx, token, now, now.Add(w.cfg.LeaseTTL), 1)
+			return e
+		})
+		if err != nil {
+			return processed, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		rf := batch[0]
+		if qerr := w.refund.QueryRefund(ctx, rf); qerr != nil {
+			logger.Warnw("退款查单失败", "refund_no", rf.RefundNo, "worker", w.cfg.WorkerID, "err", qerr)
+		}
+		w.rescheduleIfProcessing(ctx, rf.RefundNo, token)
+		processed++
 	}
-	return len(batch), nil
+	return processed, nil
 }
 
 // recoverStuckCreated 把滞留 CREATED 的退款恢复为 PROCESSING + 立即查单。
@@ -127,24 +141,26 @@ func (w *RefundQueryWorker) recoverStuckCreated(ctx context.Context, now time.Ti
 // 查询次数恰好跨过 MaxQueries 时告警一次(边沿触发,不会每轮刷);告警在事务外发出,
 // 不把外部 IO 放进持锁期间。达阈值只告警不落终态:钱可能实际已退,本地判失败会造成账实不符,
 // 滞留由退款通知或人工介入收敛。
-func (w *RefundQueryWorker) rescheduleIfProcessing(ctx context.Context, refundNo string, prevCount int32) {
+func (w *RefundQueryWorker) rescheduleIfProcessing(ctx context.Context, refundNo, token string) {
 	var (
-		stalled bool
-		orderNo string
+		stalled    bool
+		orderNo    string
+		queryCount int32
 	)
 	err := w.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		rf, err := r.Refunds().GetByRefundNo(ctx, refundNo, true)
 		if err != nil {
 			return err
 		}
-		if rf.Status != models.RefundProcessing {
-			return nil // 已终态,无需重排(不会被再次认领)
+		if rf.Status != models.RefundProcessing || rf.LockedBy != token {
+			return nil // 已终态或被新的认领接管,旧结果不得重排
 		}
-		rf.QueryCount = prevCount + 1
+		rf.QueryCount++
 		rf.NextQueryAt = sql.NullTime{Time: w.clock().Add(jitterBackoff(w.cfg.BaseBackoff, w.cfg.MaxBackoff, rf.QueryCount)), Valid: true}
 		rf.LockedBy = ""
 		rf.LockedUntil = sql.NullTime{}
 		stalled, orderNo = rf.QueryCount == w.cfg.MaxQueries, rf.OrderNo
+		queryCount = rf.QueryCount
 		return r.Refunds().Update(ctx, rf)
 	})
 	if err != nil {
@@ -153,7 +169,7 @@ func (w *RefundQueryWorker) rescheduleIfProcessing(ctx context.Context, refundNo
 	}
 	if stalled {
 		w.alerter.Anomaly(ctx, "refund_query_stalled", map[string]any{
-			"refund_no": refundNo, "order_no": orderNo, "query_count": prevCount + 1,
+			"refund_no": refundNo, "order_no": orderNo, "query_count": queryCount,
 		})
 	}
 }

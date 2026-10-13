@@ -5,7 +5,7 @@ orderd 只做订单与资金主链,**不做交付/发权益**(接入方消费事
 
 - 对外契约:`proto/order/v1/*.proto` —— 同源生成 **gRPC + REST(grpc-gateway)+ OpenAPI**(`pb/order.swagger.json`,供 PHP 等非 gRPC 接入方)
 - 事件契约:`proto/order/v1/events.proto` + 接入方消费 SDK `sdk/orderevents`
-- 数据模型:`docs/sql/schema.sql`(orderd **独立库**权威建表草稿,9 张核心表 + 2 张对账表;本项目无迁移工具,人工评审执行,生产禁 AutoMigrate)
+- 数据模型:`docs/sql/schema.sql`(orderd **独立库**权威建表草稿,15 张表，含对账源证据与本地流水核对队列;本项目无迁移工具,人工评审执行,生产禁 AutoMigrate)
 - 两套 schema、两个库、两个执行方,勿混:`docs/sql/schema.sql` 由 orderd/DBA 建在 **orderd 自己的库**;`sdk/orderevents/inbox_schema.sql` 由**接入方**建在**接入方自己的业务库**(发权益幂等真相源)
 
 ---
@@ -50,7 +50,7 @@ internal/
   module/event/worker/                             投递/查单/超时/退款查单/对账 worker
   paygateway/ + paygateway/{alipaygw,wechatgw}/    网关端口 + 支付宝/微信适配(gtkit/go-pay)
   pkg/{auth,sqlutil,webhook,dbtx,requestid,interceptor,idgen,ordernum}  纯工具:JWT/SQL助手/出口投递/context-tx/请求标识/拦截器/号码
-  shared/{account,endpoint,bill,secret,alert}      跨模块轻量 port:账号/端点/账单源/密钥/告警
+  shared/{account,endpoint,bill,secret,alert}      跨模块 port 与适配器:账号/端点/账单源/密钥/告警
   platform/{config,data}   配置加载 + ormx 连接
   runtime/ bootstrap/      装配 + 生命周期(gRPC + REST 网关 + worker)
 sdk/orderevents/           接入方事件消费 SDK(含 inbox_schema.sql)
@@ -88,7 +88,7 @@ sequenceDiagram
     Note over BFF: inbox 幂等,event_id 唯一 + 版本单调<br/>同事务发权益/落账单 → 回 2xx
 ```
 
-兜底路径(图外,均已实现):回调丢失由**查单 worker** 收敛 UNKNOWN/CLOSING 尝试;支付超时由**超时 watchdog** 关单(含 REQUESTING 卡死、CLOSING 滞留);webhook 漏投由接入方 `ListOrderEvents` 游标补拉;投递失败退避重试,达上限转死信(AdminService 可查可重放,兜底重放 worker 可选)。
+兜底路径(图外,均已实现):回调丢失由**查单 worker** 收敛 READY/UNKNOWN/CLOSING 尝试;支付超时由**超时 watchdog** 关单(含 REQUESTING 卡死、CLOSING 滞留);webhook 漏投由接入方 `ListOrderEvents` 游标补拉;投递失败退避重试,达上限转死信(AdminService 可查可重放,兜底重放 worker 可选)。
 
 ### 退款执行(审批在接入方 admin,orderd 只执行)
 
@@ -149,7 +149,7 @@ go run ./examples/createorder
 | `ORDERD_MYSQL_PASSWORD` | 否 | MySQL 口令覆盖:非空则盖过 yaml `database.password`(生产密钥注入用) |
 | `ORDERD_WEBHOOK_SECRETS` | 否 | **仅 dev**:`ref=secret,...`(生产用 KMS) |
 
-**支付渠道凭据在 `pay:` 段**(与 go-pay 的 alipay/wechat Config 对齐:私钥/证书支持 `*_pem` 内容或 `*_path` 挂载文件;证书模式 vs 公钥模式)。这些是敏感项:**真实 `env.yml` 必须 git 忽略 + 按环境挂载,提交仓库的只能是 `env.example.yml`(凭据留空);生产优先用 `*_path` 指向挂载的密钥文件**。深度凭据校验由 go-pay provider 在启动时 fail-fast,orderd 只校验路由必填项(`app_id`/`notify_url`/`account_id`,微信另加 `mch_id`)。
+**支付渠道凭据在 `pay:` 段**(与 go-pay 的 alipay/wechat Config 对齐:私钥/证书支持 `*_pem` 内容或 `*_path` 挂载文件;证书模式 vs 公钥模式)。这些是敏感项:**真实 `env.yml` 必须 git 忽略 + 按环境挂载,提交仓库的只能是 `env.example.yml`(凭据留空);生产优先用 `*_path` 指向挂载的密钥文件**。深度凭据校验由 go-pay provider 在启动时 fail-fast。orderd 校验路由必填项(`app_id`/`notify_url`/`account_id`,微信另加 `mch_id`);支付宝还要求对应 `app_pay_accounts` 记录的 `mch_id` 保存收款 `seller_id`,与 `pay_app_id` 一起用于验签后的商户身份核对,留空无回落并拒绝启动。
 
 YAML 结构(节选,全量见 `config/env/env.example.yml`):
 
@@ -164,7 +164,7 @@ database:                      # dbtype/host/port/dbname/user/password + 连接�
 redis: { addr: "127.0.0.1:6379", password: "", dbs: [0,1,2], prefix: "" }   # 当前未消费,仅解析保留
 order: { ttl: "30m", attemptttl: "15m" }
 refund: { enabled: true }      # 开启需同时发放 refund:execute 权限
-reconcile: { enabled: false }  # 需真实渠道账单源
+reconcile: { enabled: false, interval: "1m", auto_confirm: false } # 真实账单核对；正向资金确认独立开关，默认关闭
 pricing: { trustcaller: false }# 默认拒绝采信客户端金额(fail-closed);BFF 经严格服务身份才置 true
 auth: { issuer: "bff", audience: "orderd" }   # JWT 密钥走 env ORDERD_JWT_KEYS
 snowflake: { machineid: 0 }    # 多副本 StatefulSet ordinal 静态分配
@@ -290,13 +290,20 @@ JWT 载荷(claims):
 ### CancelOrder — 用户取消待支付订单
 从未提交网关 → `CANCELLED`;有已提交历史 → `CLOSING`,提交后 orderd 立即向渠道尽力关单一次,再由查单 worker 按渠道查单结果确认 `CLOSED` 并发 `order.closed`。
 `CLOSING` 表示"渠道侧可能仍可支付":预下单/扫码模式下用户尚未扫码时渠道查不到交易,订单会保持 `CLOSING` 直到商户单截止(`order.attemptttl`)后才落 `CLOSED`;期间用户若扫旧码付款,订单转 `PAID` 并发 `order.paid`。
-`CLOSED` 表示渠道已确认不可再支付。已 `CLOSED` 的订单再收到真实付款,按 app 配置二选一:
-- **默认:结算为 `PAID`**(资金已入账,权益仍可发放),同时清空 `close_reason`、指标 `orderd_pay_confirm_total{outcome="paid_after_closed"}` 计数并发出 `paid_after_closed` 告警;
-- **app 在 `order.latepaymentrefundapps` 中:自动退款、不恢复订单**(适合收到 `order.closed` 后会释放库存/名额的接入方)。订单保持 `CLOSED`、不发 `order.paid`;付款落 `paid_after_closed` 异常流水(`ListAnomalyTxns` 可查),并以退款号 `late-<流水id>` 自动发起按流水退款,由退款查单 worker 收敛;自动退款失败告警 `late_payment_refund_failed`,运维可对该流水手动 `RefundAnomalyTxn`。配置非空要求 `refund.enabled=true`,否则启动失败。
+`CLOSED`/`CANCELLED` 收到验签及账号、商户单号、金额、币种校验通过的成功付款后，统一恢复为 `PAID`，不受本地到期限制。事务内写支付流水、结算快照和 `order.paid` 事件，清空 `close_reason`；重复通知幂等。事件保留 `previous_status` 和聚合版本，接入方必须处理已关闭后的资源恢复与履约幂等。退款中的订单不因旧通知回到已支付。
 
-`CLOSING` 期间(接入方尚未收到 `order.closed`)的付款两种配置下都结算为 `PAID`。该情形应当罕见,出现即需排查关单收敛。
+旧配置 `order.latepaymentrefundapps` 仅用于检测遗留策略：默认/留空为 `[]`，非空启动失败，须清空后迁移至统一恢复语义，与 `refund.enabled` 无关。历史自动退款流水仍保留供审计和人工处理。`paid_after_closed` 指标与告警记录关闭或取消后的付款恢复。
+
+`READY`、`UNKNOWN`、`CLOSING` 都会主动查单；渠道无此单只有在尝试截止加宽限期之后才能释放槽位，累计错误次数不会提前关闭仍可支付的二维码。
 
 ### RefundOrder / GetRefund — 退款(V1 授权关闭)
+
+退款幂等键 `out_refund_no` 支持并发同请求复用同一退款号，参数不同则拒绝。支付宝返回的渠道退款号可能等于原支付交易号，因此退款资金流水使用 `refund:<out_refund_no>` 独立标识；原渠道退款号仍保留供审计。流水唯一键冲突必须核对全部身份和金额，不能直接当作退款成功。
+
+`not_exist_count` 仅记录连续的“退款不存在”，网络错误或处理中结果会清零；`query_count` 只负责调度。渠道确认受理、处理中或成功后，`gateway_confirmed` 持久保留。任何退款连续 6 次不存在都进入 `ABNORMAL`/`REFUND_EXCEPTION` 人工处置并保留资金守卫；明确渠道异常同样进入人工链。渠道受理后本地证据写入可能失败，因此缺少受理证据也不能据此判定未退款。只有明确渠道失败、确定从未发出或明确未受理才允许自动失败回退。退款成功金额缺失或不符也转人工核实；成功时间仅保存渠道原值，缺失时保留空值，人工核实时间记录在操作审计中。
+
+部署时先停止旧版本的退款执行与查询写入，再执行新增迁移 `docs/sql/20261012000001_alter_refunds_add_query_evidence.sql` 并校验回填，最后统一启动新版本服务和 worker，禁止新旧实例混跑。迁移将存量在途退款保守标记为渠道已确认，避免历史受理证据丢失造成重复退款。
+
 `RefundOrder`:`order_no`、`refund_amount`(V1=全额)、`reason`、`out_refund_no`(幂等键)。需 `refund:execute` + `ORDERD_REFUND_ENABLED=true`。
 `GetRefund`:`refund_no` 或 `out_refund_no` 二选一(均按 `app_id` 隔离)。
 
@@ -356,7 +363,7 @@ orderd 通过 Outbox worker 把订单事件 HTTP 推给接入方配置的 `webho
 - 头:`X-Order-Event-Id`(幂等键)、`X-Order-Event-Type`、`X-Order-Key-Id`、`X-Order-Timestamp`、`X-Order-Signature = sha256=HMAC-SHA256(timestamp + "." + raw_body, secret)`。
 - 事件类型:`order.paid` / `order.refunded` / `order.closed`。
 - **幂等 + 防乱序**:`event_id` 去重 + `aggregate_version` 单调(拒绝比已处理更旧的事件)。
-- **`order.paid` 可能晚于 `order.closed`**:关闭后迟到付款会再发 `order.paid`(`previous_status=CLOSED`,`aggregate_version` 更大)。接入方消费 `order.closed` 后不得把订单视为终态;收到后续 `order.paid` 应以其为准发放权益,或调用 `RefundOrder` 退款。
+- **`order.paid` 可能晚于 `order.closed`**:关闭后迟到付款会再发 `order.paid`(`previous_status=CLOSED/CANCELLED`,`aggregate_version` 更大)。接入方消费 `order.closed` 后不得把订单视为终态;收到后续 `order.paid` 应以其为准发放权益,或调用 `RefundOrder` 退款。
 - `order.paid` 的 `pay_channel`/`pay_method` 是**实际结算渠道**(换渠道后与下单渠道可能不同)。
 
 接入方消费(权益发放的**幂等真相源必须是接入方 MySQL 的 `inbox_events`**,见 `sdk/orderevents/inbox_schema.sql`):
@@ -420,9 +427,9 @@ SDK 行为(资金安全):`OnPaid` 必填(缺失 panic);资金事件(paid/refunde
 1. **播种账号**(schema 由 `make setup-db` 建好后):
    ```sql
    INSERT INTO app_pay_accounts(pay_account_id,app_id,channel,mch_id,pay_app_id,notify_route_id,config_ref,config_version,enabled)
-   VALUES('acc-alipay','app1','alipay','','<APPID>','alipay-sbx','env',1,1);
+   VALUES('acc-alipay','app1','alipay','<SELLER_ID>','<APPID>','alipay-sbx','env',1,1);
    ```
-   `app_id` 必须与调用 JWT 的 `app_id` 一致;`notify_route_id` 与 `pay.alipay.route_id` 一致。
+   `app_id` 必须与调用 JWT 的 `app_id` 一致;`notify_route_id` 与 `pay.alipay.route_id` 一致。`<SELLER_ID>` 填该环境真实收款支付宝账号的 seller_id,用于回调商户身份校验,不能填应用 APPID、沙箱买家账号或留空。
 2. **ngrok** 暴露本机 HTTP:`ngrok http 8080`,`pay.alipay.notify_url=https://<域名>/notify/alipay/alipay-sbx`。
 3. **起服务**(`config/env/env.yml` 的 `pay.alipay.*` 填 app_id/notify_url/route_id;私钥/公钥填 `private_key`/`alipay_public_key`,或用 `private_key_path` 挂载,勿提交)。
 4. **下单**:`go run ./examples/createorder`(`PAY_METHOD=alipay`)→ `app_params` 是二维码内容(native)→ 用沙箱买家扫码付款。
@@ -438,24 +445,30 @@ SDK 行为(资金安全):`OnPaid` 必填(缺失 panic);资金事件(paid/refunde
 
 | worker | 职责 |
 |---|---|
-| Outbox 投递 | 认领待投递事件 → 签名 HTTP 推送 → 退避重试 → 死信告警(§12) |
-| 支付查单 | 收敛 UNKNOWN/CLOSING 支付尝试(§9),查单=已付走 §7;CLOSING 尝试"渠道无此单"须等商户单截止后才确认关闭 |
+| Outbox 投递 | 逐条认领后立即签名 HTTP 推送;失败写回按本次随机 token CAS,退避重试与死信告警(§12) |
+| 支付查单 | 收敛 READY/UNKNOWN/CLOSING 支付尝试(§9),查单=已付走 §7;CLOSING 尝试"渠道无此单"须等商户单截止后才确认关闭 |
 | 超时关单 | 过期 PENDING 订单 → CLOSING/CLOSED;卡死 REQUESTING → UNKNOWN |
 | 退款查单 | 收敛 PROCESSING 退款(`ORDERD_REFUND_ENABLED` 时) |
-| 对账 | 每日渠道账单比对 → 差异落 `reconcile_diffs` + 告警(`ORDERD_RECONCILE_ENABLED` 时) |
+| 对账 | 真实支付宝/微信日账单，持久化日期游标、分代暂存与分页发布，支付/退款双向核对、迟到资金唤醒；自动正向确认默认关闭 |
+
+对账使用独立算法修订号、源证据代次和执行认领token。旧支付批次不会被误当成退款已核对；新财务流水同事务追加核对唤醒，历史账单封存后可离线重比。按东八区日切，每轮最多31个日期和8个工作片，100条一页；30秒Fetch、45秒工作片、60秒租约，失败5分钟后重试。`reconcile.interval`留空默认1分钟，`auto_confirm`默认false且依赖enabled；只有完整发布的账单与独立成功查单、已有本地对象身份/本金均匹配才复用既有确认事务。
+
+上线前必须完成增量迁移与真实商户验收，详见 [对账上线清单](docs/reconciliation-rollout.md)。本地模拟不能替代真实账单模板、渠道凭据、容量和生产恢复演练。
 
 ---
 
 ## 开发与门禁
 
 ```bash
-make check          # gofmt + buf lint + go vet + golangci-lint + go test -race(提交门禁)
-make test-race      # 竞态测试
-make setup-db       # 建库(应用 docs/sql/schema.sql;无迁移工具)
-make gen            # 由 proto 生成 pb/(go + grpc + grpc-gateway + openapiv2)
-make build          # 编译
+make check          # 当前Makefile实际运行govulncheck与gosec
+go test -race -count=1 -timeout=5m ./...
+go vet ./...
+go build ./...
+golangci-lint run ./...
+buf lint proto
+# proto生成：在proto目录按buf.gen.yaml执行buf generate；禁止手改pb。
 # 集成测试(需真实 MySQL):
-ORDERD_TEST_MYSQL_DSN='root@tcp(127.0.0.1:3306)/orderd_it?parseTime=true' make test-integration
+ORDERD_TEST_MYSQL_DSN='root@tcp(127.0.0.1:3306)/orderd_test?parseTime=true&interpolateParams=true' go test -race -tags=integration -count=1 ./internal/repository/gormstore
 ```
 
 核心资金链、状态机、幂等、并发矩阵均有单测(`internal/apptest`、`internal/module/**`),门禁要求 `go test -race` 全绿。
@@ -472,6 +485,14 @@ ORDERD_TEST_MYSQL_DSN='root@tcp(127.0.0.1:3306)/orderd_it?parseTime=true' make t
   微信**退款独立通知**(`/refund-notify/wechat`)为可选加速器,退款终态由 RefundQueryWorker 收敛,暂未接(501)。
 
 **未接(需外部条件)**:
-- **真实渠道账单源**(对账 worker 的 `bill.Source`)—— 现为占位;
+- **真实渠道账单验收**—— runtime已装配支付宝/微信真实源，支持模板与安全限制见[上线清单](docs/reconciliation-rollout.md)；真实商户文件、签名查询、历史补件和大额资金预发布演练仍须授权环境完成，不能由本地mock结果代替。
 - **KMS/Vault**(`secret.Resolver`)—— dev 走 env,生产需接密钥系统;
 - DESIGN §17 完整故障注入集成测试矩阵。
+
+### 支付回调商户身份校验
+
+支付宝启用时，`pay.alipay.account_id` 对应的 `app_pay_accounts` 记录必须存在，渠道为 `alipay`，`pay_app_id` 与配置 `pay.alipay.app_id` 相同，`mch_id` 为真实支付宝收款商户 `seller_id`。适配层在验签后检查这些身份字段，缺失或不一致拒绝结算；微信同样验证通知中的 `appid/mchid`。不以签名通过代替商户归属检查。
+
+**已有支付宝账户升级**：旧版播种说明曾允许 `mch_id` 留空。切换新版本前，部署方须按每个 `pay_account_id` 核实该环境的真实收款 `seller_id`，补入对应 `app_pay_accounts.mch_id`，并核对 `channel='alipay'`、`pay_app_id` 与部署配置一致，再启动服务。该值没有默认或 YAML 回落，不能从 APPID 猜测，也不能用一份商户身份批量覆盖多个账户。未补录会在启动时失败；本次代码及 SQL 迁移不会自动改写已有账户身份。
+
+退款查询同样要求渠道返回的 `out_trade_no` 与 `out_refund_no` 都非空且匹配本次请求；缺失或错配按查询错误重试，不能因金额相同就确认另一笔退款成功。

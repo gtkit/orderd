@@ -10,6 +10,9 @@ import (
 // ddlColumns 是各表在 docs/sql/schema.sql 中的真实列集(权威)。
 // 生成列(active_order/active_guard)由 DB 维护、不在 model,故不列入。
 var ddlColumns = map[string]map[string]bool{
+	"reconcile_bill_entries":  set("id", "batch_id", "run_id", "kind", "identity_key", "channel", "pay_account_id", "transaction_id", "original_transaction_id", "out_trade_no", "out_refund_no", "amount", "currency", "event_at", "merchant_id", "provider_app_id", "source_status", "created_at"),
+	"reconcile_local_changes": set("txn_id", "channel", "pay_account_id", "done", "attempts", "next_at", "locked_by", "locked_until", "last_error", "created_at", "updated_at"),
+
 	"orders": set(
 		"id", "app_id", "idempotency_key", "request_hash", "client_order_no", "order_no", "order_token",
 		"user_id", "status", "close_reason", "product_id", "product_title", "business_type",
@@ -28,6 +31,7 @@ var ddlColumns = map[string]map[string]bool{
 	"refunds": set(
 		"id", "app_id", "refund_no", "out_refund_no", "request_hash", "order_no", "source_txn_id", "pay_account_id",
 		"refund_amount", "status", "gateway_refund_id", "reason", "succeeded_at", "last_error",
+		"not_exist_count", "gateway_confirmed",
 		"next_query_at", "query_count", "locked_by", "locked_until", "created_at", "updated_at",
 	),
 	"payment_transactions": set(
@@ -45,19 +49,22 @@ var ddlColumns = map[string]map[string]bool{
 		"id", "event_id", "app_id", "order_no", "event_type", "aggregate_version", "payload", "status",
 		"attempts", "next_attempt_at", "locked_by", "locked_until", "last_error", "created_at", "updated_at",
 	),
-	"reconcile_batches": set(
+	"reconcile_batches": set("source_digest_algorithm", "source_digest",
+		"algorithm_version", "run_id", "source_run_id", "published_run_id", "published_source_run_id", "import_complete", "compare_after_id", "dirty_seq", "run_dirty_seq", "published_dirty_seq", "source_refund_amount", "local_refund_amount",
 		"id", "batch_no", "app_id", "channel", "pay_account_id", "bill_date", "status", "source_count",
 		"matched_count", "diff_count", "source_amount", "local_amount", "locked_by", "locked_until",
 		"pulled_at", "reconciled_at", "last_error", "created_at", "updated_at",
 	),
 	"reconcile_diffs": set(
+		"run_id", "entry_id", "kind", "identity_key", "local_txn_id", "original_transaction_id", "out_refund_no", "refund_no", "currency", "verify_attempts", "next_verify_at", "verify_locked_by", "verify_locked_until", "verify_last_error",
 		"id", "batch_id", "app_id", "channel", "pay_account_id", "diff_type", "order_no", "transaction_id",
 		"out_trade_no", "gateway_amount", "local_amount", "detail", "handle_status", "handled_by",
 		"handled_at", "handle_remark", "created_at", "updated_at",
 	),
 	"app_pay_accounts": set(
+		"reconcile_scan_version", "reconcile_local_seed_cursor",
 		"pay_account_id", "app_id", "channel", "mch_id", "pay_app_id", "notify_route_id", "config_ref",
-		"config_version", "enabled", "created_at", "updated_at",
+		"config_version", "enabled", "created_at", "updated_at", "reconcile_scanned_through",
 	),
 	"app_endpoints": set(
 		"app_id", "webhook_url", "key_id", "hmac_secret_ref", "prev_key_id", "prev_hmac_secret_ref",
@@ -98,6 +105,8 @@ func TestGormSchemaMappingMatchesDDL(t *testing.T) {
 		{&OrderEvent{}, "order_events"},
 		{&EventOutbox{}, "event_outbox"},
 		{&ReconcileBatch{}, "reconcile_batches"},
+		{&ReconcileEntry{}, "reconcile_bill_entries"},
+		{&ReconcileLocalChange{}, "reconcile_local_changes"},
 		{&ReconcileDiff{}, "reconcile_diffs"},
 		{&AppPayAccount{}, "app_pay_accounts"},
 		{&AppEndpoint{}, "app_endpoints"},

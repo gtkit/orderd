@@ -87,7 +87,7 @@ func TestOrderTransitions(t *testing.T) {
 		{OrderRefunding, OrderRefunded, true},
 		{OrderRefunding, OrderPaid, true},
 		{OrderRefunding, OrderRefundException, true},
-		{OrderCancelled, OrderPaid, false}, // 终态不可复活(评审 #5:历史 CLOSED 才能晚付,CANCELLED 不能)
+		{OrderCancelled, OrderPaid, true}, // 有效付款可恢复取消订单
 		{OrderPending, OrderRefunding, false},
 		{OrderPaid, OrderCancelled, false},
 		{OrderRefunded, OrderPaid, false},
@@ -110,7 +110,7 @@ func TestCanSettlePayment(t *testing.T) {
 		{OrderClosing, true},
 		{OrderClosed, true}, // 异常恢复:查单证明真实付款
 		{OrderPaid, false},
-		{OrderCancelled, false},
+		{OrderCancelled, true},
 		{OrderRefunding, false}, // 退款回退边不可被支付确认借道
 		{OrderRefunded, false},
 		{OrderRefundException, false},
@@ -140,6 +140,13 @@ func TestAttemptAndRefundTransitions(t *testing.T) {
 	}
 	if CanRefundTransit(RefundSucceeded, RefundFailed) {
 		t.Fatal("SUCCEEDED 为终态")
+	}
+	// CREATED 记录已提交后,提交网关与写回 PROCESSING 不在同一事务。
+	// 映射必须包含明确拒绝及成功通知/查询先到的真实恢复路径。
+	for _, target := range []RefundStatus{RefundSucceeded, RefundFailed, RefundAbnormal} {
+		if !CanRefundTransit(RefundCreated, target) {
+			t.Errorf("CREATED 受理写回窗口必须允许收敛到 %d", target)
+		}
 	}
 }
 

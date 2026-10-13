@@ -272,8 +272,20 @@ type ReconcileDiffRecord struct {
 	HandledAt     *timestamppb.Timestamp `protobuf:"bytes,15,opt,name=handled_at,json=handledAt,proto3" json:"handled_at,omitempty"`
 	HandleRemark  string                 `protobuf:"bytes,16,opt,name=handle_remark,json=handleRemark,proto3" json:"handle_remark,omitempty"`
 	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,17,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// 0=历史未指定，1=支付，2=退款；本金均为正整数分。
+	TransactionKind       int32  `protobuf:"varint,18,opt,name=transaction_kind,json=transactionKind,proto3" json:"transaction_kind,omitempty"`
+	OriginalTransactionId string `protobuf:"bytes,19,opt,name=original_transaction_id,json=originalTransactionId,proto3" json:"original_transaction_id,omitempty"`
+	OutRefundNo           string `protobuf:"bytes,20,opt,name=out_refund_no,json=outRefundNo,proto3" json:"out_refund_no,omitempty"`
+	RefundNo              string `protobuf:"bytes,21,opt,name=refund_no,json=refundNo,proto3" json:"refund_no,omitempty"`
+	Currency              string `protobuf:"bytes,22,opt,name=currency,proto3" json:"currency,omitempty"`
+	ImportId              string `protobuf:"bytes,23,opt,name=import_id,json=importId,proto3" json:"import_id,omitempty"`
+	// 本地待核实证据可能不属于已取得的账期，此时batch_id=0。
+	LocalTransactionId    uint64                 `protobuf:"varint,24,opt,name=local_transaction_id,json=localTransactionId,proto3" json:"local_transaction_id,omitempty"`
+	VerificationAttempts  int32                  `protobuf:"varint,25,opt,name=verification_attempts,json=verificationAttempts,proto3" json:"verification_attempts,omitempty"`
+	NextVerificationAt    *timestamppb.Timestamp `protobuf:"bytes,26,opt,name=next_verification_at,json=nextVerificationAt,proto3" json:"next_verification_at,omitempty"`
+	VerificationLastError string                 `protobuf:"bytes,27,opt,name=verification_last_error,json=verificationLastError,proto3" json:"verification_last_error,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ReconcileDiffRecord) Reset() {
@@ -423,6 +435,76 @@ func (x *ReconcileDiffRecord) GetCreatedAt() *timestamppb.Timestamp {
 		return x.CreatedAt
 	}
 	return nil
+}
+
+func (x *ReconcileDiffRecord) GetTransactionKind() int32 {
+	if x != nil {
+		return x.TransactionKind
+	}
+	return 0
+}
+
+func (x *ReconcileDiffRecord) GetOriginalTransactionId() string {
+	if x != nil {
+		return x.OriginalTransactionId
+	}
+	return ""
+}
+
+func (x *ReconcileDiffRecord) GetOutRefundNo() string {
+	if x != nil {
+		return x.OutRefundNo
+	}
+	return ""
+}
+
+func (x *ReconcileDiffRecord) GetRefundNo() string {
+	if x != nil {
+		return x.RefundNo
+	}
+	return ""
+}
+
+func (x *ReconcileDiffRecord) GetCurrency() string {
+	if x != nil {
+		return x.Currency
+	}
+	return ""
+}
+
+func (x *ReconcileDiffRecord) GetImportId() string {
+	if x != nil {
+		return x.ImportId
+	}
+	return ""
+}
+
+func (x *ReconcileDiffRecord) GetLocalTransactionId() uint64 {
+	if x != nil {
+		return x.LocalTransactionId
+	}
+	return 0
+}
+
+func (x *ReconcileDiffRecord) GetVerificationAttempts() int32 {
+	if x != nil {
+		return x.VerificationAttempts
+	}
+	return 0
+}
+
+func (x *ReconcileDiffRecord) GetNextVerificationAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.NextVerificationAt
+	}
+	return nil
+}
+
+func (x *ReconcileDiffRecord) GetVerificationLastError() string {
+	if x != nil {
+		return x.VerificationLastError
+	}
+	return ""
 }
 
 type ListReconcileDiffsResponse struct {
@@ -1451,7 +1533,7 @@ const file_order_v1_admin_proto_rawDesc = "" +
 	"billDateTo\x12\x1f\n" +
 	"\x06cursor\x18\b \x01(\tB\a\xbaH\x04r\x02\x18\x14R\x06cursor\x12 \n" +
 	"\x05limit\x18\t \x01(\x05B\n" +
-	"\xbaH\a\x1a\x05\x18\xc8\x01(\x00R\x05limit\"\x92\x05\n" +
+	"\xbaH\a\x1a\x05\x18\xc8\x01(\x00R\x05limit\"\xdc\b\n" +
 	"\x13ReconcileDiffRecord\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x04R\x02id\x12\x19\n" +
 	"\bbatch_id\x18\x02 \x01(\x04R\abatchId\x12\x15\n" +
@@ -1474,7 +1556,17 @@ const file_order_v1_admin_proto_rawDesc = "" +
 	"handled_at\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\thandledAt\x12#\n" +
 	"\rhandle_remark\x18\x10 \x01(\tR\fhandleRemark\x129\n" +
 	"\n" +
-	"created_at\x18\x11 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"r\n" +
+	"created_at\x18\x11 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12)\n" +
+	"\x10transaction_kind\x18\x12 \x01(\x05R\x0ftransactionKind\x126\n" +
+	"\x17original_transaction_id\x18\x13 \x01(\tR\x15originalTransactionId\x12\"\n" +
+	"\rout_refund_no\x18\x14 \x01(\tR\voutRefundNo\x12\x1b\n" +
+	"\trefund_no\x18\x15 \x01(\tR\brefundNo\x12\x1a\n" +
+	"\bcurrency\x18\x16 \x01(\tR\bcurrency\x12\x1b\n" +
+	"\timport_id\x18\x17 \x01(\tR\bimportId\x120\n" +
+	"\x14local_transaction_id\x18\x18 \x01(\x04R\x12localTransactionId\x123\n" +
+	"\x15verification_attempts\x18\x19 \x01(\x05R\x14verificationAttempts\x12L\n" +
+	"\x14next_verification_at\x18\x1a \x01(\v2\x1a.google.protobuf.TimestampR\x12nextVerificationAt\x126\n" +
+	"\x17verification_last_error\x18\x1b \x01(\tR\x15verificationLastError\"r\n" +
 	"\x1aListReconcileDiffsResponse\x123\n" +
 	"\x05diffs\x18\x01 \x03(\v2\x1d.order.v1.ReconcileDiffRecordR\x05diffs\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\tR\n" +
@@ -1629,40 +1721,41 @@ var file_order_v1_admin_proto_depIdxs = []int32{
 	0,  // 3: order.v1.ReconcileDiffRecord.handle_status:type_name -> order.v1.DiffHandleStatus
 	19, // 4: order.v1.ReconcileDiffRecord.handled_at:type_name -> google.protobuf.Timestamp
 	19, // 5: order.v1.ReconcileDiffRecord.created_at:type_name -> google.protobuf.Timestamp
-	3,  // 6: order.v1.ListReconcileDiffsResponse.diffs:type_name -> order.v1.ReconcileDiffRecord
-	0,  // 7: order.v1.HandleReconcileDiffRequest.target:type_name -> order.v1.DiffHandleStatus
-	0,  // 8: order.v1.HandleReconcileDiffResponse.handle_status:type_name -> order.v1.DiffHandleStatus
-	19, // 9: order.v1.DeadLetterRecord.created_at:type_name -> google.protobuf.Timestamp
-	19, // 10: order.v1.DeadLetterRecord.updated_at:type_name -> google.protobuf.Timestamp
-	8,  // 11: order.v1.ListDeadLettersResponse.dead_letters:type_name -> order.v1.DeadLetterRecord
-	19, // 12: order.v1.ListAnomalyTxnsRequest.paid_from:type_name -> google.protobuf.Timestamp
-	19, // 13: order.v1.ListAnomalyTxnsRequest.paid_to:type_name -> google.protobuf.Timestamp
-	19, // 14: order.v1.AnomalyTxnRecord.paid_at:type_name -> google.protobuf.Timestamp
-	19, // 15: order.v1.AnomalyTxnRecord.created_at:type_name -> google.protobuf.Timestamp
-	13, // 16: order.v1.ListAnomalyTxnsResponse.txns:type_name -> order.v1.AnomalyTxnRecord
-	20, // 17: order.v1.RefundAnomalyTxnResponse.status:type_name -> order.v1.RefundStatus
-	20, // 18: order.v1.ResolveRefundAbnormalRequest.target:type_name -> order.v1.RefundStatus
-	20, // 19: order.v1.ResolveRefundAbnormalResponse.status:type_name -> order.v1.RefundStatus
-	21, // 20: order.v1.ResolveRefundAbnormalResponse.order_status:type_name -> order.v1.OrderStatus
-	2,  // 21: order.v1.AdminService.ListReconcileDiffs:input_type -> order.v1.ListReconcileDiffsRequest
-	5,  // 22: order.v1.AdminService.HandleReconcileDiff:input_type -> order.v1.HandleReconcileDiffRequest
-	7,  // 23: order.v1.AdminService.ListDeadLetters:input_type -> order.v1.ListDeadLettersRequest
-	10, // 24: order.v1.AdminService.RequeueDeadLetter:input_type -> order.v1.RequeueDeadLetterRequest
-	12, // 25: order.v1.AdminService.ListAnomalyTxns:input_type -> order.v1.ListAnomalyTxnsRequest
-	15, // 26: order.v1.AdminService.RefundAnomalyTxn:input_type -> order.v1.RefundAnomalyTxnRequest
-	17, // 27: order.v1.AdminService.ResolveRefundAbnormal:input_type -> order.v1.ResolveRefundAbnormalRequest
-	4,  // 28: order.v1.AdminService.ListReconcileDiffs:output_type -> order.v1.ListReconcileDiffsResponse
-	6,  // 29: order.v1.AdminService.HandleReconcileDiff:output_type -> order.v1.HandleReconcileDiffResponse
-	9,  // 30: order.v1.AdminService.ListDeadLetters:output_type -> order.v1.ListDeadLettersResponse
-	11, // 31: order.v1.AdminService.RequeueDeadLetter:output_type -> order.v1.RequeueDeadLetterResponse
-	14, // 32: order.v1.AdminService.ListAnomalyTxns:output_type -> order.v1.ListAnomalyTxnsResponse
-	16, // 33: order.v1.AdminService.RefundAnomalyTxn:output_type -> order.v1.RefundAnomalyTxnResponse
-	18, // 34: order.v1.AdminService.ResolveRefundAbnormal:output_type -> order.v1.ResolveRefundAbnormalResponse
-	28, // [28:35] is the sub-list for method output_type
-	21, // [21:28] is the sub-list for method input_type
-	21, // [21:21] is the sub-list for extension type_name
-	21, // [21:21] is the sub-list for extension extendee
-	0,  // [0:21] is the sub-list for field type_name
+	19, // 6: order.v1.ReconcileDiffRecord.next_verification_at:type_name -> google.protobuf.Timestamp
+	3,  // 7: order.v1.ListReconcileDiffsResponse.diffs:type_name -> order.v1.ReconcileDiffRecord
+	0,  // 8: order.v1.HandleReconcileDiffRequest.target:type_name -> order.v1.DiffHandleStatus
+	0,  // 9: order.v1.HandleReconcileDiffResponse.handle_status:type_name -> order.v1.DiffHandleStatus
+	19, // 10: order.v1.DeadLetterRecord.created_at:type_name -> google.protobuf.Timestamp
+	19, // 11: order.v1.DeadLetterRecord.updated_at:type_name -> google.protobuf.Timestamp
+	8,  // 12: order.v1.ListDeadLettersResponse.dead_letters:type_name -> order.v1.DeadLetterRecord
+	19, // 13: order.v1.ListAnomalyTxnsRequest.paid_from:type_name -> google.protobuf.Timestamp
+	19, // 14: order.v1.ListAnomalyTxnsRequest.paid_to:type_name -> google.protobuf.Timestamp
+	19, // 15: order.v1.AnomalyTxnRecord.paid_at:type_name -> google.protobuf.Timestamp
+	19, // 16: order.v1.AnomalyTxnRecord.created_at:type_name -> google.protobuf.Timestamp
+	13, // 17: order.v1.ListAnomalyTxnsResponse.txns:type_name -> order.v1.AnomalyTxnRecord
+	20, // 18: order.v1.RefundAnomalyTxnResponse.status:type_name -> order.v1.RefundStatus
+	20, // 19: order.v1.ResolveRefundAbnormalRequest.target:type_name -> order.v1.RefundStatus
+	20, // 20: order.v1.ResolveRefundAbnormalResponse.status:type_name -> order.v1.RefundStatus
+	21, // 21: order.v1.ResolveRefundAbnormalResponse.order_status:type_name -> order.v1.OrderStatus
+	2,  // 22: order.v1.AdminService.ListReconcileDiffs:input_type -> order.v1.ListReconcileDiffsRequest
+	5,  // 23: order.v1.AdminService.HandleReconcileDiff:input_type -> order.v1.HandleReconcileDiffRequest
+	7,  // 24: order.v1.AdminService.ListDeadLetters:input_type -> order.v1.ListDeadLettersRequest
+	10, // 25: order.v1.AdminService.RequeueDeadLetter:input_type -> order.v1.RequeueDeadLetterRequest
+	12, // 26: order.v1.AdminService.ListAnomalyTxns:input_type -> order.v1.ListAnomalyTxnsRequest
+	15, // 27: order.v1.AdminService.RefundAnomalyTxn:input_type -> order.v1.RefundAnomalyTxnRequest
+	17, // 28: order.v1.AdminService.ResolveRefundAbnormal:input_type -> order.v1.ResolveRefundAbnormalRequest
+	4,  // 29: order.v1.AdminService.ListReconcileDiffs:output_type -> order.v1.ListReconcileDiffsResponse
+	6,  // 30: order.v1.AdminService.HandleReconcileDiff:output_type -> order.v1.HandleReconcileDiffResponse
+	9,  // 31: order.v1.AdminService.ListDeadLetters:output_type -> order.v1.ListDeadLettersResponse
+	11, // 32: order.v1.AdminService.RequeueDeadLetter:output_type -> order.v1.RequeueDeadLetterResponse
+	14, // 33: order.v1.AdminService.ListAnomalyTxns:output_type -> order.v1.ListAnomalyTxnsResponse
+	16, // 34: order.v1.AdminService.RefundAnomalyTxn:output_type -> order.v1.RefundAnomalyTxnResponse
+	18, // 35: order.v1.AdminService.ResolveRefundAbnormal:output_type -> order.v1.ResolveRefundAbnormalResponse
+	29, // [29:36] is the sub-list for method output_type
+	22, // [22:29] is the sub-list for method input_type
+	22, // [22:22] is the sub-list for extension type_name
+	22, // [22:22] is the sub-list for extension extendee
+	0,  // [0:22] is the sub-list for field type_name
 }
 
 func init() { file_order_v1_admin_proto_init() }

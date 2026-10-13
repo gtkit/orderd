@@ -4,6 +4,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/gtkit/logger"
@@ -33,7 +34,6 @@ import (
 	"github.com/gtkit/orderd/internal/repository/gormstore"
 	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/shared/alert/hook"
-	billstub "github.com/gtkit/orderd/internal/shared/bill/stub"
 	"github.com/gtkit/orderd/internal/shared/secret"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -71,6 +71,12 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	st := gormstore.New(cli)
+	built := false
+	defer func() {
+		if !built {
+			_ = st.Close()
+		}
+	}()
 	gen, err := ordernum.NewGenerator(cfg.MachineID)
 	if err != nil {
 		return nil, err
@@ -81,6 +87,13 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		alerter   alert.Alerter = loggerAlerter{}
 		alertHook *hook.Alerter
 	)
+	defer func() {
+		if !built && alertHook != nil {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			alertHook.Close(closeCtx)
+		}
+	}()
 	if cfg.Alert.Provider != "" {
 		h, herr := hook.New(hook.Config{
 			Provider: cfg.Alert.Provider, WebhookURL: cfg.Alert.WebhookURL, Secret: cfg.Alert.Secret,
@@ -102,9 +115,18 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 		wechatR   paygateway.Router
 	)
 	if a := cfg.Pay.Alipay; a.Enabled {
+		accountCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		acct, accountErr := accounts.ResolveByID(accountCtx, a.AccountID)
+		cancel()
+		if accountErr != nil {
+			return nil, fmt.Errorf("读取支付宝回调商户身份: %w", accountErr)
+		}
+		if acct.Channel != "alipay" || acct.PayAppID != a.AppID || acct.MchID == "" {
+			return nil, fmt.Errorf("支付宝账号渠道/app_id/商户身份与配置不一致: %s", a.AccountID)
+		}
 		ar, aerr := alipaygw.NewRouter([]alipaygw.Config{{
 			PayAccountID: a.AccountID, NotifyRouteID: a.RouteID, NotifyURL: a.NotifyURL, TradeType: a.TradeType,
-			AppID: a.AppID, PrivateKey: a.PrivateKey, PrivateKeyPath: a.PrivateKeyPath, IsProduction: a.IsProduction,
+			AppID: a.AppID, SellerID: acct.MchID, PrivateKey: a.PrivateKey, PrivateKeyPath: a.PrivateKeyPath, IsProduction: a.IsProduction,
 			AppCertPublicKey: a.AppCertPublicKey, AppCertPublicKeyPath: a.AppCertPublicKeyPath,
 			AlipayRootCert: a.AlipayRootCert, AlipayRootCertPath: a.AlipayRootCertPath,
 			AlipayCertPublicKey: a.AlipayCertPublicKey, AlipayCertPublicKeyPath: a.AlipayCertPublicKeyPath,
@@ -135,18 +157,18 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 	reg.MustRegister(metrics.NewBacklogCollector(st.DB()))
 	flow := metrics.NewFlowMetrics(reg)
 
+	bills, err := buildBillRouter(ctx, cfg, accounts)
+	if err != nil {
+		return nil, err
+	}
+
 	ref := refundapp.New(refundapp.Deps{
-		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
+		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock, BillVerifier: bills,
 		NewRefundNo: gen.RefundNo, NewEventID: idgen.UUIDv4, Enabled: cfg.RefundEnabled,
 	})
-	lateRefundApps := make(map[string]bool, len(cfg.LatePaymentRefundApps))
-	for _, a := range cfg.LatePaymentRefundApps {
-		lateRefundApps[a] = true
-	}
 	pay := paymentapp.New(paymentapp.Deps{
-		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock,
+		Store: st, Router: router, Accounts: accounts, Alerter: alerter, Clock: clock, BillVerifier: bills,
 		NewEventID: idgen.UUIDv4, OutTradeNo: gen.OutTradeNo, AttemptTTL: cfg.AttemptTTL, Obs: flow,
-		LateRefundApps: lateRefundApps, LateRefunder: ref,
 	})
 	// 定价:默认 fail-closed;仅显式开启(BFF 经严格服务身份)才采信调用方金额(评审 P1)。
 	var pricing models.PricingAuthority = policy.DenyAllPricing{}
@@ -211,14 +233,16 @@ func Build(ctx context.Context, cfg config.Config) (*App, error) {
 			MaxAutoRequeues: int32(cfg.DeadLetter.MaxAutoRequeues), MaxLifetime: cfg.DeadLetter.MaxLifetime,
 		}, clock)
 	}
-	// 对账 worker:需真实渠道账单源;V1 默认关闭(ReconcileEnabled=false → 不启动)。
+	// 真实账单核对与受限正向补偿：默认均关闭，资金补偿需单独开关。
 	if cfg.ReconcileEnabled {
 		reconcileSvc := reconcileapp.New(reconcileapp.Deps{
-			Store: st, Bill: billstub.Source{}, Alerter: alerter, Clock: clock, NewBatchNo: gen.BatchNo,
+			Store: st, Bill: bills, Alerter: alerter, Clock: clock, NewBatchNo: gen.BatchNo,
+			Repair: positiveRepairRouter{payment: pay, refund: ref}, AutoConfirm: cfg.ReconcileAutoConfirm,
 		})
 		set.Reconcile = worker.NewReconcileWorker(reconcileSvc, accounts, cfg.ReconcileInterval, clock)
 	}
 
+	built = true
 	return &App{
 		Cfg: cfg, Store: st, GRPC: grpcSrv, AdminGRPC: adminSrv, Interceptor: interceptor,
 		HTTP: httpcb.New(aliRouter, wcRouter, pay), Workers: worker.New(set),

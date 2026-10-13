@@ -66,8 +66,8 @@ func TestLoadValid(t *testing.T) {
 	if c.AttemptTTL != 15*time.Minute {
 		t.Fatalf("attemptttl 应取默认 15m: %v", c.AttemptTTL)
 	}
-	if c.ReconcileInterval != 24*time.Hour {
-		t.Fatalf("reconcile.interval 应取默认 24h: %v", c.ReconcileInterval)
+	if c.ReconcileInterval != time.Minute {
+		t.Fatalf("reconcile.interval 应取默认 1m: %v", c.ReconcileInterval)
 	}
 	if c.WorkerID != "worker-0" {
 		t.Fatalf("worker.id 应自动 worker-0: %q", c.WorkerID)
@@ -81,6 +81,20 @@ func TestLoadValid(t *testing.T) {
 	}
 	if string(c.JWTKeys["dev1"]) != "dev-secret-change-me-32bytes-xx" {
 		t.Fatalf("JWT 密钥应来自 env: %v", c.JWTKeys)
+	}
+}
+
+func TestLegacyLateRefundPolicyRejected(t *testing.T) {
+	for _, enabled := range []string{"false", "true"} {
+		t.Run(enabled, func(t *testing.T) {
+			setSecrets(t)
+			yml := strings.Replace(validYAML, "order:\n", "order:\n  latepaymentrefundapps: [app1]\n", 1)
+			yml += "\nrefund:\n  enabled: " + enabled + "\n"
+			_, err := Load(writeTemp(t, yml))
+			if err == nil || !strings.Contains(err.Error(), "latepaymentrefundapps 已废弃") {
+				t.Fatalf("legacy policy must fail explicitly: %v", err)
+			}
+		})
 	}
 }
 
@@ -264,5 +278,34 @@ func TestLoadSecretsDir(t *testing.T) {
 	c, err = Load(writeTemp(t, validYAML+"secrets:\n  dir: \"/var/run/secrets/orderd\"\n"))
 	if err != nil || c.SecretsDir != "/var/run/secrets/orderd" {
 		t.Fatalf("secrets.dir 解析失败: %q err=%v", c.SecretsDir, err)
+	}
+}
+
+func TestReconcileAutomaticConfirmationConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name, section         string
+		enabled, confirm, bad bool
+	}{
+		{"default", "", false, false, false},
+		{"read only", "reconcile:\n  enabled: true\n", true, false, false},
+		{"enabled", "reconcile:\n  enabled: true\n  auto_confirm: true\n", true, true, false},
+		{"orphan switch", "reconcile:\n  enabled: false\n  auto_confirm: true\n", false, true, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setSecrets(t)
+			c, err := Load(writeTemp(t, validYAML+"\n"+tt.section))
+			if tt.bad {
+				if err == nil || !strings.Contains(err.Error(), "auto_confirm requires") {
+					t.Fatalf("want dependency error: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.ReconcileEnabled != tt.enabled || c.ReconcileAutoConfirm != tt.confirm {
+				t.Fatalf("switches=%v/%v", c.ReconcileEnabled, c.ReconcileAutoConfirm)
+			}
+		})
 	}
 }

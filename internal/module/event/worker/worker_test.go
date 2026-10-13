@@ -223,7 +223,7 @@ func TestDeliveryObserverOutcomes(t *testing.T) {
 		if e != nil {
 			return e
 		}
-		return r.Outbox().Reschedule(ctx, o.ID, qClock(), o.Attempts, "x")
+		return r.Outbox().Requeue(ctx, o.ID, qClock())
 	})
 	if err != nil {
 		t.Fatal(err)

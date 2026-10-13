@@ -6,19 +6,19 @@ package application
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/gtkit/logger"
 	"github.com/gtkit/orderd/internal/models"
 	eventapp "github.com/gtkit/orderd/internal/module/event/application"
-	refundapp "github.com/gtkit/orderd/internal/module/refund/application"
 	"github.com/gtkit/orderd/internal/paygateway"
 	"github.com/gtkit/orderd/internal/pkg/sqlutil"
 	"github.com/gtkit/orderd/internal/shared/account"
 	"github.com/gtkit/orderd/internal/shared/alert"
+	"github.com/gtkit/orderd/internal/shared/bill"
 	"github.com/gtkit/orderd/internal/shared/obs"
 	"github.com/gtkit/orderd/internal/store"
 )
@@ -28,6 +28,7 @@ const minPayWindow = time.Minute
 
 // Deps 是 payment 服务的依赖。
 type Deps struct {
+	BillVerifier   bill.Verifier // 对账补偿专用的完整验签查单端口；nil时拒绝补偿。
 	Store          store.Store
 	Router         paygateway.Router
 	Accounts       account.Resolver
@@ -39,15 +40,6 @@ type Deps struct {
 	GatewayTimeout time.Duration // 单次网关调用强制超时(评审 P1)
 	// Obs 关键路径埋点端口(nil → Nop,行为不变)。
 	Obs obs.FlowObserver
-	// LateRefundApps 已关闭订单收到付款时自动退款(不恢复订单)的 app;LateRefunder 执行退款。
-	// 列表为空时 LateRefunder 可为 nil。
-	LateRefundApps map[string]bool
-	LateRefunder   LateRefunder
-}
-
-// LateRefunder 迟到付款自动退款端口(refund 服务实现:按异常流水退款,out_refund_no 幂等)。
-type LateRefunder interface {
-	RefundAnomalyTxn(ctx context.Context, in refundapp.AnomalyRefundInput) (refundapp.RefundOutcome, error)
 }
 
 // Service 支付应用服务。
@@ -162,10 +154,16 @@ func (s *Service) preparePayment(ctx context.Context, in PrepareInput) (PrepareO
 		case active.Channel != channel:
 			// 异渠道 REQUESTING/UNKNOWN:提交结果未定,不能并发开新单;分别由超时 watchdog / 查单 worker 收敛。
 			return fmt.Errorf("%w: 存在结果未定的活跃尝试,换渠道需待其收敛%w", models.ErrActiveAttemptExists, rejection(obs.PrepareRejectForeignInflight))
+		case !active.ExpireAt.After(s.d.Clock().Add(minPayWindow)):
+			return fmt.Errorf("%w: 尝试已临近截止，等待查单确认%w", models.ErrActiveAttemptExists, rejection(obs.PrepareRejectPayWindow))
 		default:
 			// 同渠道 REQUESTING/READY/UNKNOWN:重新驱动到 REQUESTING 以便再取 prepay
 			// (并发幂等重放共用同一在途商户单号,不拒绝)。
 			active.Status = models.AttemptRequesting
+			// 新调起令旧负面查单结果失效；已支付事实仍可直接确认。
+			active.LockedBy = ""
+			active.LockedUntil = sql.NullTime{}
+			active.NextQueryAt = sql.NullTime{}
 			if err := r.Attempts().Update(ctx, active); err != nil {
 				return err
 			}
@@ -209,12 +207,18 @@ func (s *Service) preparePayment(ctx context.Context, in PrepareInput) (PrepareO
 			// 期间被取消/关单:不再置就绪,尝试留待 reconcile(评审 #8 取消 vs 建尝试竞态)。
 			return models.ErrOrderNotPending
 		}
-		a, err := r.Attempts().GetByOutTradeNo(ctx, plan.outTradeNo, false)
+		a, err := r.Attempts().GetByOutTradeNo(ctx, plan.outTradeNo, true)
 		if err != nil {
 			return err
 		}
 		if a == nil {
 			return store.ErrNotFound
+		}
+		if a.Status != models.AttemptRequesting && a.Status != models.AttemptUnknown && a.Status != models.AttemptReady {
+			return models.ErrActiveAttemptExists
+		}
+		if !s.d.Clock().Before(o.ExpireAt) || !s.d.Clock().Before(a.ExpireAt) {
+			return models.ErrOrderNotPending
 		}
 		a.Status = models.AttemptReady
 		a.PrepayID = pr.PrepayID
@@ -350,16 +354,18 @@ func (s *Service) markAttemptUnknown(outTradeNo string) {
 
 // ConfirmInput 网关确认的一笔成功支付(回调或查单)。
 type ConfirmInput struct {
-	AppID         string
-	OrderNo       string
-	OutTradeNo    string
-	Channel       string
-	PayAccountID  string
-	TransactionID string
-	Amount        int64
-	Currency      string
-	PaidAt        time.Time
-	NotifyDigest  string
+	// 非nil仅由本包账单补偿设置：同一订单锁事务内拒绝所有异常入账分支。
+	reconcileAccount *models.AppPayAccount
+	AppID            string
+	OrderNo          string
+	OutTradeNo       string
+	Channel          string
+	PayAccountID     string
+	TransactionID    string
+	Amount           int64
+	Currency         string
+	PaidAt           time.Time
+	NotifyDigest     string
 }
 
 // ConfirmResult 确认结果。
@@ -367,7 +373,7 @@ type ConfirmResult struct {
 	Outcome     string // paid / duplicate / anomaly
 	Anomaly     bool
 	AnomalyKind string
-	// Recovered 结算前订单为 CLOSED(关闭后迟到付款):Outcome 仍为 paid,埋点与告警单列。
+	// Recovered 结算前订单为 CLOSED/CANCELLED(关闭或取消后的真实付款):Outcome 仍为 paid,埋点与告警单列。
 	Recovered bool
 }
 
@@ -376,6 +382,10 @@ type ConfirmResult struct {
 //     (不回滚丢证),再事务外告警(评审 #4);
 //   - CAS 唯一成功:仅一笔跃迁订单到 PAID,胜出后关其它活跃尝试并写成功账号快照(评审 #6)。
 func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (ConfirmResult, error) {
+	if in.TransactionID == "" || in.OutTradeNo == "" {
+		return ConfirmResult{}, fmt.Errorf("%w: 交易号和商户单号不能为空", models.ErrPaymentAnomaly)
+	}
+	in.Currency = sqlutil.OrDefault(in.Currency, "CNY")
 	if in.Amount <= 0 {
 		return ConfirmResult{}, fmt.Errorf("%w: 确认金额必须为正", models.ErrInvalidAmount)
 	}
@@ -389,15 +399,18 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		res          ConfirmResult
 		alertOrderNo string
 		prevReason   models.CloseReason
-		lateTxnID    uint64 // 非零:事务提交后对该 paid_after_closed 流水发起自动退款
 	)
+	// 不可变关联在事务外读取，避免先建 RR 快照后等待订单锁导致重复流水不可见。
+	initial, err := s.d.Store.Reader().Attempts().GetByOutTradeNo(ctx, in.OutTradeNo, false)
+	if err != nil {
+		return ConfirmResult{}, err
+	}
 	err = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		// 权威身份由 out_trade_no 唯一派生(评审 P0):不信任回调传入的 order_no/app_id。
-		attempt, err := r.Attempts().GetByOutTradeNo(ctx, in.OutTradeNo, false)
-		if err != nil {
-			return err
-		}
+		attempt := initial
 		if attempt == nil {
+			if in.reconcileAccount != nil {
+				return models.ErrPaymentAnomaly
+			}
 			// 未知商户单号的真实通知:无法安全绑定订单 → 资金事实按路由账号归属落 anomaly 流水(order_no 为空),不结算。
 			if err := insertAnomalyTxn(ctx, r, acct.AppID, "", in, nil, models.AnomalyKindUnknownOutTradeNo); err != nil {
 				return err
@@ -411,6 +424,18 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 			return err
 		}
 
+		attempt, err = r.Attempts().GetByOutTradeNo(ctx, in.OutTradeNo, true)
+		if err != nil {
+			return err
+		}
+		if attempt == nil {
+			return store.ErrNotFound
+		}
+
+		if in.reconcileAccount != nil && !safeReconcileConfirmation(o, attempt, acct, in) {
+			return fmt.Errorf("%w: reconciliation identity changed before confirmation", models.ErrPaymentAnomaly)
+		}
+
 		// 通知路由到的渠道/账号必须与该尝试冻结的一致;不一致=错误路由/映射 → anomaly 落库不结算。
 		if in.Channel != attempt.Channel || in.PayAccountID != attempt.PayAccountID {
 			if err := insertAnomalyTxn(ctx, r, o.AppID, o.OrderNo, in, attempt, models.AnomalyKindAccountChannelMismatch); err != nil {
@@ -421,10 +446,10 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		}
 
 		// 1) 重复回调:命中唯一流水 → 重读校验一致性(权威订单为派生 o.OrderNo)。
-		if dup, err := r.Transactions().GetByTxnID(ctx, attempt.Channel, attempt.PayAccountID, in.TransactionID); err != nil {
+		if dup, err := r.Transactions().GetByTxnID(ctx, attempt.Channel, attempt.PayAccountID, in.TransactionID, false); err != nil {
 			return err
 		} else if dup != nil {
-			if dup.OrderNo != o.OrderNo || dup.Amount != in.Amount || dup.PayAccountID != attempt.PayAccountID {
+			if !samePayment(dup, o, in) {
 				res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: "duplicate_txn_mismatch"}
 				return nil
 			}
@@ -433,17 +458,13 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 			if err := settleAttempt(ctx, r, attempt); err != nil {
 				return err
 			}
-			// 迟到付款退款流水的重复通知:再次触发自动退款(退款号幂等),覆盖"提交后、退款前进程崩溃"。
-			if dup.AnomalyKind == models.AnomalyKindPaidAfterClosed && s.d.LateRefundApps[o.AppID] {
-				lateTxnID = dup.ID
-			}
 			res = ConfirmResult{Outcome: "duplicate"}
 			return nil
 		}
 
 		mismatch := in.Amount != o.PayAmount || (in.Currency != "" && in.Currency != o.Currency)
 
-		// 2) 订单状态不在结算白名单(含 PAID/退款域/已取消):第二笔真实付款 → 落 anomaly 流水,
+		// 2) 订单状态不在结算白名单(含 PAID/退款域):第二笔真实付款 → 落 anomaly 流水,
 		// 不改订单(评审 #4)。准入用 CanSettlePayment 而非状态机全表:REFUNDING→PAID 是
 		// 退款失败回退专用边,支付确认借道会把退款中订单错误拉回 PAID(覆盖快照+二次发事件)。
 		if !models.CanSettlePayment(o.Status) {
@@ -467,31 +488,6 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 				return err
 			}
 			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindAmountMismatch}
-			return nil
-		}
-
-		// 4) 已关闭订单 + app 启用迟到付款退款:接受资金事实但不恢复订单(接入方收到 order.closed 后可能已
-		// 释放资源)——落 paid_after_closed 流水、尝试收敛 PAID,订单保持 CLOSED 不发 order.paid;提交后自动退款。
-		// CLOSING 仍走正常结算:接入方尚未收到 order.closed。
-		if o.Status == models.OrderClosed && s.d.LateRefundApps[o.AppID] {
-			t := payTxn(o.AppID, o.OrderNo, in, attempt, true, models.AnomalyKindPaidAfterClosed)
-			if err := r.Transactions().Insert(ctx, t); errors.Is(err, store.ErrDuplicate) {
-				// 并发同笔通知:第 1 步的快照读看不到另一路刚提交的流水,插入才撞唯一键。
-				// 先提交的一路已在事务后触发自动退款,本路按重复处理。
-				res = ConfirmResult{Outcome: "duplicate"}
-				return nil
-			} else if err != nil {
-				return err
-			}
-			// 订单 CLOSED 时其尝试通常已 CLOSED(非活跃,settleAttempt 不处理):按渠道事实显式置 PAID(CLOSED→PAID 合法)。
-			if attempt.Status != models.AttemptPaid {
-				attempt.Status = models.AttemptPaid
-				if err := r.Attempts().Update(ctx, attempt); err != nil {
-					return err
-				}
-			}
-			lateTxnID = t.ID
-			res = ConfirmResult{Outcome: "anomaly", Anomaly: true, AnomalyKind: models.AnomalyKindPaidAfterClosed}
 			return nil
 		}
 
@@ -545,7 +541,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		if err := eventapp.WriteEvent(ctx, r, o.AppID, o.OrderNo, env); err != nil {
 			return err
 		}
-		res = ConfirmResult{Outcome: "paid", Recovered: prev == models.OrderClosed}
+		res = ConfirmResult{Outcome: "paid", Recovered: prev == models.OrderClosed || prev == models.OrderCancelled}
 		return nil
 	})
 	if err != nil {
@@ -567,26 +563,7 @@ func (s *Service) ConfirmPaySuccess(ctx context.Context, in ConfirmInput) (Confi
 		})
 	}
 	s.d.Obs.ConfirmOutcome(outcome) // 事务外纯内存计数
-	if lateTxnID != 0 {
-		s.refundLatePayment(ctx, lateTxnID, alertOrderNo)
-	}
 	return res, nil
-}
-
-// refundLatePayment 对 paid_after_closed 流水发起自动退款(事务外;退款号 late-<流水id> 保证重复触发幂等)。
-// 失败只告警:流水已落库,运维可经 RefundAnomalyTxn 手动退款;不影响本次回调的应答。
-func (s *Service) refundLatePayment(ctx context.Context, txnID uint64, orderNo string) {
-	out, err := s.d.LateRefunder.RefundAnomalyTxn(ctx, refundapp.AnomalyRefundInput{
-		TxnID: txnID, OutRefundNo: "late-" + strconv.FormatUint(txnID, 10),
-		Reason: "订单已关闭后付款,自动退款", Actor: models.OpsActorSystem,
-	})
-	if err != nil {
-		s.d.Alerter.Anomaly(ctx, "late_payment_refund_failed", map[string]any{
-			"txn_id": txnID, "order_no": orderNo, "err": err.Error(),
-		})
-		return
-	}
-	logger.Infow("迟到付款已发起自动退款", "txn_id", txnID, "order_no", orderNo, "refund_no", out.RefundNo, "status", out.Status, "reused", out.Reused)
 }
 
 // ---------------------------------------------------------------------
@@ -618,13 +595,16 @@ func (s *Service) RecoverStuckRequesting(ctx context.Context, outTradeNo string)
 }
 
 // ApplyQueryNotPaid 查单=有单未支付 → UNKNOWN 尝试恢复为 READY(可继续等待回调)。
-func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string) error {
+func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string, leaseToken ...string) error {
 	return s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		// 行锁:只写尝试单行,读-复核-写原子。防并发取消/超时把该尝试置 CLOSING 后,
 		// 本函数基于陈旧 UNKNOWN 盲写 READY → 订单 CLOSING+尝试 READY 无人收敛的永久滞留(P1-A)。
 		a, err := r.Attempts().GetByOutTradeNo(ctx, outTradeNo, true)
 		if err != nil || a == nil {
 			return err
+		}
+		if len(leaseToken) > 0 && a.LockedBy != leaseToken[0] {
+			return nil
 		}
 		if a.Status == models.AttemptUnknown {
 			a.Status = models.AttemptReady
@@ -636,7 +616,7 @@ func (s *Service) ApplyQueryNotPaid(ctx context.Context, outTradeNo string) erro
 
 // CloseAttemptAndMaybeOrder 查单确证不存在/已关闭 → 尝试转 CLOSED;
 // 若订单处于 CLOSING 且已无活跃尝试,则订单转 CLOSED 并发 order.closed 事件(完成取消/关单闭环)。
-func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo string) error {
+func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo string, leaseToken ...string) error {
 	var closingSince time.Time // 非零=本次把订单由 CLOSING 落定为 CLOSED(updated_at 即进入 CLOSING 的时刻)
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		// 统一锁序订单→尝试:先无锁读取不可变的 app_id/order_no,再锁订单,再锁尝试重读复核。
@@ -654,7 +634,10 @@ func (s *Service) CloseAttemptAndMaybeOrder(ctx context.Context, outTradeNo stri
 		if err != nil || a == nil {
 			return err
 		}
-		if a.Status == models.AttemptUnknown || a.Status == models.AttemptClosing {
+		if len(leaseToken) > 0 && a.LockedBy != leaseToken[0] {
+			return nil
+		}
+		if a.Status == models.AttemptUnknown || a.Status == models.AttemptClosing || a.Status == models.AttemptReady {
 			a.Status = models.AttemptClosed
 			if err := r.Attempts().Update(ctx, a); err != nil {
 				return err
@@ -738,10 +721,8 @@ const (
 )
 
 // insertWinningTxn 结算前插入正常流水;命中 uk_txn 时重读比对,区分"并发同笔"与"跨订单冲突"(评审 P0)。
-// 注:RR 隔离下本事务的重读是快照读,看不到并发【同订单】另一事务刚提交的流水行——但同订单并发确认
-// 已被订单行锁 + CanSettlePayment 前置串行化(第二个确认见 PAID 走 second_real_payment,不到此),故
-// txnDupConsistent 在正常并发下罕见,是防御性保留;此处主要拦【跨订单复用同交易号】(不同订单锁,
-// 能并发到此并撞 uk_txn,重读到他订单已提交流水 → txnDupConflict 禁止结算本单)。
+// 冲突后使用当前读，保证 RR 下能看见刚提交的唯一键持有者；
+// 仅在插入冲突后加锁，避免预先锁定不存在记录引入额外 gap 锁竞争。
 func insertWinningTxn(ctx context.Context, r store.Repos, o *models.Order, in ConfirmInput, attempt *models.PaymentAttempt) (txnInsertResult, error) {
 	err := r.Transactions().Insert(ctx, payTxn(o.AppID, o.OrderNo, in, attempt, false, ""))
 	if err == nil {
@@ -750,11 +731,11 @@ func insertWinningTxn(ctx context.Context, r store.Repos, o *models.Order, in Co
 	if !errors.Is(err, store.ErrDuplicate) {
 		return txnInserted, err
 	}
-	existing, gerr := r.Transactions().GetByTxnID(ctx, in.Channel, in.PayAccountID, in.TransactionID)
+	existing, gerr := r.Transactions().GetByTxnID(ctx, in.Channel, in.PayAccountID, in.TransactionID, true)
 	if gerr != nil {
 		return txnInserted, gerr
 	}
-	if existing == nil || existing.OrderNo != o.OrderNo || existing.Amount != in.Amount || existing.PayAccountID != in.PayAccountID {
+	if !samePayment(existing, o, in) {
 		return txnDupConflict, nil // 该交易号已属其它订单/金额/账号 → 禁止结算本订单
 	}
 	return txnDupConsistent, nil
@@ -784,4 +765,11 @@ func closeOtherActiveAttempts(ctx context.Context, r store.Repos, orderNo string
 		}
 	}
 	return nil
+}
+
+// samePayment compares the complete immutable identity before accepting a replay.
+func samePayment(t *models.PaymentTransaction, o *models.Order, in ConfirmInput) bool {
+	return t != nil && t.Kind == models.TxnPay && t.AppID == o.AppID && t.OrderNo == o.OrderNo &&
+		t.OutTradeNo == in.OutTradeNo && t.Channel == in.Channel && t.PayAccountID == in.PayAccountID &&
+		t.Amount == in.Amount && t.Currency == in.Currency
 }

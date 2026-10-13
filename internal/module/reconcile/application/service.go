@@ -4,12 +4,13 @@ package application
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/gtkit/orderd/internal/models"
-	"github.com/gtkit/orderd/internal/pkg/sqlutil"
+	"github.com/gtkit/orderd/internal/pkg/idgen"
 	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/shared/bill"
 	"github.com/gtkit/orderd/internal/store"
@@ -17,11 +18,13 @@ import (
 
 // Deps 是对账服务依赖。
 type Deps struct {
-	Store      store.Store
-	Bill       bill.Source
-	Alerter    alert.Alerter
-	Clock      func() time.Time
-	NewBatchNo func() string
+	Store       store.Store
+	Bill        bill.Source
+	Repair      bill.Repairer
+	AutoConfirm bool
+	Alerter     alert.Alerter
+	Clock       func() time.Time
+	NewBatchNo  func() string
 }
 
 // Service 对账应用服务。
@@ -40,135 +43,176 @@ type Result struct {
 	BatchNo   string
 	Matched   int
 	DiffCount int
-	Skipped   bool // 该账期已对账完成,跳过
+	Skipped   bool // 已完成、重试未到期或认领已由另一副本持有/接管
 }
 
-// Reconcile 对某账号某日对账;幂等(已完成则跳过,差异写入去重)。
+const (
+	algorithmVersion   int16 = 2
+	pageSize                 = 100
+	comparePages             = 8
+	calendarBatchSize        = 31
+	executionBatchSize       = 8
+	transactionBudget        = 5 * time.Second
+	fetchBudget              = 30 * time.Second
+	executionBudget          = 45 * time.Second
+	leaseTTL                 = time.Minute
+	retryDelay               = 5 * time.Minute
+)
+
+// Reconcile 对指定账期认领后执行;租约未到期、已完成或认领已被接管时跳过。
 func (s *Service) Reconcile(ctx context.Context, appID, channel, payAccountID string, billDate time.Time) (Result, error) {
-	// 1. 批次防重:已完成则跳过。
-	existing, err := s.d.Store.Reader().Reconcile().GetBatchByAccountDate(ctx, channel, payAccountID, billDate)
+	ctx, cancel := context.WithTimeout(ctx, executionBudget)
+	defer cancel()
+	token, err := idgen.UUIDv4()
 	if err != nil {
 		return Result{}, err
 	}
 	var batch *models.ReconcileBatch
-	switch {
-	case existing != nil && existing.Status == models.BatchDone:
-		return Result{BatchNo: existing.BatchNo, Matched: int(existing.MatchedCount), DiffCount: int(existing.DiffCount), Skipped: true}, nil
-	case existing != nil:
-		batch = existing
-	default:
-		batch = &models.ReconcileBatch{
-			BatchNo: s.d.NewBatchNo(), AppID: appID, Channel: channel, PayAccountID: payAccountID,
-			BillDate: billDate, Status: models.BatchPending,
+	var claimed bool
+	err = s.withinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		var err error
+		batch, err = s.ensureBatch(ctx, r, appID, channel, payAccountID, billDate)
+		if err != nil {
+			return err
 		}
-		if err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-			return r.Reconcile().CreateBatch(ctx, batch)
-		}); err != nil {
-			if errors.Is(err, store.ErrDuplicate) { // 并发另一方已建 → 重取
-				existing, gerr := s.d.Store.Reader().Reconcile().GetBatchByAccountDate(ctx, channel, payAccountID, billDate)
-				if gerr != nil || existing == nil {
-					return Result{}, fmt.Errorf("对账批次已存在但重取失败: %w", gerr)
-				}
-				if existing.Status == models.BatchDone {
-					return Result{BatchNo: existing.BatchNo, Skipped: true}, nil
-				}
-				batch = existing
-			} else {
-				return Result{}, err
-			}
-		}
-	}
-
-	// 2. 拉账单(网络,不在事务内)。
-	b, err := s.d.Bill.Fetch(ctx, channel, payAccountID, billDate)
-	if err != nil {
-		s.failBatch(ctx, batch, err.Error())
-		return Result{}, err
-	}
-	// 3. 读本地支付流水(kind=支付)。
-	local, err := s.d.Store.Reader().Transactions().ListByAccountDate(ctx, channel, payAccountID, billDate)
-	if err != nil {
-		return Result{}, err
-	}
-
-	// 4. 比对。
-	diffs, matched, localAmount := diff(b, local, batch, appID, channel, payAccountID)
-
-	// 5. 落差异 + 更新批次(同事务)。
-	batch.Status = models.BatchDone
-	batch.SourceCount = int32(len(b.Entries))
-	batch.MatchedCount = int32(matched)
-	batch.DiffCount = int32(len(diffs))
-	batch.SourceAmount = b.TotalAmount
-	batch.LocalAmount = localAmount
-	batch.PulledAt = sqlutil.Time(s.d.Clock())
-	batch.ReconciledAt = sqlutil.Time(s.d.Clock())
-	if err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		for i := range diffs {
-			if derr := r.Reconcile().InsertDiff(ctx, &diffs[i]); derr != nil && !errors.Is(derr, store.ErrDuplicate) {
-				return derr
-			}
-		}
-		return r.Reconcile().UpdateBatch(ctx, batch)
-	}); err != nil {
-		return Result{}, err
-	}
-
-	if len(diffs) > 0 {
-		s.d.Alerter.Anomaly(ctx, "reconcile_diff", map[string]any{
-			"batch_no": batch.BatchNo, "channel": channel, "pay_account_id": payAccountID,
-			"bill_date": billDate.Format("2006-01-02"), "diff_count": len(diffs),
-		})
-	}
-	return Result{BatchNo: batch.BatchNo, Matched: matched, DiffCount: len(diffs)}, nil
-}
-
-// diff 计算长款/短款/金额不一致。以 transaction_id 为主键匹配。
-func diff(b bill.Bill, local []*models.PaymentTransaction, batch *models.ReconcileBatch, appID, channel, payAccountID string) ([]models.ReconcileDiff, int, int64) {
-	localByTxn := make(map[string]*models.PaymentTransaction, len(local))
-	var localAmount int64
-	for _, t := range local {
-		if t.Kind != models.TxnPay {
-			continue // V1 对账聚焦支付
-		}
-		localByTxn[t.TransactionID] = t
-		localAmount += t.Amount
-	}
-	gwSeen := make(map[string]bool, len(b.Entries))
-	var diffs []models.ReconcileDiff
-	matched := 0
-	mk := func(dt models.DiffType, orderNo, txnID, outTradeNo string, gwAmt, lcAmt int64, detail string) models.ReconcileDiff {
-		return models.ReconcileDiff{
-			BatchID: batch.ID, AppID: appID, Channel: channel, PayAccountID: payAccountID,
-			DiffType: dt, OrderNo: orderNo, TransactionID: txnID, OutTradeNo: outTradeNo,
-			GatewayAmount: gwAmt, LocalAmount: lcAmt, Detail: detail,
-		}
-	}
-	for _, e := range b.Entries {
-		gwSeen[e.TransactionID] = true
-		lt, ok := localByTxn[e.TransactionID]
-		if !ok {
-			diffs = append(diffs, mk(models.DiffSurplus, e.OrderNo, e.TransactionID, e.OutTradeNo, e.Amount, 0, "渠道有本地无(长款)"))
-			continue
-		}
-		if lt.Amount != e.Amount {
-			diffs = append(diffs, mk(models.DiffAmount, lt.OrderNo, e.TransactionID, e.OutTradeNo, e.Amount, lt.Amount, "金额不一致"))
-			continue
-		}
-		matched++
-	}
-	for txnID, lt := range localByTxn {
-		if !gwSeen[txnID] {
-			diffs = append(diffs, mk(models.DiffShort, lt.OrderNo, txnID, lt.OutTradeNo, 0, lt.Amount, "本地有渠道无(短款)"))
-		}
-	}
-	return diffs, matched, localAmount
-}
-
-func (s *Service) failBatch(ctx context.Context, batch *models.ReconcileBatch, reason string) {
-	batch.Status = models.BatchFailed
-	batch.LastError = sqlutil.Str(reason)
-	_ = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		return r.Reconcile().UpdateBatch(ctx, batch)
+		now := s.d.Clock()
+		claimed, err = r.Reconcile().ClaimBatch(ctx, batch.ID, token, now, now.Add(leaseTTL))
+		return err
 	})
+	if err != nil {
+		return Result{}, err
+	}
+	if !claimed {
+		return Result{BatchNo: batch.BatchNo, Matched: int(batch.MatchedCount), DiffCount: int(batch.DiffCount), Skipped: true}, nil
+	}
+	batch.LockedBy = token
+	batch.LockedUntil = sql.NullTime{Time: s.d.Clock().Add(leaseTTL), Valid: true}
+	result, err := s.reconcileClaimed(ctx, batch)
+	if err == nil && !result.Skipped {
+		err = s.verifyLocal(ctx, channel, payAccountID)
+	}
+	return result, err
+}
+
+// RecoverAccount 逐步确保历史账期存在,随后至多处理八期;不加载整个账号历史。
+// 每轮最多31个日期,事务5秒、单期45秒,故一个账号总预算最多365秒。
+func (s *Service) RecoverAccount(ctx context.Context, account models.AppPayAccount, through time.Time) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, transactionBudget+executionBatchSize*executionBudget)
+	defer cancel()
+	if err := s.seedCalendar(ctx, account, through); err != nil {
+		return 0, err
+	}
+	if err := s.seedLocal(ctx, account); err != nil {
+		return 0, err
+	}
+	var resultErr error
+	n := 0
+	for range executionBatchSize {
+		if err := ctx.Err(); err != nil {
+			return n, errors.Join(resultErr, err)
+		}
+		token, err := idgen.UUIDv4()
+		if err != nil {
+			return n, errors.Join(resultErr, err)
+		}
+		batchCtx, batchCancel := context.WithTimeout(ctx, executionBudget)
+		var batch *models.ReconcileBatch
+		err = s.withinTx(batchCtx, func(ctx context.Context, r store.Repos) error {
+			var err error
+			now := s.d.Clock()
+			batch, err = r.Reconcile().ClaimNextBatch(ctx, account.Channel, account.PayAccountID, token, now, now.Add(leaseTTL), algorithmVersion)
+			return err
+		})
+		if err != nil || batch == nil {
+			batchCancel()
+			resultErr = errors.Join(resultErr, err)
+			break
+		}
+		n++
+		_, err = s.reconcileClaimed(batchCtx, batch)
+		batchCancel()
+		resultErr = errors.Join(resultErr, err)
+	}
+	resultErr = errors.Join(resultErr, s.verifyLocal(ctx, account.Channel, account.PayAccountID))
+	resultErr = errors.Join(resultErr, s.repair(ctx, account.Channel, account.PayAccountID))
+	return n, resultErr
+}
+
+func (s *Service) seedCalendar(ctx context.Context, account models.AppPayAccount, through time.Time) error {
+	through = calendarDate(through, bill.Location)
+	return s.withinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		a, err := r.Reconcile().GetScanAccount(ctx, account.PayAccountID, true)
+		if err != nil {
+			return err
+		}
+		if a.Channel != account.Channel || a.CreatedAt.IsZero() {
+			return fmt.Errorf("对账账号渠道或创建日期无效: %s", account.PayAccountID)
+		}
+		start := calendarDate(a.CreatedAt, through.Location())
+		if a.ReconcileScanVersion == algorithmVersion && a.ReconcileScannedThrough.Valid {
+			date := a.ReconcileScannedThrough.Time
+			start = time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, bill.Location).AddDate(0, 0, 1)
+		}
+		if start.After(through) {
+			return nil
+		}
+		end := start.AddDate(0, 0, calendarBatchSize-1)
+		if end.Before(through) {
+			// 历史页留一个名额给昨日,不能因此把连续游标直接跳到昨日。
+			end = end.AddDate(0, 0, -1)
+			if _, err := s.ensureBatch(ctx, r, a.AppID, a.Channel, a.PayAccountID, through); err != nil {
+				return err
+			}
+		} else {
+			end = through
+		}
+		for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := s.ensureBatch(ctx, r, a.AppID, a.Channel, a.PayAccountID, day); err != nil {
+				return err
+			}
+		}
+		return r.Reconcile().UpdateScanCursor(ctx, a.PayAccountID, end, algorithmVersion)
+	})
+}
+
+func calendarDate(t time.Time, location *time.Location) time.Time {
+	t = t.In(location)
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, location)
+}
+
+func (s *Service) ensureBatch(ctx context.Context, r store.Repos, appID, channel, accountID string, day time.Time) (*models.ReconcileBatch, error) {
+	day = calendarDate(day, bill.Location)
+	b, err := r.Reconcile().GetBatchByAccountDate(ctx, channel, accountID, day, algorithmVersion)
+	if err != nil || b != nil {
+		return b, err
+	}
+	b = &models.ReconcileBatch{BatchNo: s.d.NewBatchNo(), AppID: appID, Channel: channel,
+		PayAccountID: accountID, BillDate: calendarDate(day, bill.Location), Status: models.BatchPending, AlgorithmVersion: algorithmVersion}
+	if err := r.Reconcile().CreateBatch(ctx, b); err != nil {
+		if !errors.Is(err, store.ErrDuplicate) {
+			return nil, err
+		}
+		// 不能把 batch_no 碰撞误当成该账期已存在,否则会错误推进连续游标。
+		existing, getErr := r.Reconcile().GetBatchByAccountDate(ctx, channel, accountID, day, algorithmVersion)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if existing == nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+	return b, nil
+}
+
+func (s *Service) withinTx(ctx context.Context, fn func(context.Context, store.Repos) error) error {
+	ctx, cancel := context.WithTimeout(ctx, transactionBudget)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.d.Store.WithinTx(ctx, fn)
 }

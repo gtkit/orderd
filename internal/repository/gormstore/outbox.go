@@ -44,33 +44,37 @@ func (r outboxRepo) MarkDelivered(ctx context.Context, id uint64) error {
 	}, "mark delivered")
 }
 
-// Reschedule / MarkDead 加 status=Pending 守卫:另一副本(租约过期后重认领)已 MarkDelivered 的行
-// 不被本副本的陈旧失败结果覆盖为 Dead/退避(成功优先);未命中(RowsAffected=0)非错误,静默。
-// MarkDelivered 保持无守卫——投递成功是事实,可覆盖他副本的误判 Dead。
-func (r outboxRepo) Reschedule(ctx context.Context, id uint64, nextAttemptAt time.Time, attempts int32, lastErr string) error {
-	err := dbOf(ctx, r.base).Model(&models.EventOutbox{}).
-		Where("id = ? AND status = ?", id, models.OutboxPending).
+// Reschedule / MarkDead 只接受当前认领的失败;成功送达仍可覆盖陈旧的失败判断。
+func (r outboxRepo) Reschedule(ctx context.Context, id uint64, claimToken string, nextAttemptAt time.Time, attempts int32, lastErr string) (bool, error) {
+	if claimToken == "" {
+		return false, nil
+	}
+	result := dbOf(ctx, r.base).Model(&models.EventOutbox{}).
+		Where("id = ? AND status = ? AND locked_by = ?", id, models.OutboxPending, claimToken).
 		Updates(map[string]any{
 			"attempts": attempts, "next_attempt_at": nextAttemptAt, "last_error": nullOrNil(lastErr),
 			"locked_by": "", "locked_until": nil,
-		}).Error
-	if err != nil {
-		return fmt.Errorf("gormstore: outbox reschedule: %w", err)
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("gormstore: outbox reschedule: %w", result.Error)
 	}
-	return nil
+	return result.RowsAffected == 1, nil
 }
 
-func (r outboxRepo) MarkDead(ctx context.Context, id uint64, attempts int32, lastErr string) error {
-	err := dbOf(ctx, r.base).Model(&models.EventOutbox{}).
-		Where("id = ? AND status = ?", id, models.OutboxPending).
+func (r outboxRepo) MarkDead(ctx context.Context, id uint64, claimToken string, attempts int32, lastErr string) (bool, error) {
+	if claimToken == "" {
+		return false, nil
+	}
+	result := dbOf(ctx, r.base).Model(&models.EventOutbox{}).
+		Where("id = ? AND status = ? AND locked_by = ?", id, models.OutboxPending, claimToken).
 		Updates(map[string]any{
 			"status": models.OutboxDead, "attempts": attempts, "last_error": nullOrNil(lastErr),
 			"locked_by": "", "locked_until": nil,
-		}).Error
-	if err != nil {
-		return fmt.Errorf("gormstore: outbox mark dead: %w", err)
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("gormstore: outbox mark dead: %w", result.Error)
 	}
-	return nil
+	return result.RowsAffected == 1, nil
 }
 
 func (r outboxRepo) Requeue(ctx context.Context, id uint64, nextAttemptAt time.Time) error {

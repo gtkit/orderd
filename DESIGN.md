@@ -139,16 +139,20 @@ stateDiagram-v2
     REQUESTING --> UNKNOWN: 网关超时
     REQUESTING --> PAID: 回调早于下单返回(补确认)
     REQUESTING --> FAILED: 明确失败
+    READY --> REQUESTING: 同渠道重新调起
+    UNKNOWN --> REQUESTING: 同渠道重试
+    REQUESTING --> CLOSING: 取消或到期
+    UNKNOWN --> CLOSING: 取消或到期
+    READY --> CLOSED: 渠道确认关闭或到期查证不存在
     READY --> PAID: 支付成功
     READY --> CLOSING: 订单关单/取消
     UNKNOWN --> READY: 查单=有单
     UNKNOWN --> PAID: 查单=已支付
-    UNKNOWN --> CLOSED: 多次查单确证不存在
+    UNKNOWN --> CLOSED: 截止加宽限期后查证不存在
     CLOSING --> CLOSED: 网关关单确认
     CLOSING --> PAID: 关单窗口内已付(查单恢复)
-    CLOSED --> PAID: 网关查单证明真实付款(异常恢复)
+    CLOSED --> PAID: 回调或查单验证真实付款后恢复
     PAID --> [*]
-    CLOSED --> [*]
     FAILED --> [*]
 ```
 
@@ -156,7 +160,7 @@ stateDiagram-v2
 ```
 UNKNOWN → 多次查单 + 退避观察窗口
         → 仍不存在 → 优先按【同 out_trade_no】重试 UnifiedOrder
-        → 网关明确不存在/已关闭后 → 才允许新 attempt + 新 out_trade_no
+        → 明确已关闭，或达到 ExpireAt+ExpireGrace 且不存在 → 才允许新 attempt + 新 out_trade_no
 ```
 按微信/支付宝各自幂等语义分别定义,不用通用"查不到就换号"。旧尝试关闭后若晚到支付成功 → 走 §7 CAS 决唯一成功 + 关其他活跃尝试。
 
@@ -168,9 +172,11 @@ UNKNOWN → 多次查单 + 退避观察窗口
 
 - **V1 双重关闭**:退款仅在 `refund.enabled=true` 配置开关 **且** 调用方持有 `refund:execute` 权限时才允许;两者缺一即拒。V1 两者都不给(`enabled=false` 且不发放权限),故退款关闭;admin 退款审批模块上线时同时打开二者。配置开关在 service 层校验,权限在 transport 层校验。
 - **订单侧**:`PAID` →CAS→ `REFUNDING` → `REFUNDED`(成功)/ `PAID`(失败回退)/ `REFUND_EXCEPTION`(异常人工)。
-- **单笔退款**:`CREATED → PROCESSING →(UNKNOWN 查单)→ SUCCEEDED/FAILED/CLOSED/ABNORMAL`。
+- **单笔退款**:`CREATED → PROCESSING →(UNKNOWN 查单)→ SUCCEEDED/FAILED/CLOSED/ABNORMAL`；CREATED 已落库而受理写回尚未完成时，也允许按真实结果直接进入 SUCCEEDED/ABNORMAL，或在确定未发出/明确拒绝时进入 FAILED。
 - **并发**:先 CAS `PAID→REFUNDING` 与建退款记录同事务;`active_guard` 活跃退款唯一(失败可重提);`UNIQUE(app_id,out_refund_no)` + 退款 `request_hash`;超时进 PROCESSING 主动查单,不盲目再退。
-- 微信独立退款通知,支付宝共用入口;退款查单 worker 以网关为准。
+- 退款查询次数与连续不存在证据分开持久化；渠道受理证据不会被后续否定查询清除，任何退款连续不存在达到阈值都转 ABNORMAL 保留守卫等待人工核实。
+- 支付宝退款流水使用 `refund:<out_refund_no>`，避免原支付交易号与渠道退款号相同产生唯一键冲突；冲突必须核对身份、金额和币种。
+- 同退款幂等键在资金聚合锁内重查，相同请求复用同号；负面查单写回校验每次认领的唯一 token。微信独立退款通知尚未接入，当前退款由主动查单收敛。
 
 ---
 
@@ -227,6 +233,7 @@ AdminService 列表的 app_id 为可选查询过滤(空=全域,含跨租户共�
 
 - DB 备份 + **恢复演练**、迁移回滚;
 - **支付渠道账单对账**:每日 CLI/worker 拉取渠道账单 → `reconcile_batches`(批次唯一 + 防重)→ 差异写 `reconcile_diffs`(长款/短款/金额不一致)→ 告警 + 人工处理入口(已实现:AdminService 差异清单/处置,状态机 0待处理→1处理中→2已解决/3已忽略,终态不可改、已忽略必留备注、处置人取自 token、并发锁行串行化、处置与审计同事务);
+- **对账恢复边界**:真实支付宝/微信源通过验签元信息、受限下载与完整文件验证后封存逐行证据，支付/退款按完整身份和本金核对。算法修订号隔离旧支付批次，执行token与源/比较代次分离，分页检查点可续跑；新流水同事务写本地核对唤醒，覆盖迟到提交与跨日退款。完整已发布差异才允许独立成功查单补偿，复用既有确认事务且默认关闭；负面/不确定查询不改资金。配置、资源预算、迁移顺序及真实商户上线阻塞见 `docs/reconciliation-rollout.md`。
 - 告警:Outbox 死信 / 最老积压时间 / 支付失败率 / 已支付事件未投递(**不是** "PAID 未 Delivered"——orderd 无 Delivered、不发权益)。
 - 后续增强:跨地域灾备、自动长短款处理、复杂报表。
 
@@ -242,15 +249,13 @@ stateDiagram-v2
     PENDING --> CLOSING: 取消(有支付单)/超时/被取代
     CLOSING --> CLOSED
     CLOSING --> PAID
-    CLOSED --> PAID: 异常恢复
+    CLOSED --> PAID: 已验证真实付款恢复
+    CANCELLED --> PAID: 已验证真实付款恢复
     PAID --> REFUNDING: (V1 关闭)admin
     REFUNDING --> REFUNDED
     REFUNDING --> PAID
     REFUNDING --> REFUND_EXCEPTION
-    PAID --> [*]
     REFUNDED --> [*]
-    CLOSED --> [*]
-    CANCELLED --> [*]
 ```
 
 ---

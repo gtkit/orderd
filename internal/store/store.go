@@ -22,6 +22,7 @@ var (
 	ErrNotFound = errors.New("store: 记录不存在")
 	// ErrDuplicate 命中唯一键(用于幂等键/交易号唯一冲突判定)。
 	ErrDuplicate = errors.New("store: 唯一键冲突")
+	ErrAmbiguous = errors.New("store: 存在多个冲突账单证据")
 )
 
 // Store 是持久化根:开事务 + 提供非事务只读入口。
@@ -88,35 +89,61 @@ type DeadRequeueCond struct {
 
 // ReconcileRepo 对账批次与差异仓储(对账 worker + AdminService 处置用,DESIGN §14)。
 type ReconcileRepo interface {
+	// SaveRun 在同一事务中按 token、现存 run 和未过期租约写检查点/暂存/差异。
+	// publish=true 才更新发布指针；任何失败必须回滚整个调用事务。
+	SaveRun(context.Context, *models.ReconcileBatch, string, string, time.Time, []models.ReconcileEntry, []models.ReconcileDiff, bool) (bool, error)
+	ListEntries(context.Context, uint64, string, uint64, int) ([]models.ReconcileEntry, error)
+	GetEntry(context.Context, uint64) (*models.ReconcileEntry, error)
+	FindPublishedEntry(context.Context, string, string, models.TxnKind, string) (*models.ReconcileEntry, error)
+	RequestRecheck(context.Context, uint64, uint64) error
+	ResolveMatchedDiffs(context.Context, uint64, string, []uint64, time.Time) error
+	ListLocalTxnPage(context.Context, string, string, uint64, int) ([]models.PaymentTransaction, error)
+	UpdateLocalSeedCursor(context.Context, string, uint64) error
+	EnqueueLocalTxn(context.Context, uint64, time.Time) error
+	ClaimLocalTxn(context.Context, string, string, string, time.Time, time.Time) (*models.ReconcileLocalChange, error)
+	FinishLocalTxn(context.Context, uint64, string, time.Time, time.Time, string) (bool, error)
+	// SetLocalDiff 同流水身份幂等；返回新建或关键差异变化。nil 表示已匹配，仅自动解决 Pending 并追加审计。
+	SetLocalDiff(context.Context, uint64, *models.ReconcileDiff, time.Time) (bool, error)
+	ClaimRepair(context.Context, string, string, string, time.Time, time.Time) (*models.ReconcileDiff, error)
+	FinishRepair(context.Context, uint64, string, time.Time, time.Time, bool, string) (bool, error)
+
 	// CreateBatch 建批次;命中 uk(channel,pay_account_id,bill_date) 或 batch_no → ErrDuplicate(防重)。
 	CreateBatch(ctx context.Context, b *models.ReconcileBatch) error
 	// GetBatchByAccountDate 取某账号某日批次;无则 (nil, nil)。
-	GetBatchByAccountDate(ctx context.Context, channel, payAccountID string, billDate time.Time) (*models.ReconcileBatch, error)
-	UpdateBatch(ctx context.Context, b *models.ReconcileBatch) error
+	GetBatchByAccountDate(ctx context.Context, channel, payAccountID string, billDate time.Time, version ...int16) (*models.ReconcileBatch, error)
+	// GetScanAccount 读取账号日历游标;扩展日历时须锁账号行并在同事务更新游标。
+	GetScanAccount(ctx context.Context, payAccountID string, forUpdate bool) (*models.AppPayAccount, error)
+	UpdateScanCursor(ctx context.Context, payAccountID string, through time.Time, version ...int16) error
+	// ClaimBatch 仅认领未完成且租约/重试等待已到期的批次;token 每次重新生成。
+	ClaimBatch(ctx context.Context, id uint64, claimToken string, now, leaseUntil time.Time) (bool, error)
+	// ClaimNextBatch 按账号认领一笔到期的 Pending/Pulled/Failed 批次,须在事务内调用。
+	ClaimNextBatch(ctx context.Context, channel, payAccountID, claimToken string, now, leaseUntil time.Time, version ...int16) (*models.ReconcileBatch, error)
+	// UpdateBatch 按认领 token CAS;陈旧结果返回 false,完成批次不可回退。
+	UpdateBatch(ctx context.Context, b *models.ReconcileBatch, claimToken string) (bool, error)
 	// InsertDiff 写差异;同批次同交易同类型幂等(命中唯一键返回 ErrDuplicate)。
 	InsertDiff(ctx context.Context, d *models.ReconcileDiff) error
 	// ListDiffs 差异清单(自增 id 升序游标,id > afterID,≤ limit 条)。
 	ListDiffs(ctx context.Context, f DiffFilter, afterID uint64, limit int) ([]models.ReconcileDiff, error)
 	// GetDiff 按 id 取差异;不存在返回 ErrNotFound。forUpdate=true 行锁(处置 CAS 用)。
 	GetDiff(ctx context.Context, id uint64, forUpdate bool) (*models.ReconcileDiff, error)
-	// UpdateDiffHandling 写处置四字段;remark 为空串时保留原备注(只推进状态/人/时间)。
+	// UpdateDiffHandling 写处置四字段;remark 为空串保留备注。人工调用须先在同事务 GetDiff(forUpdate=true)，按 batch→diff 锁顺序传播当前未发布同行；system 仅写当前行。
 	UpdateDiffHandling(ctx context.Context, id uint64, status models.DiffHandleStatus, handledBy string, handledAt time.Time, remark string) error
 }
 
 // OutboxRepo 发件箱投递仓储(投递 worker 用,DESIGN §12)。
 type OutboxRepo interface {
 	// ClaimDue 认领到期的待投递行(status=Pending 且 next_attempt_at<=now 且租约空闲),
-	// 打上 (workerID, leaseUntil) 租约后返回;MySQL 用 FOR UPDATE SKIP LOCKED 保证多副本不重复认领。
-	ClaimDue(ctx context.Context, workerID string, now, leaseUntil time.Time, limit int) ([]*models.EventOutbox, error)
+	// 打上每次唯一的 (claimToken, leaseUntil) 租约后返回;MySQL 用 FOR UPDATE SKIP LOCKED 认领。
+	ClaimDue(ctx context.Context, claimToken string, now, leaseUntil time.Time, limit int) ([]*models.EventOutbox, error)
 	// MarkDelivered 标记已投递(终态)。
 	MarkDelivered(ctx context.Context, id uint64) error
-	// Reschedule 投递失败重排:attempts 递增、设下次投递时间、清租约、记错误。
-	Reschedule(ctx context.Context, id uint64, nextAttemptAt time.Time, attempts int32, lastErr string) error
+	// Reschedule 仅当前 Pending token 可写失败结果;返回是否应用,陈旧结果不改计数或租约。
+	Reschedule(ctx context.Context, id uint64, claimToken string, nextAttemptAt time.Time, attempts int32, lastErr string) (bool, error)
 	// MarkDead 超过最大次数转死信(不自动再投,需人工/定时重放)。
 	// attempts 为含本次失败的最终尝试次数:必须落库,使 attempts 成为跨"重放→失败→回死信"
 	// 循环的单调计数器——兜底重放的次数上限(attempts < MaxAttempts+MaxAutoRequeues)依赖它,
 	// 不落库则自动重放永不达上限(只剩存活时长兜底)。
-	MarkDead(ctx context.Context, id uint64, attempts int32, lastErr string) error
+	MarkDead(ctx context.Context, id uint64, claimToken string, attempts int32, lastErr string) (bool, error)
 	// Requeue 死信重放:置回 Pending 并设下次投递时间(清 last_error 与租约;attempts 不重置——
 	// 一次重放 = 一次投递机会,再失败立即回死信)。
 	Requeue(ctx context.Context, id uint64, nextAttemptAt time.Time) error
@@ -141,7 +168,7 @@ type OrderRepo interface {
 	// 按 expire_at 最早优先),行锁返回;被其它事务锁住的行跳过(MySQL FOR UPDATE SKIP LOCKED)。
 	// 必须在事务内调用并在同一事务内完成关单。无可认领返回 (nil, nil)。
 	ClaimExpiredPending(ctx context.Context, now time.Time, exclude []uint64) (*models.Order, error)
-	// ListStalledClosing 列出 CLOSING 且 updated_at 早于 before 的订单(滞留兜底 watchdog)。
+	// ListStalledClosing 列出 CLOSING、无活跃尝试且 updated_at 早于 before 的订单,按更新时间/id 排序。
 	ListStalledClosing(ctx context.Context, before time.Time, limit int) ([]*models.Order, error)
 	// CountPendingByUser 统计同 (app_id, user_id) 未过期(expire_at>now)的 PENDING 订单数
 	// (下单防刷上限用,近似语义;已过期待关单的订单不占名额)。
@@ -165,7 +192,7 @@ type AttemptRepo interface {
 	CountByOrder(ctx context.Context, orderNo string) (int, error)
 	// ExistsSubmitted 是否存在曾提交网关(status>=REQUESTING)的尝试(区分 CANCELLED vs CLOSED,评审 #5)。
 	ExistsSubmitted(ctx context.Context, orderNo string) (bool, error)
-	// ClaimQueryDue 认领待查单尝试(status∈{UNKNOWN,CLOSING} 且 next_query_at 到期/空、租约空闲),
+	// ClaimQueryDue 认领待查单尝试(status∈{READY,UNKNOWN,CLOSING} 且 next_query_at 到期/空、租约空闲),
 	// 打租约后返回(MySQL 用 FOR UPDATE SKIP LOCKED)。供查单 worker 收敛"结果未知"窗口。
 	ClaimQueryDue(ctx context.Context, workerID string, now, leaseUntil time.Time, limit int) ([]*models.PaymentAttempt, error)
 	// ListStuckRequesting 列出停留在 REQUESTING 且 updated_at 早于 before 的尝试(卡死 watchdog)。
@@ -197,7 +224,7 @@ type TransactionRepo interface {
 	// Insert 命中 uk_txn(channel,pay_account_id,transaction_id) 时返回 ErrDuplicate。
 	Insert(ctx context.Context, t *models.PaymentTransaction) error
 	// GetByTxnID 未命中返回 (nil, nil)。
-	GetByTxnID(ctx context.Context, channel, payAccountID, txnID string) (*models.PaymentTransaction, error)
+	GetByTxnID(ctx context.Context, channel, payAccountID, txnID string, forUpdate bool) (*models.PaymentTransaction, error)
 	// GetByID 按主键取流水;不存在返回 ErrNotFound。forUpdate=true 行锁(流水不可变,锁只用于
 	// 串行化以其为源的退款发起)。
 	GetByID(ctx context.Context, id uint64, forUpdate bool) (*models.PaymentTransaction, error)

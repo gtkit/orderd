@@ -1,5 +1,5 @@
 // Package worker 实现后台 worker:Outbox 事件投递(DESIGN §12,租约+退避+死信告警)与
-// 支付查单收敛(§9,见 query.go)。对账 worker(§14)仍为后续。
+// 支付查单收敛(§9,见 query.go)和对账恢复调度(§14,见 reconcile.go)。
 package worker
 
 import (
@@ -11,6 +11,7 @@ import (
 
 	"github.com/gtkit/logger"
 	"github.com/gtkit/orderd/internal/models"
+	"github.com/gtkit/orderd/internal/pkg/idgen"
 	"github.com/gtkit/orderd/internal/pkg/webhook"
 	"github.com/gtkit/orderd/internal/shared/alert"
 	"github.com/gtkit/orderd/internal/shared/endpoint"
@@ -21,7 +22,7 @@ import (
 
 // Config 投递 worker 调优参数。
 type Config struct {
-	WorkerID     string        // 副本实例标识(租约持有者)
+	WorkerID     string        // 保留实例标识兼容既有装配;租约隔离使用每次认领的新 token
 	BatchSize    int           // 每轮认领上限
 	LeaseTTL     time.Duration // 租约时长
 	MaxAttempts  int32         // 超过此次数转死信
@@ -78,19 +79,29 @@ func NewDelivery(st store.Store, ep endpoint.Resolver, sec secret.Resolver, send
 	return &Delivery{store: st, endpoints: ep, secrets: sec, sender: sender, alerter: alerter, obs: ob, cfg: cfg, clock: clock}
 }
 
-// RunOnce 认领一批并逐条投递;返回本轮成功/失败数。
+// RunOnce 逐条认领并立即投递;一轮最多 BatchSize 条,不让等待队列消耗租约。
 func (d *Delivery) RunOnce(ctx context.Context) (delivered, failed int, err error) {
-	now := d.clock()
-	var batch []*models.EventOutbox
-	err = d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		var e error
-		batch, e = r.Outbox().ClaimDue(ctx, d.cfg.WorkerID, now, now.Add(d.cfg.LeaseTTL), d.cfg.BatchSize)
-		return e
-	})
-	if err != nil {
-		return 0, 0, err
-	}
-	for _, ob := range batch {
+	for range d.cfg.BatchSize {
+		if err := ctx.Err(); err != nil {
+			return delivered, failed, err
+		}
+		token, err := idgen.UUIDv4()
+		if err != nil {
+			return delivered, failed, err
+		}
+		now := d.clock()
+		var batch []*models.EventOutbox
+		if err := d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+			var e error
+			batch, e = r.Outbox().ClaimDue(ctx, token, now, now.Add(d.cfg.LeaseTTL), 1)
+			return e
+		}); err != nil {
+			return delivered, failed, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		ob := batch[0]
 		ok, bkErr := d.deliverOne(ctx, ob)
 		if bkErr != nil {
 			logger.Warnw("Outbox 记账失败", "event_id", ob.EventID, "err", bkErr)
@@ -120,10 +131,16 @@ func (d *Delivery) deliverOne(ctx context.Context, ob *models.EventOutbox) (bool
 	}
 	attempts := ob.Attempts + 1
 	if attempts >= d.cfg.MaxAttempts {
-		d.obs.DeliveryResult(obs.DeliveryDead, elapsed)
+		var applied bool
 		markErr := d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-			return r.Outbox().MarkDead(ctx, ob.ID, attempts, sendErr.Error())
+			var err error
+			applied, err = r.Outbox().MarkDead(ctx, ob.ID, ob.LockedBy, attempts, sendErr.Error())
+			return err
 		})
+		if markErr != nil || !applied {
+			return false, markErr
+		}
+		d.obs.DeliveryResult(obs.DeliveryDead, elapsed)
 		d.alerter.Anomaly(ctx, "outbox_dead_letter", map[string]any{
 			"event_id": ob.EventID, "app_id": ob.AppID, "order_no": ob.OrderNo,
 			"attempts": attempts, "last_error": sendErr.Error(),
@@ -131,11 +148,17 @@ func (d *Delivery) deliverOne(ctx context.Context, ob *models.EventOutbox) (bool
 		logger.Errorw("Outbox 事件转死信", "event_id", ob.EventID, "attempts", attempts, "err", sendErr)
 		return false, markErr
 	}
-	d.obs.DeliveryResult(obs.DeliveryFailed, elapsed)
 	next := d.clock().Add(d.backoff(attempts))
-	return false, d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
-		return r.Outbox().Reschedule(ctx, ob.ID, next, attempts, sendErr.Error())
+	var applied bool
+	err := d.store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		var err error
+		applied, err = r.Outbox().Reschedule(ctx, ob.ID, ob.LockedBy, next, attempts, sendErr.Error())
+		return err
 	})
+	if err == nil && applied {
+		d.obs.DeliveryResult(obs.DeliveryFailed, elapsed)
+	}
+	return false, err
 }
 
 // trySend 解析端点+密钥并发起投递。

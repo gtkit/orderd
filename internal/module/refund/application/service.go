@@ -21,11 +21,13 @@ import (
 	"github.com/gtkit/orderd/internal/pkg/sqlutil"
 	"github.com/gtkit/orderd/internal/shared/account"
 	"github.com/gtkit/orderd/internal/shared/alert"
+	"github.com/gtkit/orderd/internal/shared/bill"
 	"github.com/gtkit/orderd/internal/store"
 )
 
 // Deps 是 refund 服务依赖。
 type Deps struct {
+	BillVerifier   bill.Verifier // 对账补偿专用的完整验签查单端口；nil时拒绝补偿。
 	Store          store.Store
 	Router         paygateway.Router
 	Accounts       account.Resolver
@@ -35,8 +37,8 @@ type Deps struct {
 	NewEventID     func() (string, error)
 	Enabled        bool          // refund.enabled 配置开关(V1=false)
 	GatewayTimeout time.Duration // 单次网关调用强制超时(评审 P1)
-	// NotExistMaxQueries:退款查单连续"网关无此退款单"达此次数 → 判定退款请求从未落地,
-	// FAILED + 订单回退(防渠道写入延迟误判,故不首查即判)。0 取默认 6。
+	// NotExistMaxQueries:退款查单连续"网关无此退款单"达此次数 → ABNORMAL 转人工核实,
+	// 始终保留活跃退款守卫(无法仅凭未查到证明资金未退)。0 取默认 6。
 	// 与查单 worker 的 MaxQueries(滞留告警阈值,只告警不落终态)语义不同,不复用。
 	NotExistMaxQueries int32
 }
@@ -109,8 +111,8 @@ func resolveTarget(ctx context.Context, r store.Repos, rf *models.Refund) (refun
 }
 
 // reuseRefund 按 (app_id, out_refund_no) 幂等:命中且请求哈希一致复用,不一致冲突;未命中返回 nil。
-func (s *Service) reuseRefund(ctx context.Context, appID, outRefundNo, hash string) (*RefundOutcome, error) {
-	existing, err := s.d.Store.Reader().Refunds().FindByOutRefundNo(ctx, appID, outRefundNo)
+func reuseRefund(ctx context.Context, r store.Repos, appID, outRefundNo, hash string) (*RefundOutcome, error) {
+	existing, err := r.Refunds().FindByOutRefundNo(ctx, appID, outRefundNo)
 	if err != nil || existing == nil {
 		return nil, err
 	}
@@ -129,7 +131,7 @@ func (s *Service) RefundOrder(ctx context.Context, in RefundInput) (RefundOutcom
 		return RefundOutcome{}, fmt.Errorf("%w: 缺少 out_refund_no", models.ErrRefundNotAllowed)
 	}
 	hash := models.RefundRequestHash(in.OutRefundNo, in.OrderNo, in.RefundAmount, in.Reason)
-	if out, err := s.reuseRefund(ctx, in.AppID, in.OutRefundNo, hash); err != nil || out != nil {
+	if out, err := reuseRefund(ctx, s.d.Store.Reader(), in.AppID, in.OutRefundNo, hash); err != nil || out != nil {
 		if out != nil {
 			return *out, nil
 		}
@@ -137,12 +139,17 @@ func (s *Service) RefundOrder(ctx context.Context, in RefundInput) (RefundOutcom
 	}
 
 	var (
-		rf *models.Refund
-		tg refundTarget
+		rf     *models.Refund
+		tg     refundTarget
+		reused *RefundOutcome
 	)
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		o, err := r.Orders().GetByOrderNo(ctx, in.AppID, in.OrderNo, true)
 		if err != nil {
+			return err
+		}
+		reused, err = reuseRefund(ctx, r, in.AppID, in.OutRefundNo, hash)
+		if err != nil || reused != nil {
 			return err
 		}
 		if o.Status != models.OrderPaid {
@@ -175,9 +182,18 @@ func (s *Service) RefundOrder(ctx context.Context, in RefundInput) (RefundOutcom
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrDuplicate) {
+			if out, readErr := reuseRefund(ctx, s.d.Store.Reader(), in.AppID, in.OutRefundNo, hash); readErr != nil || out != nil {
+				if out != nil {
+					return *out, nil
+				}
+				return RefundOutcome{}, readErr
+			}
 			return RefundOutcome{}, fmt.Errorf("%w: 已存在活跃退款", models.ErrActiveRefundExists)
 		}
 		return RefundOutcome{}, err
+	}
+	if reused != nil {
+		return *reused, nil
 	}
 	return s.submit(rf, tg)
 }
@@ -202,7 +218,7 @@ func (s *Service) RefundAnomalyTxn(ctx context.Context, in AnomalyRefundInput) (
 	}
 	// 流水不可变:金额与归属直接取无锁读的值;哈希绑定源流水,同退款号换流水视为冲突。
 	hash := models.RefundRequestHash(in.OutRefundNo, "txn:"+strconv.FormatUint(in.TxnID, 10), t0.Amount, in.Reason)
-	if out, err := s.reuseRefund(ctx, t0.AppID, in.OutRefundNo, hash); err != nil || out != nil {
+	if out, err := reuseRefund(ctx, s.d.Store.Reader(), t0.AppID, in.OutRefundNo, hash); err != nil || out != nil {
 		if out != nil {
 			return *out, nil
 		}
@@ -210,9 +226,14 @@ func (s *Service) RefundAnomalyTxn(ctx context.Context, in AnomalyRefundInput) (
 	}
 
 	var rf *models.Refund
+	var reused *RefundOutcome
 	err = s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
 		t, err := r.Transactions().GetByID(ctx, in.TxnID, true) // 行锁:串行化以该流水为源的退款发起
 		if err != nil {
+			return err
+		}
+		reused, err = reuseRefund(ctx, r, t.AppID, in.OutRefundNo, hash)
+		if err != nil || reused != nil {
 			return err
 		}
 		if !t.Anomaly || t.Kind != models.TxnPay {
@@ -244,9 +265,18 @@ func (s *Service) RefundAnomalyTxn(ctx context.Context, in AnomalyRefundInput) (
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrDuplicate) {
+			if out, readErr := reuseRefund(ctx, s.d.Store.Reader(), t0.AppID, in.OutRefundNo, hash); readErr != nil || out != nil {
+				if out != nil {
+					return *out, nil
+				}
+				return RefundOutcome{}, readErr
+			}
 			return RefundOutcome{}, fmt.Errorf("%w: 该流水已存在活跃退款或退款号已被占用", models.ErrActiveRefundExists)
 		}
 		return RefundOutcome{}, err
+	}
+	if reused != nil {
+		return *reused, nil
 	}
 	return s.submit(rf, refundTarget{
 		channel: t0.Channel, payAccountID: t0.PayAccountID, outTradeNo: t0.OutTradeNo, total: t0.Amount, currency: t0.Currency,
@@ -270,22 +300,22 @@ func (s *Service) submit(rf *models.Refund, tg refundTarget) (RefundOutcome, err
 	if gerr != nil {
 		// 结果未知(超时/网络/未知错误):渠道可能已受理,绝不判失败——错判会造成
 		// "钱已退、本地 FAILED、订单回 PAID、refunded 事件不发"的账实与权益双错。
-		// 置 PROCESSING 交退款查单 worker 收敛;从未落地的请求由 NotExist 阈值判失败回退(见 QueryRefund)。
-		s.markRefundProcessing(rf.RefundNo, "")
+		// 置 PROCESSING 交退款查单 worker 收敛;连续 NotExist 达阈值仍须转人工保留守卫。
+		s.markRefundProcessing(rf.RefundNo, "", false)
 		return RefundOutcome{RefundNo: rf.RefundNo, Status: models.RefundProcessing}, nil
 	}
 	if !rr.Accepted {
 		s.failRefund(rf.RefundNo, "网关未受理退款")
 		return RefundOutcome{RefundNo: rf.RefundNo, Status: models.RefundFailed}, nil
 	}
-	s.markRefundProcessing(rf.RefundNo, rr.GatewayRefundID)
+	s.markRefundProcessing(rf.RefundNo, rr.GatewayRefundID, true)
 	return RefundOutcome{RefundNo: rf.RefundNo, Status: models.RefundProcessing}, nil
 }
 
 // markRefundProcessing 把退款推进到 PROCESSING 并设查单时间(网关已受理带渠道退款单号;
 // 结果未知传空串)。用解耦 ctx,不吞错误;更新失败告警,退款留在 CREATED,
 // 由退款查单 worker 的 CREATED 滞留恢复扫描兜底进入查单收敛。
-func (s *Service) markRefundProcessing(refundNo, gatewayRefundID string) {
+func (s *Service) markRefundProcessing(refundNo, gatewayRefundID string, confirmed bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
@@ -293,14 +323,20 @@ func (s *Service) markRefundProcessing(refundNo, gatewayRefundID string) {
 		if err != nil {
 			return err
 		}
-		if rf.Status != models.RefundCreated {
-			return nil // 已被推进(查单已收敛/已 PROCESSING),不回写
+		if rf.Status != models.RefundCreated && rf.Status != models.RefundProcessing {
+			return nil // 已终态,不回写
+		}
+		if confirmed {
+			rf.GatewayConfirmed = true
+			rf.NotExistCount = 0
 		}
 		rf.Status = models.RefundProcessing
 		if gatewayRefundID != "" {
 			rf.GatewayRefundID = gatewayRefundID
 		}
-		rf.NextQueryAt = sqlutil.Time(s.d.Clock().Add(10 * time.Second))
+		if !rf.NextQueryAt.Valid {
+			rf.NextQueryAt = sqlutil.Time(s.d.Clock().Add(10 * time.Second))
+		}
 		return r.Refunds().Update(ctx, rf)
 	})
 	if err != nil {
@@ -340,26 +376,7 @@ func (s *Service) failRefund(refundNo, reason string) {
 		if err != nil {
 			return err
 		}
-		// 状态前置:仅在途退款(CREATED/PROCESSING)可判失败;已 SUCCEEDED/ABNORMAL/FAILED 终态一律不覆盖
-		// (防成功被迟到的失败路径盲写覆盖 → 账实分歧)。
-		if rf.Status != models.RefundCreated && rf.Status != models.RefundProcessing {
-			return nil
-		}
-		rf.Status = models.RefundFailed
-		rf.LastError = sqlutil.Str(reason)
-		if err := r.Refunds().Update(ctx, rf); err != nil {
-			return err
-		}
-		if o != nil && o.Status == models.OrderRefunding {
-			prev := o.Status
-			o.Status = models.OrderPaid
-			o.AggregateVersion++
-			if err := r.Orders().Update(ctx, o); err != nil {
-				return err
-			}
-			return eventapp.WriteLog(ctx, r, o, prev, "system", "退款失败回退")
-		}
-		return nil
+		return failRefundLocked(ctx, r, o, rf, reason)
 	})
 	if err != nil {
 		s.d.Alerter.Anomaly(context.Background(), "refund_fail_rollback_failed",
@@ -367,18 +384,73 @@ func (s *Service) failRefund(refundNo, reason string) {
 	}
 }
 
+func failRefundLocked(ctx context.Context, r store.Repos, o *models.Order, rf *models.Refund, reason string) error {
+	if rf.Status != models.RefundCreated && rf.Status != models.RefundProcessing {
+		return nil
+	}
+	rf.Status = models.RefundFailed
+	rf.LastError = sqlutil.Str(reason)
+	if err := r.Refunds().Update(ctx, rf); err != nil {
+		return err
+	}
+	if o != nil && o.Status == models.OrderRefunding {
+		prev := o.Status
+		o.Status = models.OrderPaid
+		o.AggregateVersion++
+		if err := r.Orders().Update(ctx, o); err != nil {
+			return err
+		}
+		return eventapp.WriteLog(ctx, r, o, prev, "system", "退款失败回退")
+	}
+	return nil
+}
+
+// abnormalRefundLocked 的调用方已按订单→退款加锁并复核在途状态。
+func abnormalRefundLocked(ctx context.Context, r store.Repos, o *models.Order, rf *models.Refund, reason string) error {
+	rf.Status = models.RefundAbnormal
+	rf.LastError = sqlutil.Str(reason)
+	if err := r.Refunds().Update(ctx, rf); err != nil {
+		return err
+	}
+	if o != nil && o.Status == models.OrderRefunding {
+		prev := o.Status
+		o.Status = models.OrderRefundException
+		o.AggregateVersion++
+		if err := r.Orders().Update(ctx, o); err != nil {
+			return err
+		}
+		return eventapp.WriteLog(ctx, r, o, prev, "system", reason)
+	}
+	return nil
+}
+
 // recordRefundTxn 写退款成功不可变流水(kind=2,回指 refund_no;渠道用退款实际落地渠道)。
-// transaction_id 用【渠道退款单号】(空则回退 out_refund_no):它才是退款这条资金腿的第三方唯一标识;
-// 原支付交易号已被 kind=1 流水占用 uk_txn。命中唯一键=同一退款重复确认,视为已记录。
+// 支付宝没有独立渠道退款号,用 refund:<out_refund_no> 区分资金腿;微信取渠道退款号(空则回退请求号)。
+// 唯一冲突仅在完整资金身份一致时视为幂等,避免吞掉支付或另一笔退款。
 func recordRefundTxn(ctx context.Context, r store.Repos, rf *models.Refund, tg refundTarget, gatewayRefundID, digest string, amount int64, at time.Time) error {
-	err := r.Transactions().Insert(ctx, &models.PaymentTransaction{
+	txnID := sqlutil.OrDefault(gatewayRefundID, rf.OutRefundNo)
+	if tg.channel == "alipay" {
+		txnID = "refund:" + rf.OutRefundNo
+	}
+	txn := &models.PaymentTransaction{
 		AppID: rf.AppID, OrderNo: rf.OrderNo, RefundNo: rf.RefundNo, PayAccountID: rf.PayAccountID,
 		Channel: tg.channel, Kind: models.TxnRefund, OutTradeNo: rf.OutRefundNo,
-		TransactionID: sqlutil.OrDefault(gatewayRefundID, rf.OutRefundNo), Amount: amount,
+		TransactionID: txnID, Amount: amount,
 		Currency: sqlutil.OrDefault(tg.currency, "CNY"), PaidAt: sqlutil.Time(at), NotifyDigest: digest,
-	})
-	if err != nil && !errors.Is(err, store.ErrDuplicate) {
+	}
+	err := r.Transactions().Insert(ctx, txn)
+	if !errors.Is(err, store.ErrDuplicate) {
 		return err
+	}
+	existing, err := r.Transactions().GetByTxnID(ctx, tg.channel, rf.PayAccountID, txnID, true)
+	if err != nil {
+		return err
+	}
+	if existing == nil || existing.Kind != models.TxnRefund || existing.AppID != txn.AppID ||
+		existing.OrderNo != txn.OrderNo || existing.RefundNo != txn.RefundNo || existing.OutTradeNo != txn.OutTradeNo ||
+		existing.Channel != txn.Channel || existing.PayAccountID != txn.PayAccountID ||
+		existing.Amount != txn.Amount || existing.Currency != txn.Currency {
+		return fmt.Errorf("%w: 退款流水身份冲突 refund=%s txn=%s", models.ErrPaymentAnomaly, rf.RefundNo, txnID)
 	}
 	return nil
 }
@@ -409,7 +481,7 @@ func (s *Service) markOrderRefunded(ctx context.Context, r store.Repos, o *model
 func (s *Service) ConfirmRefundSuccess(ctx context.Context, refundNo, gatewayRefundID string, amount int64, at time.Time) error {
 	var (
 		mismatch              bool
-		conflict              bool // 被失败路径抢先(rf 已 FAILED)但渠道确认成功 → 资金分歧,告警人工
+		conflict              bool // 已 FAILED/CLOSED 但渠道确认成功 → 资金分歧,告警人工
 		wantAmount, gotAmount int64
 		orderNo               string
 	)
@@ -422,33 +494,25 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, refundNo, gatewayRef
 		if rf.Status == models.RefundSucceeded || rf.Status == models.RefundAbnormal {
 			return nil // 幂等:成功与人工终态都不重复处置、不重复告警
 		}
-		if rf.Status == models.RefundFailed {
-			// 失败路径已抢先(如 NotExist 阈值误判/渠道摆动),而此刻渠道确认成功:
+		if rf.Status == models.RefundFailed || rf.Status == models.RefundClosed {
+			// 失败路径已抢先(如历史 NotExist 误判/渠道摆动),而此刻渠道确认成功:
 			// 钱可能已退而本地已判失败 → 绝不静默,高等级告警交人工核查渠道并调账。
 			// 不自动改状态(避免与可能已发起的第二笔退款撞 active_guard),把 P1 静默资损降级为可见分歧。
 			conflict = true
 			return nil
 		}
+		rf.GatewayConfirmed = true
+		rf.NotExistCount = 0
+		if gatewayRefundID != "" {
+			rf.GatewayRefundID = gatewayRefundID
+		}
+		rf.SucceededAt = sqlutil.Time(at)
 		// 校验成功金额与退款单金额一致(评审 P1):不一致=资金异常,同事务落人工终态——
 		// 退款 ABNORMAL(活跃守卫内,人工确认前阻断再次退款)+ 订单 REFUNDING→REFUND_EXCEPTION。
 		// 留在 PROCESSING 会被退款查单 worker 无限轮询;告警在事务提交后发出(不在持锁期间做外部 IO)。
 		if amount != rf.RefundAmount {
 			mismatch, wantAmount, gotAmount = true, rf.RefundAmount, amount
-			rf.Status = models.RefundAbnormal
-			rf.LastError = sqlutil.Str(fmt.Sprintf("退款成功金额 %d 与退款单金额 %d 不符", amount, rf.RefundAmount))
-			if err := r.Refunds().Update(ctx, rf); err != nil {
-				return err
-			}
-			if o != nil && o.Status == models.OrderRefunding {
-				prev := o.Status
-				o.Status = models.OrderRefundException
-				o.AggregateVersion++
-				if err := r.Orders().Update(ctx, o); err != nil {
-					return err
-				}
-				return eventapp.WriteLog(ctx, r, o, prev, "system", "退款金额不符,转人工")
-			}
-			return nil // 按异常流水退款 / 订单已离开 REFUNDING:只落退款终态,不动订单
+			return abnormalRefundLocked(ctx, r, o, rf, fmt.Sprintf("退款成功金额 %d 与退款单金额 %d 不符", amount, rf.RefundAmount))
 		}
 		tg, err := resolveTarget(ctx, r, rf)
 		if err != nil {
@@ -458,8 +522,6 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, refundNo, gatewayRef
 			return err
 		}
 		rf.Status = models.RefundSucceeded
-		rf.GatewayRefundID = gatewayRefundID
-		rf.SucceededAt = sqlutil.Time(at)
 		if err := r.Refunds().Update(ctx, rf); err != nil {
 			return err
 		}
@@ -469,6 +531,9 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, refundNo, gatewayRef
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, models.ErrPaymentAnomaly) {
+			s.d.Alerter.Anomaly(ctx, "refund_ledger_conflict", map[string]any{"refund_no": refundNo, "err": err.Error()})
+		}
 		return err
 	}
 	if mismatch {
@@ -479,7 +544,7 @@ func (s *Service) ConfirmRefundSuccess(ctx context.Context, refundNo, gatewayRef
 	if conflict {
 		s.d.Alerter.Anomaly(ctx, "refund_terminal_conflict", map[string]any{
 			"refund_no": refundNo, "order_no": orderNo,
-			"detail": "退款已判 FAILED 但渠道确认成功:钱可能已退而本地已判失败,人工核查渠道并调账",
+			"detail": "退款已判 FAILED/CLOSED 但渠道确认成功:钱可能已退而本地已判失败,人工核查渠道并调账",
 		})
 	}
 	return nil
@@ -505,6 +570,8 @@ type ResolveOutcome struct {
 //   - FAILED:退款 FAILED;订单级退款的订单 REFUND_EXCEPTION→PAID(可重新发起退款);
 //   - SUCCEEDED:actual_amount 须等于退款单金额;写退款流水;订单 REFUND_EXCEPTION→REFUNDED
 //   - 累计已退 + order.refunded 事件。
+//
+// 人工操作时间由审计记录承载;渠道成功时间仅沿用已知值,未知时保留 NULL。
 func (s *Service) ResolveRefundAbnormal(ctx context.Context, in ResolveInput) (ResolveOutcome, error) {
 	if in.Target != models.RefundSucceeded && in.Target != models.RefundFailed {
 		return ResolveOutcome{}, fmt.Errorf("%w: 人工落定目标只能是 SUCCEEDED 或 FAILED", models.ErrIllegalTransition)
@@ -521,7 +588,6 @@ func (s *Service) ResolveRefundAbnormal(ctx context.Context, in ResolveInput) (R
 		if in.Target == models.RefundSucceeded && in.ActualAmount != rf.RefundAmount {
 			return fmt.Errorf("%w: 实际退款金额 %d 须等于退款单金额 %d", models.ErrInvalidAmount, in.ActualAmount, rf.RefundAmount)
 		}
-		now := s.d.Clock()
 		operator := sqlutil.OrDefault(in.Actor, "admin")
 		detail := fmt.Sprintf("refund ABNORMAL→%d actual=%d remark=%q", in.Target, in.ActualAmount, in.Remark)
 		var prevOrder models.OrderStatus
@@ -549,11 +615,14 @@ func (s *Service) ResolveRefundAbnormal(ctx context.Context, in ResolveInput) (R
 			if err != nil {
 				return err
 			}
-			if err := recordRefundTxn(ctx, r, rf, tg, rf.GatewayRefundID, "manual", in.ActualAmount, now); err != nil {
+			var succeededAt time.Time
+			if rf.SucceededAt.Valid {
+				succeededAt = rf.SucceededAt.Time
+			}
+			if err := recordRefundTxn(ctx, r, rf, tg, rf.GatewayRefundID, "manual", in.ActualAmount, succeededAt); err != nil {
 				return err
 			}
 			rf.Status = models.RefundSucceeded
-			rf.SucceededAt = sqlutil.Time(now)
 			if err := r.Refunds().Update(ctx, rf); err != nil {
 				return err
 			}
@@ -574,6 +643,9 @@ func (s *Service) ResolveRefundAbnormal(ctx context.Context, in ResolveInput) (R
 		})
 	})
 	if err != nil {
+		if errors.Is(err, models.ErrPaymentAnomaly) {
+			s.d.Alerter.Anomaly(ctx, "refund_ledger_conflict", map[string]any{"refund_no": in.RefundNo, "err": err.Error()})
+		}
 		return ResolveOutcome{}, err
 	}
 	return out, nil
@@ -609,45 +681,72 @@ func (s *Service) GetRefund(ctx context.Context, appID, refundNo, outRefundNo st
 func (s *Service) QueryRefund(ctx context.Context, rf *models.Refund) error {
 	tg, err := resolveTarget(ctx, s.d.Store.Reader(), rf)
 	if err != nil {
-		return err
+		return errors.Join(err, s.applyRefundQuery(ctx, rf, paygateway.RefundQueryResult{}))
 	}
 	gw, err := s.d.Router.Resolve(tg.channel, rf.PayAccountID)
 	if err != nil {
-		return err
+		return errors.Join(err, s.applyRefundQuery(ctx, rf, paygateway.RefundQueryResult{}))
 	}
-	gctx, cancel := s.gwCtx()
+	gctx, cancel := context.WithTimeout(ctx, s.d.GatewayTimeout)
 	defer cancel()
 	qr, err := gw.RefundQuery(gctx, paygateway.RefundQueryInput{
 		Channel: tg.channel, PayAccountID: rf.PayAccountID, OutRefundNo: rf.OutRefundNo, OutTradeNo: tg.outTradeNo,
 	})
 	if err != nil {
-		return err
+		return errors.Join(err, s.applyRefundQuery(ctx, rf, paygateway.RefundQueryResult{}))
 	}
-	switch qr.State {
-	case paygateway.RefundQuerySucceeded:
-		amt := qr.Amount
-		if amt == 0 {
-			amt = rf.RefundAmount
-		}
-		return s.ConfirmRefundSuccess(ctx, rf.RefundNo, qr.GatewayRefundID, amt, at(qr, s.d.Clock()))
-	case paygateway.RefundQueryFailed:
-		s.failRefund(rf.RefundNo, "网关退款失败")
-		return nil
-	case paygateway.RefundQueryNotExist:
-		// 渠道明确报无此退款单:多次核实(防写入延迟)后判定请求从未落地 → 失败回退。
-		// 与"仍处理中"不同,NotExist 是确定性的否定信号,与支付侧 UNKNOWN 连续查证不存在同模式。
-		if rf.QueryCount+1 >= s.d.NotExistMaxQueries {
-			s.failRefund(rf.RefundNo, "网关无此退款单(多次查证)")
-		}
-		return nil
-	default: // Processing / Error → 保持,交下次查单
-		return nil
+	if qr.State == paygateway.RefundQuerySucceeded {
+		// 真实成功优先于查询租约,其自身事务负责终态幂等。
+		// 缺失/零金额不能用请求金额补成成功事实,由金额核对进入人工状态。
+		return s.ConfirmRefundSuccess(ctx, rf.RefundNo, qr.GatewayRefundID, qr.Amount, qr.SucceededAt)
 	}
+	return s.applyRefundQuery(ctx, rf, qr)
 }
 
-func at(qr paygateway.RefundQueryResult, now time.Time) time.Time {
-	if qr.SucceededAt.IsZero() {
-		return now
+// applyRefundQuery 在同一事务内保存最新证据与非成功结果;旧认领不得写入新持有者的状态。
+func (s *Service) applyRefundQuery(ctx context.Context, claimed *models.Refund, qr paygateway.RefundQueryResult) error {
+	var anomaly string
+	err := s.d.Store.WithinTx(ctx, func(ctx context.Context, r store.Repos) error {
+		o, rf, err := lockRefund(ctx, r, claimed.RefundNo)
+		if err != nil {
+			return err
+		}
+		if rf.Status != models.RefundCreated && rf.Status != models.RefundProcessing {
+			return nil
+		}
+		if claimed.LockedBy != "" && claimed.LockedBy != rf.LockedBy {
+			return nil
+		}
+		if qr.State != paygateway.RefundQueryNotExist {
+			rf.NotExistCount = 0
+		}
+		switch qr.State {
+		case paygateway.RefundQueryProcessing, paygateway.RefundQueryAbnormal:
+			rf.GatewayConfirmed = true
+			if qr.GatewayRefundID != "" {
+				rf.GatewayRefundID = qr.GatewayRefundID
+			}
+			if qr.State == paygateway.RefundQueryAbnormal {
+				anomaly = "refund_channel_abnormal"
+				return abnormalRefundLocked(ctx, r, o, rf, "渠道退款异常,需人工核实")
+			}
+		case paygateway.RefundQueryFailed:
+			return failRefundLocked(ctx, r, o, rf, "网关退款失败")
+		case paygateway.RefundQueryNotExist:
+			rf.NotExistCount++
+			if rf.NotExistCount >= s.d.NotExistMaxQueries {
+				if rf.GatewayConfirmed {
+					anomaly = "refund_query_evidence_conflict"
+					return abnormalRefundLocked(ctx, r, o, rf, "渠道已确认退款存在,后续连续查证不存在,需人工核实")
+				}
+				anomaly = "refund_query_acceptance_unknown"
+				return abnormalRefundLocked(ctx, r, o, rf, "渠道连续查证不存在,受理结果未知,需人工核实")
+			}
+		}
+		return r.Refunds().Update(ctx, rf)
+	})
+	if err == nil && anomaly != "" {
+		s.d.Alerter.Anomaly(ctx, anomaly, map[string]any{"refund_no": claimed.RefundNo, "order_no": claimed.OrderNo})
 	}
-	return qr.SucceededAt
+	return err
 }

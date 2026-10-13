@@ -156,25 +156,26 @@ func TestRefundGatewayRejectedFails(t *testing.T) {
 }
 
 // TestRefundQueryNotExistThreshold NotExist 阈值终态:未达阈值保持 PROCESSING 观察;
-// 达阈值判定"请求从未落地"→ FAILED + 订单回退 PAID;渠道报处理中永不因次数落终态。
+// 达阈值转人工并保留退款守卫;渠道报处理中永不因次数落终态。
 func TestRefundQueryNotExistThreshold(t *testing.T) {
 	notExist := paygateway.RefundQueryResult{State: paygateway.RefundQueryNotExist}
 	processing := paygateway.RefundQueryResult{State: paygateway.RefundQueryProcessing}
 	tests := []struct {
-		name       string
-		queryCount int32 // 查单前已查次数(阈值默认 6:queryCount+1>=6 才终态)
-		qr         paygateway.RefundQueryResult
-		wantRefund models.RefundStatus
-		wantOrder  models.OrderStatus
+		name          string
+		notExistCount int32 // 已连续查证不存在次数,不复用总查询次数
+		qr            paygateway.RefundQueryResult
+		wantRefund    models.RefundStatus
+		wantOrder     models.OrderStatus
 	}{
 		{"NotExist 未达阈值保持观察", 4, notExist, models.RefundProcessing, models.OrderRefunding},
-		{"NotExist 达阈值失败回退", 5, notExist, models.RefundFailed, models.OrderPaid},
+		{"NotExist 达阈值转人工", 5, notExist, models.RefundAbnormal, models.OrderRefundException},
 		{"Processing 超次数不落终态", 100, processing, models.RefundProcessing, models.OrderRefunding},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(true)
 			orderNo, token := h.createAndPay(t, "")
+			h.gateway.refundErr = errors.New("提交结果未知")
 			out, err := h.refund.RefundOrder(bg, refundapp.RefundInput{AppID: "app1", OrderNo: orderNo, RefundAmount: 90, OutRefundNo: "r1"})
 			if err != nil {
 				t.Fatalf("退款受理失败: %v", err)
@@ -185,7 +186,7 @@ func TestRefundQueryNotExistThreshold(t *testing.T) {
 				if e != nil {
 					return e
 				}
-				rf.QueryCount = tc.queryCount
+				rf.NotExistCount = tc.notExistCount
 				return r.Refunds().Update(ctx, rf)
 			})
 			if err != nil {

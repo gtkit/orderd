@@ -3,7 +3,9 @@ package memstore
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"fmt"
 	"slices"
 	"strconv"
 	"time"
@@ -103,14 +105,27 @@ func (r orderRepo) ListStalledClosing(_ context.Context, before time.Time, limit
 	var out []*models.Order
 	for _, e := range r.m.d.orders {
 		if e.Status == models.OrderClosing && e.UpdatedAt.Before(before) {
+			active := false
+			for _, a := range r.m.d.attempts {
+				if a.OrderNo == e.OrderNo && a.Status.Active() {
+					active = true
+					break
+				}
+			}
+			if active {
+				continue
+			}
 			cp := e
 			out = append(out, &cp)
-			if len(out) >= limit {
-				break
-			}
 		}
 	}
-	return out, nil
+	slices.SortFunc(out, func(a, b *models.Order) int {
+		if d := a.UpdatedAt.Compare(b.UpdatedAt); d != 0 {
+			return d
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return out[:min(len(out), limit)], nil
 }
 
 func (r orderRepo) CountPendingByUser(_ context.Context, appID string, userID int64, now time.Time) (int, error) {
@@ -239,7 +254,7 @@ func (r attemptRepo) ClaimQueryDue(_ context.Context, workerID string, now, leas
 	defer r.m.mu.Unlock()
 	var out []*models.PaymentAttempt
 	for id, e := range r.m.d.attempts {
-		if e.Status != models.AttemptUnknown && e.Status != models.AttemptClosing {
+		if e.Status != models.AttemptReady && e.Status != models.AttemptUnknown && e.Status != models.AttemptClosing {
 			continue
 		}
 		if e.NextQueryAt.Valid && e.NextQueryAt.Time.After(now) {
@@ -448,6 +463,11 @@ func (r txnRepo) Insert(_ context.Context, t *models.PaymentTransaction) error {
 	d.seq++
 	t.ID = d.seq
 	d.txns[t.ID] = *t
+	now := t.CreatedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	d.changes[t.ID] = models.ReconcileLocalChange{Channel: t.Channel, PayAccountID: t.PayAccountID, TxnID: t.ID, NextAt: now, CreatedAt: now}
 	return nil
 }
 
@@ -508,7 +528,7 @@ func (r txnRepo) GetByID(_ context.Context, id uint64, _ bool) (*models.PaymentT
 	return &t, nil
 }
 
-func (r txnRepo) GetByTxnID(_ context.Context, channel, payAccountID, txnID string) (*models.PaymentTransaction, error) {
+func (r txnRepo) GetByTxnID(_ context.Context, channel, payAccountID, txnID string, _ bool) (*models.PaymentTransaction, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.txns {
@@ -629,13 +649,26 @@ func (r outboxRepo) MarkDelivered(_ context.Context, id uint64) error {
 	})
 }
 
-// Reschedule / MarkDead 仅对 Pending 生效(与 gormstore 的 status=Pending 守卫一致):
-// 不覆盖他副本已 MarkDelivered 的行。
-func (r outboxRepo) Reschedule(_ context.Context, id uint64, nextAttemptAt time.Time, attempts int32, lastErr string) error {
-	return r.mutate(id, func(o *models.EventOutbox) {
-		if o.Status != models.OutboxPending {
-			return
+func (r outboxRepo) mutateClaim(id uint64, claimToken string, f func(*models.EventOutbox)) (bool, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	for i := range r.m.d.outbox {
+		o := &r.m.d.outbox[i]
+		if o.ID != id {
+			continue
 		}
+		if claimToken == "" || o.Status != models.OutboxPending || o.LockedBy != claimToken {
+			return false, nil
+		}
+		f(o)
+		o.UpdatedAt = time.Now()
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r outboxRepo) Reschedule(_ context.Context, id uint64, claimToken string, nextAttemptAt time.Time, attempts int32, lastErr string) (bool, error) {
+	return r.mutateClaim(id, claimToken, func(o *models.EventOutbox) {
 		o.Attempts = attempts
 		o.NextAttemptAt = nextAttemptAt
 		o.LastError = sql.NullString{String: lastErr, Valid: lastErr != ""}
@@ -644,11 +677,8 @@ func (r outboxRepo) Reschedule(_ context.Context, id uint64, nextAttemptAt time.
 	})
 }
 
-func (r outboxRepo) MarkDead(_ context.Context, id uint64, attempts int32, lastErr string) error {
-	return r.mutate(id, func(o *models.EventOutbox) {
-		if o.Status != models.OutboxPending {
-			return
-		}
+func (r outboxRepo) MarkDead(_ context.Context, id uint64, claimToken string, attempts int32, lastErr string) (bool, error) {
+	return r.mutateClaim(id, claimToken, func(o *models.EventOutbox) {
 		o.Status = models.OutboxDead
 		o.Attempts = attempts
 		o.LastError = sql.NullString{String: lastErr, Valid: lastErr != ""}
@@ -729,13 +759,16 @@ func (r outboxRepo) ClaimDeadForRequeue(_ context.Context, cond store.DeadRequeu
 type reconcileRepo struct{ m *Mem }
 
 func (r reconcileRepo) CreateBatch(_ context.Context, b *models.ReconcileBatch) error {
+	if b.AlgorithmVersion == 0 {
+		b.AlgorithmVersion = 1
+	}
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.batches {
 		if e.BatchNo == b.BatchNo {
 			return store.ErrDuplicate
 		}
-		if e.Channel == b.Channel && e.PayAccountID == b.PayAccountID && sameDay(e.BillDate, b.BillDate) {
+		if e.Channel == b.Channel && e.PayAccountID == b.PayAccountID && e.AlgorithmVersion == b.AlgorithmVersion && sameDay(e.BillDate, b.BillDate) {
 			return store.ErrDuplicate
 		}
 	}
@@ -745,11 +778,11 @@ func (r reconcileRepo) CreateBatch(_ context.Context, b *models.ReconcileBatch) 
 	return nil
 }
 
-func (r reconcileRepo) GetBatchByAccountDate(_ context.Context, channel, payAccountID string, billDate time.Time) (*models.ReconcileBatch, error) {
+func (r reconcileRepo) GetBatchByAccountDate(_ context.Context, channel, payAccountID string, billDate time.Time, version ...int16) (*models.ReconcileBatch, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.batches {
-		if e.Channel == channel && e.PayAccountID == payAccountID && sameDay(e.BillDate, billDate) {
+		if e.Channel == channel && e.PayAccountID == payAccountID && (len(version) == 0 || e.AlgorithmVersion == version[0]) && sameDay(e.BillDate, billDate) {
 			cp := e
 			return &cp, nil
 		}
@@ -757,21 +790,107 @@ func (r reconcileRepo) GetBatchByAccountDate(_ context.Context, channel, payAcco
 	return nil, nil
 }
 
-func (r reconcileRepo) UpdateBatch(_ context.Context, b *models.ReconcileBatch) error {
+func (r reconcileRepo) GetScanAccount(_ context.Context, payAccountID string, _ bool) (*models.AppPayAccount, error) {
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
-	if _, ok := r.m.d.batches[b.ID]; !ok {
+	a, ok := r.m.d.accounts[payAccountID]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return &a, nil
+}
+
+func (r reconcileRepo) UpdateScanCursor(_ context.Context, payAccountID string, through time.Time, version ...int16) error {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	a, ok := r.m.d.accounts[payAccountID]
+	if !ok {
 		return store.ErrNotFound
 	}
-	r.m.d.batches[b.ID] = *b
+	a.ReconcileScannedThrough = sql.NullTime{Time: through, Valid: true}
+	if len(version) > 0 {
+		a.ReconcileScanVersion = version[0]
+	}
+	r.m.d.accounts[payAccountID] = a
 	return nil
 }
 
+func (r reconcileRepo) ClaimBatch(_ context.Context, id uint64, claimToken string, now, leaseUntil time.Time) (bool, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	b, ok := r.m.d.batches[id]
+	if !ok || claimToken == "" || !batchClaimable(b, now) {
+		return false, nil
+	}
+	b.LockedBy, b.LockedUntil = claimToken, sql.NullTime{Time: leaseUntil, Valid: true}
+	b.UpdatedAt = now
+	r.m.d.batches[id] = b
+	return true, nil
+}
+
+func batchClaimable(b models.ReconcileBatch, now time.Time) bool {
+	return (b.Status == models.BatchPending || b.Status == models.BatchPulled || b.Status == models.BatchFailed) &&
+		(!b.LockedUntil.Valid || !b.LockedUntil.Time.After(now))
+}
+
+func (r reconcileRepo) ClaimNextBatch(_ context.Context, channel, payAccountID, claimToken string, now, leaseUntil time.Time, version ...int16) (*models.ReconcileBatch, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	if claimToken == "" {
+		return nil, nil
+	}
+	for _, status := range []models.BatchStatus{models.BatchPending, models.BatchPulled, models.BatchFailed} {
+		var best *models.ReconcileBatch
+		for _, b := range r.m.d.batches {
+			if (len(version) > 0 && b.AlgorithmVersion != version[0]) || b.Channel != channel || b.PayAccountID != payAccountID || b.Status != status || !batchClaimable(b, now) {
+				continue
+			}
+			if best == nil || (best.LockedUntil.Valid && !b.LockedUntil.Valid) ||
+				(b.LockedUntil.Valid == best.LockedUntil.Valid && (b.LockedUntil.Time.Before(best.LockedUntil.Time) ||
+					(b.LockedUntil.Time.Equal(best.LockedUntil.Time) && b.ID < best.ID))) {
+				cp := b
+				best = &cp
+			}
+		}
+		if best != nil {
+			best.LockedBy, best.LockedUntil = claimToken, sql.NullTime{Time: leaseUntil, Valid: true}
+			best.UpdatedAt = now
+			r.m.d.batches[best.ID] = *best
+			return best, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r reconcileRepo) UpdateBatch(_ context.Context, b *models.ReconcileBatch, claimToken string) (bool, error) {
+	r.m.mu.Lock()
+	defer r.m.mu.Unlock()
+	cur, ok := r.m.d.batches[b.ID]
+	if !ok || claimToken == "" || cur.Status == models.BatchDone || cur.LockedBy != claimToken {
+		return false, nil
+	}
+	if b.Status == models.BatchDone {
+		cur.SourceCount, cur.MatchedCount, cur.DiffCount = b.SourceCount, b.MatchedCount, b.DiffCount
+		cur.SourceAmount, cur.LocalAmount = b.SourceAmount, b.LocalAmount
+		cur.PulledAt, cur.ReconciledAt = b.PulledAt, b.ReconciledAt
+	}
+	cur.Status, cur.LockedBy, cur.LockedUntil, cur.LastError = b.Status, b.LockedBy, b.LockedUntil, b.LastError
+	cur.UpdatedAt = time.Now()
+	r.m.d.batches[b.ID] = cur
+	return true, nil
+}
+
 func (r reconcileRepo) InsertDiff(_ context.Context, d *models.ReconcileDiff) error {
+	if d.Kind == 0 {
+		d.Kind = models.TxnPay
+	}
+	if d.IdentityKey == "" {
+		d.IdentityKey = fmt.Sprintf("%x", sha256.Sum256([]byte(d.Channel+"\x00"+d.TransactionID)))
+	}
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.diffs {
-		if e.BatchID == d.BatchID && e.Channel == d.Channel && e.TransactionID == d.TransactionID && e.DiffType == d.DiffType {
+		if e.BatchID == d.BatchID && e.RunID == d.RunID && e.Kind == d.Kind && e.IdentityKey == d.IdentityKey && e.Channel == d.Channel && e.TransactionID == d.TransactionID && e.DiffType == d.DiffType {
 			return store.ErrDuplicate
 		}
 	}
@@ -786,7 +905,7 @@ func (r reconcileRepo) ListDiffs(_ context.Context, f store.DiffFilter, afterID 
 	defer r.m.mu.Unlock()
 	out := make([]models.ReconcileDiff, 0, limit)
 	for _, e := range r.m.d.diffs {
-		if e.ID <= afterID {
+		if e.ID <= afterID || !r.visible(e) {
 			continue
 		}
 		if f.HandleStatus != nil && e.HandleStatus != *f.HandleStatus {
@@ -828,7 +947,7 @@ func (r reconcileRepo) GetDiff(_ context.Context, id uint64, _ bool) (*models.Re
 	r.m.mu.Lock()
 	defer r.m.mu.Unlock()
 	for _, e := range r.m.d.diffs {
-		if e.ID == id {
+		if e.ID == id && r.visible(e) {
 			cp := e
 			return &cp, nil
 		}
@@ -849,6 +968,22 @@ func (r reconcileRepo) UpdateDiffHandling(_ context.Context, id uint64, status m
 		d.HandledAt = sql.NullTime{Time: handledAt, Valid: true}
 		if remark != "" { // 空备注保留原值(与 gormstore 语义一致)
 			d.HandleRemark = remark
+		}
+		if handledBy != models.OpsActorSystem && d.RunID != "" {
+			batch := r.m.d.batches[d.BatchID]
+			if d.RunID != batch.PublishedRunID {
+				return store.ErrNotFound
+			}
+			for j := range r.m.d.diffs {
+				target := &r.m.d.diffs[j]
+				if target.BatchID == d.BatchID && target.RunID == batch.RunID && target.RunID != batch.PublishedRunID && target.Kind == d.Kind && target.IdentityKey == d.IdentityKey && target.DiffType == d.DiffType {
+					target.HandleStatus = status
+					target.HandledBy = handledBy
+					target.HandledAt = d.HandledAt
+					target.HandleRemark = d.HandleRemark
+					target.UpdatedAt = time.Now()
+				}
+			}
 		}
 		d.UpdatedAt = time.Now()
 		return nil

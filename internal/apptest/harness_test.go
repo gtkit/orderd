@@ -3,6 +3,7 @@ package apptest
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,7 +44,7 @@ func (fakeAccounts) Resolve(_ context.Context, appID, channel string) (models.Ap
 
 func (fakeAccounts) ResolveByID(_ context.Context, payAccountID string) (models.AppPayAccount, error) {
 	return models.AppPayAccount{
-		PayAccountID: payAccountID, AppID: "app1", MchID: "mch-" + payAccountID, PayAppID: "app-" + payAccountID,
+		PayAccountID: payAccountID, AppID: "app1", MchID: "mch-" + strings.TrimPrefix(payAccountID, "acc-"), PayAppID: "app-" + strings.TrimPrefix(payAccountID, "acc-"),
 		ConfigVersion: 1, Enabled: true,
 	}, nil
 }

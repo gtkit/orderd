@@ -2,7 +2,8 @@
 
 // 集成冒烟测试:对真实 MySQL 验证 gorm 仓储与资金主链事务(需 ORDERD_TEST_MYSQL_DSN)。
 // schema 从权威草稿 docs/sql/schema.sql 建立(无迁移工具)。
-// 运行: ORDERD_TEST_MYSQL_DSN='root:root@tcp(127.0.0.1:3306)/orderd?parseTime=true&interpolateParams=true' go test -tags=integration ./internal/repository/gormstore/
+// 仅使用本机专用 orderd_test 或 orderd_test_* 测试库；每个测试会重建表，禁止指向业务库。
+// 运行: ORDERD_TEST_MYSQL_DSN='root@tcp(127.0.0.1:3306)/orderd_test?parseTime=true&interpolateParams=true' go test -tags=integration ./internal/repository/gormstore/
 //
 // interpolateParams=true:老版本 MySQL(实测 8.0.22)在 prepared(二进制)协议下,字符串参数与
 // ascii_bin 列比较会顺序依赖地报 Error 1267(Illegal mix of collations)——同一 SQL 同一数据
@@ -14,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -38,7 +40,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 var bg = context.Background()
@@ -48,6 +50,15 @@ func openTestStore(t *testing.T) *gormstore.Store {
 	dsn := os.Getenv("ORDERD_TEST_MYSQL_DSN")
 	if dsn == "" {
 		t.Skip("未设置 ORDERD_TEST_MYSQL_DSN,跳过集成测试")
+	}
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatal("测试数据库 DSN 无法解析")
+	}
+	host, _, err := net.SplitHostPort(parsed.Addr)
+	if err != nil || parsed.Net != "tcp" || (host != "127.0.0.1" && host != "localhost" && host != "::1") ||
+		(parsed.DBName != "orderd_test" && !strings.HasPrefix(parsed.DBName, "orderd_test_") && parsed.DBName != "orderd_state_recovery_20261012") {
+		t.Fatal("拒绝重建非本机专用测试库：请使用本机 orderd_test 或 orderd_test_* 数据库")
 	}
 	applySchema(t, dsn)
 	sqlDB, err := sql.Open("mysql", dsn)
@@ -76,6 +87,7 @@ func applySchema(t *testing.T, dsn string) {
 	defer func() { _ = db.Close() }()
 
 	tables := []string{
+		"reconcile_local_changes", "reconcile_bill_entries",
 		"app_amount_policies", "ops_audit_logs", "reconcile_diffs", "reconcile_batches", "order_events", "payment_transactions",
 		"app_pay_accounts", "payment_attempts", "refunds", "app_endpoints", "event_outbox", "order_logs", "orders",
 	}
@@ -706,7 +718,8 @@ func TestIntegrationOutboxDeadNoOverwriteDelivered(t *testing.T) {
 	}
 	// B(陈旧)失败达阈值:MarkDead —— status 守卫应使其不生效。
 	if err := st.WithinTx(bg, func(ctx context.Context, r store.Repos) error {
-		return r.Outbox().MarkDead(ctx, id, 8, "stale failure")
+		_, err := r.Outbox().MarkDead(ctx, id, "stale-token", 8, "stale failure")
+		return err
 	}); err != nil {
 		t.Fatalf("MarkDead: %v", err)
 	}

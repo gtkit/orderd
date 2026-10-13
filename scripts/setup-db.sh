@@ -38,5 +38,6 @@ my "$MDB" < "$SCHEMA"
 
 echo "完成:$MDB 表数=$(my -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$MDB';")"
 echo "提示:支付账号按部署自行播种,例如支付宝沙箱:"
+echo "  mch_id 必须填写该支付宝商户真实 seller_id;pay_app_id 填支付应用 APPID,两者不可互换或留空。"
 echo "  INSERT INTO app_pay_accounts(pay_account_id,app_id,channel,mch_id,pay_app_id,notify_route_id,config_ref,config_version,enabled)"
-echo "  VALUES('acc-alipay','app1','alipay','','<APPID>','alipay-sbx','env',1,1);"
+echo "  VALUES('acc-alipay','app1','alipay','<SELLER_ID>','<APPID>','alipay-sbx','env',1,1);"

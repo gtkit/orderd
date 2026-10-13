@@ -6,14 +6,20 @@
 package wechatgw
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"time"
 
 	"github.com/gtkit/go-pay/paymgr"
 	wechatp "github.com/gtkit/go-pay/wechat"
 	"github.com/gtkit/orderd/internal/paygateway"
+	"github.com/wechatpay-apiv3/wechatpay-go/services/payments"
+	"github.com/wechatpay-apiv3/wechatpay-go/utils"
 )
 
 // provider 是本网关依赖的微信能力子集:paymgr.Provider(下单/查单/关单/退款/查退款/验签)
@@ -56,6 +62,9 @@ type Gateway struct {
 	payAccountID string
 	notifyURL    string
 	tradeType    paymgr.TradeType
+	payAppID     string
+	mchID        string
+	apiKey       string
 }
 
 // PayAccountID 返回该网关绑定的支付账号(回调按路由定位账号后供支付确认校验)。
@@ -83,7 +92,8 @@ func NewGateway(ctx context.Context, cfg Config) (*Gateway, error) {
 	if tt == "" {
 		tt = paymgr.TradeTypeNative // 默认扫码(Native)
 	}
-	return &Gateway{provider: p, payAccountID: cfg.PayAccountID, notifyURL: cfg.NotifyURL, tradeType: tt}, nil
+	return &Gateway{provider: p, payAccountID: cfg.PayAccountID, notifyURL: cfg.NotifyURL, tradeType: tt,
+		payAppID: cfg.AppID, mchID: cfg.MchID, apiKey: cfg.MchAPIv3Key}, nil
 }
 
 // Prepare 统一下单;返回前端调起参数(优先 AppParams,其次 CodeURL/PayURL/H5URL)。
@@ -111,6 +121,9 @@ func (g *Gateway) Query(ctx context.Context, in paygateway.QueryInput) (paygatew
 			return paygateway.QueryResult{State: paygateway.QueryNotExist}, nil
 		}
 		return paygateway.QueryResult{State: paygateway.QueryError}, nil
+	}
+	if rsp == nil || rsp.OutTradeNo == "" || rsp.OutTradeNo != in.OutTradeNo {
+		return paygateway.QueryResult{State: paygateway.QueryError}, errors.New("wechatgw: 支付查询响应的商户单号缺失/不匹配")
 	}
 	switch rsp.TradeStatus {
 	case paymgr.TradeStatusPaid, paymgr.TradeStatusRefunded:
@@ -151,11 +164,18 @@ func (g *Gateway) RefundQuery(ctx context.Context, in paygateway.RefundQueryInpu
 		}
 		return paygateway.RefundQueryResult{State: paygateway.RefundQueryError}, err
 	}
+	// 微信实际只按退款号查询,必须复核原支付单号,避免共用商户时误认另一笔同额退款。
+	if rsp == nil || rsp.OutTradeNo == "" || rsp.OutRefundNo == "" ||
+		rsp.OutTradeNo != in.OutTradeNo || rsp.OutRefundNo != in.OutRefundNo {
+		return paygateway.RefundQueryResult{State: paygateway.RefundQueryError}, errors.New("wechatgw: 退款查询响应的原支付单号或退款号缺失/不匹配")
+	}
 	switch rsp.RefundStatus {
 	case paymgr.RefundStatusSuccess:
 		return paygateway.RefundQueryResult{State: paygateway.RefundQuerySucceeded, GatewayRefundID: rsp.RefundID, TransactionID: rsp.TransactionID, Amount: rsp.RefundAmount, SucceededAt: rsp.RefundedAt}, nil
-	case paymgr.RefundStatusProcessing, paymgr.RefundStatusAbnormal:
-		return paygateway.RefundQueryResult{State: paygateway.RefundQueryProcessing}, nil
+	case paymgr.RefundStatusProcessing:
+		return paygateway.RefundQueryResult{State: paygateway.RefundQueryProcessing, GatewayRefundID: rsp.RefundID}, nil
+	case paymgr.RefundStatusAbnormal:
+		return paygateway.RefundQueryResult{State: paygateway.RefundQueryAbnormal, GatewayRefundID: rsp.RefundID}, nil
 	case paymgr.RefundStatusClosed:
 		return paygateway.RefundQueryResult{State: paygateway.RefundQueryFailed}, nil
 	default:
@@ -179,18 +199,54 @@ type Notify struct {
 	TransactionID string
 	Paid          bool
 	AmountFen     int64
+	PaidAt        time.Time
 }
 
 // ParseNotify 验签+解密异步通知(回调层用);验签失败返回 error。
 func (g *Gateway) ParseNotify(ctx context.Context, r *http.Request) (Notify, error) {
+	// 只缓存有界原文;业务字段必须等 SDK 完成验签后才解析。
+	bodyReader := r.Body
+	defer func() { _ = bodyReader.Close() }()
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 1<<20))
+	if err != nil {
+		return Notify{}, fmt.Errorf("%w: invalid notify body", paymgr.ErrInvalidNotify)
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
 	nr, err := g.provider.ParseNotify(ctx, r)
 	if err != nil {
 		return Notify{}, err
 	}
+	// paymgr 的统一结果未保留身份,从已验签密文用官方 SDK 解密核对,不接受缺省身份。
+	var envelope struct {
+		Resource struct {
+			AssociatedData string `json:"associated_data"`
+			Nonce          string `json:"nonce"`
+			Ciphertext     string `json:"ciphertext"`
+		} `json:"resource"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil || len(envelope.Resource.Nonce) != 12 {
+		return Notify{}, fmt.Errorf("%w: invalid verified resource", paymgr.ErrInvalidNotify)
+	}
+	plain, err := utils.DecryptAES256GCM(g.apiKey, envelope.Resource.AssociatedData, envelope.Resource.Nonce, envelope.Resource.Ciphertext)
+	if err != nil {
+		return Notify{}, fmt.Errorf("%w: invalid verified ciphertext", paymgr.ErrInvalidNotify)
+	}
+	var transaction payments.Transaction
+	if err := json.Unmarshal([]byte(plain), &transaction); err != nil {
+		return Notify{}, fmt.Errorf("%w: invalid verified transaction", paymgr.ErrInvalidNotify)
+	}
+	if g.payAppID == "" || g.mchID == "" || transaction.Appid == nil || transaction.Mchid == nil ||
+		*transaction.Appid != g.payAppID || *transaction.Mchid != g.mchID {
+		return Notify{}, fmt.Errorf("%w: notify account identity mismatch", paymgr.ErrInvalidNotify)
+	}
+	paid := nr.TradeStatus == paymgr.TradeStatusPaid || nr.TradeStatus == paymgr.TradeStatusRefunded
+	if paid && nr.TotalAmount <= 0 {
+		return Notify{}, fmt.Errorf("%w: invalid payment amount", paymgr.ErrInvalidNotify)
+	}
 	return Notify{
 		OutTradeNo: nr.OutTradeNo, TransactionID: nr.TransactionID,
-		Paid:      nr.TradeStatus == paymgr.TradeStatusPaid || nr.TradeStatus == paymgr.TradeStatusRefunded,
-		AmountFen: nr.TotalAmount,
+		Paid:      paid,
+		AmountFen: nr.TotalAmount, PaidAt: nr.PaidAt,
 	}, nil
 }
 

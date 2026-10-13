@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gtkit/orderd/internal/models"
+	"github.com/gtkit/orderd/internal/pkg/dbtx"
 	"github.com/gtkit/orderd/internal/store"
 	"gorm.io/gorm"
 )
@@ -76,8 +77,10 @@ func (r orderRepo) ClaimExpiredPending(ctx context.Context, now time.Time, exclu
 
 func (r orderRepo) ListStalledClosing(ctx context.Context, before time.Time, limit int) ([]*models.Order, error) {
 	var out []*models.Order
-	// status=30(CLOSING)行数极少(本身即异常滞留),status 前缀索引足够。
-	err := dbOf(ctx, r.base).Where("status = ? AND updated_at < ?", models.OrderClosing, before).Limit(limit).Find(&out).Error
+	// 先排除仍由查单 worker 处理的活跃单,再限量,避免其长期占满兜底批次。
+	err := dbOf(ctx, r.base).Where("status = ? AND updated_at < ?", models.OrderClosing, before).
+		Where("NOT EXISTS (SELECT 1 FROM payment_attempts WHERE payment_attempts.active_order = orders.order_no)").
+		Order("updated_at, id").Limit(limit).Find(&out).Error
 	if err != nil {
 		return nil, fmt.Errorf("gormstore: list stalled closing: %w", err)
 	}
@@ -187,11 +190,11 @@ func (r attemptRepo) ExistsSubmitted(ctx context.Context, orderNo string) (bool,
 
 func (r attemptRepo) ClaimQueryDue(ctx context.Context, workerID string, now, leaseUntil time.Time, limit int) ([]*models.PaymentAttempt, error) {
 	var out []*models.PaymentAttempt
-	// status∈{UNKNOWN,CLOSING} 且到期且租约空闲;FOR UPDATE SKIP LOCKED 保证多副本不重认领。
+	// status∈{READY,UNKNOWN,CLOSING} 且到期且租约空闲;FOR UPDATE SKIP LOCKED 保证多副本不重认领。
 	err := skipLocked(dbOf(ctx, r.base)).
-		Where("status IN ?", []models.AttemptStatus{models.AttemptUnknown, models.AttemptClosing}).
+		Where("status IN ?", []models.AttemptStatus{models.AttemptReady, models.AttemptUnknown, models.AttemptClosing}).
 		Where("next_query_at IS NULL OR next_query_at <= ?", now).
-		Where("locked_until IS NULL OR locked_until < ?", now).
+		Where("locked_until IS NULL OR locked_until <= ?", now).
 		Order("next_query_at").Limit(limit).Find(&out).Error
 	if err != nil {
 		return nil, fmt.Errorf("gormstore: claim query due attempts: %w", err)
@@ -320,7 +323,7 @@ func (r refundRepo) ListBySourceTxn(ctx context.Context, txnID uint64) ([]*model
 
 func (r refundRepo) Update(ctx context.Context, rf *models.Refund) error {
 	err := dbOf(ctx, r.base).Model(&models.Refund{}).Where("id = ?", rf.ID).
-		Select("Status", "GatewayRefundID", "SucceededAt", "LastError", "NextQueryAt", "QueryCount", "LockedBy", "LockedUntil").
+		Select("Status", "GatewayRefundID", "SucceededAt", "LastError", "NextQueryAt", "QueryCount", "NotExistCount", "GatewayConfirmed", "LockedBy", "LockedUntil").
 		Updates(rf).Error
 	if err != nil {
 		return fmt.Errorf("gormstore: update refund: %w", err)
@@ -335,12 +338,21 @@ func (r refundRepo) Update(ctx context.Context, rf *models.Refund) error {
 type txnRepo struct{ base *gorm.DB }
 
 func (r txnRepo) Insert(ctx context.Context, t *models.PaymentTransaction) error {
-	return mapDup(dbOf(ctx, r.base).Create(t).Error, "insert txn")
+	write := func(db *gorm.DB) error {
+		if err := mapDup(db.Create(t).Error, "insert txn"); err != nil {
+			return err
+		}
+		return mapDup(db.Create(&models.ReconcileLocalChange{Channel: t.Channel, PayAccountID: t.PayAccountID, TxnID: t.ID, NextAt: time.Now()}).Error, "enqueue local transaction")
+	}
+	if dbtx.InTx(ctx) {
+		return write(dbOf(ctx, r.base))
+	}
+	return dbOf(ctx, r.base).Transaction(write)
 }
 
-func (r txnRepo) GetByTxnID(ctx context.Context, channel, payAccountID, txnID string) (*models.PaymentTransaction, error) {
+func (r txnRepo) GetByTxnID(ctx context.Context, channel, payAccountID, txnID string, fu bool) (*models.PaymentTransaction, error) {
 	var t models.PaymentTransaction
-	err := dbOf(ctx, r.base).
+	err := forUpdate(dbOf(ctx, r.base), fu).
 		Where("channel = ? AND pay_account_id = ? AND transaction_id = ?", channel, payAccountID, txnID).Take(&t).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil

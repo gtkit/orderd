@@ -384,15 +384,15 @@ func TestQueryUnknownNotExistBelowThreshold(t *testing.T) {
 	}
 }
 
-func TestQueryUnknownNotExistAtThreshold(t *testing.T) {
+func TestQueryUnknownNotExistThresholdDoesNotReleaseValidCode(t *testing.T) {
 	mem := memstore.New()
 	seed(t, mem, "OD-nx", models.OrderPending, models.CloseNone, models.AttemptUnknown, 5)  // 已查 5 次
 	qw := buildQueryWorker(mem, paygateway.QueryResult{State: paygateway.QueryNotExist}, 6) // 第 6 次 → 关闭
 	if _, err := qw.RunOnce(bg); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	if attemptStatus(t, mem, "OD-nx") != models.AttemptClosed {
-		t.Fatal("达阈值多次查证不存在,尝试应 CLOSED")
+	if attemptStatus(t, mem, "OD-nx") != models.AttemptUnknown {
+		t.Fatal("累计查询次数不能提前关闭仍有效的支付码")
 	}
 }
 
