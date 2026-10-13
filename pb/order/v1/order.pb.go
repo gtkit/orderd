@@ -483,11 +483,9 @@ type CreateOrderRequest struct {
 	ClientIp  string                 `protobuf:"bytes,6,opt,name=client_ip,json=clientIp,proto3" json:"client_ip,omitempty"`
 	// 幂等键。服务端对归一化后的 (user_id, product, amount, pay_method, metadata …) 计算
 	// request_hash 并与本 key 绑定:
-	//
-	//	· 同 key 同 hash → 返回原订单(reused=true);
-	//	· 同 key 不同 hash → 拒绝,gRPC codes.AlreadyExists(msg: IDEMPOTENCY_CONFLICT);
-	//	· 唯一约束 UNIQUE(app_id, idempotency_key)。
-	//
+	//   · 同 key 同 hash → 返回原订单(reused=true);
+	//   · 同 key 不同 hash → 拒绝,gRPC codes.AlreadyExists(msg: IDEMPOTENCY_CONFLICT);
+	//   · 唯一约束 UNIQUE(app_id, idempotency_key)。
 	// 留空则退化为"同 user+product 未支付单复用"。
 	IdempotencyKey string `protobuf:"bytes,7,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	// 接入方业务单号(一等字段),服务端 UNIQUE(app_id, client_order_no);关联业务单据与对账。

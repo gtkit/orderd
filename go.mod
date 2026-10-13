@@ -20,8 +20,8 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0
 	github.com/gtkit/go-pay v1.6.1
 	github.com/gtkit/logger v1.8.1
-	github.com/gtkit/orderd/pb v1.1.0
-	github.com/gtkit/orderd/sdk v0.0.0-00010101000000-000000000000
+	github.com/gtkit/orderd/pb v1.2.0
+	github.com/gtkit/orderd/sdk v1.1.1
 	github.com/gtkit/ormx v1.1.0
 	github.com/prometheus/client_golang v1.24.1
 	google.golang.org/grpc v1.83.2

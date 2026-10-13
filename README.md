@@ -3,6 +3,8 @@
 下单 → 支付 → 回调 → 全额退款(V1)。支付结果通过**事件推送(主)+ 查询(兜底)**双路径触达接入方。
 orderd 只做订单与资金主链,**不做交付/发权益**(接入方消费事件自行发放)。设计权威见 [`DESIGN.md`](./DESIGN.md)。
 
+当前发布：主服务 `v0.3.0`、协议模块 `pb/v1.2.0`、事件 SDK `sdk/v1.1.1`。升级行为和迁移要求见 [CHANGELOG.md](./CHANGELOG.md)；启用渠道对账前须完成 [上线验收](./docs/reconciliation-rollout.md)。
+
 - 对外契约:`proto/order/v1/*.proto` —— 同源生成 **gRPC + REST(grpc-gateway)+ OpenAPI**(`pb/order.swagger.json`,供 PHP 等非 gRPC 接入方)
 - 事件契约:`proto/order/v1/events.proto` + 接入方消费 SDK `sdk/orderevents`
 - 数据模型:`docs/sql/schema.sql`(orderd **独立库**权威建表草稿,15 张表，含对账源证据与本地流水核对队列;本项目无迁移工具,人工评审执行,生产禁 AutoMigrate)
